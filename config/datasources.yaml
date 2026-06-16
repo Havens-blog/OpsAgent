@@ -1,0 +1,103 @@
+# OpsAgent Data Sources Configuration
+# This file defines all data source connections.
+
+datasources:
+  # Alibaba Cloud SLS (Primary - P0)
+  aliyun_sls_prod:
+    name: "aliyun_sls_prod"
+    type: "aliyun_sls"
+    enabled: true
+    timeout: 30s
+    endpoint: "https://cn-hangzhou.log.aliyuncs.com"
+    project: "my-project"
+    logstore: "my-logstore"
+    access_key_id: "${ALIYUN_ACCESS_KEY_ID}"
+    access_key_secret: "${ALIYUN_ACCESS_KEY_SECRET}"
+    security_token: "${ALIYUN_SECURITY_TOKEN}"
+    retry:
+      max_attempts: 3
+      initial_backoff: 500ms
+      max_backoff: 30s
+      backoff_multiplier: 2.0
+      retryable_errors: ["timeout", "network", "rate_limit", "temporary"]
+
+  # Alibaba Cloud ARMS (Primary - P0)
+  aliyun_arms_prod:
+    name: "aliyun_arms_prod"
+    type: "aliyun_arms"
+    enabled: true
+    timeout: 30s
+    endpoint: "https://arms.cn-hangzhou.aliyuncs.com"
+    region: "cn-hangzhou"
+    access_key_id: "${ALIYUN_ACCESS_KEY_ID}"
+    access_key_secret: "${ALIYUN_ACCESS_KEY_SECRET}"
+    pid: "armPid"
+    retry:
+      max_attempts: 3
+      initial_backoff: 500ms
+      max_backoff: 30s
+      backoff_multiplier: 2.0
+
+  # Prometheus (IDC - P1)
+  prometheus_idc:
+    name: "prometheus_idc"
+    type: "prometheus"
+    enabled: false
+    timeout: 15s
+    endpoint: "http://prometheus.idc.internal:9090"
+    retry:
+      max_attempts: 2
+      initial_backoff: 200ms
+      max_backoff: 10s
+
+  # Volcengine TLS (P1)
+  volcengine_tls_prod:
+    name: "volcengine_tls_prod"
+    type: "volcengine_tls"
+    enabled: false
+    timeout: 30s
+    retry:
+      max_attempts: 3
+      initial_backoff: 500ms
+      max_backoff: 30s
+
+  # Huawei Cloud LTS (P1)
+  huawei_lts_prod:
+    name: "huawei_lts_prod"
+    type: "huawei_lts"
+    enabled: false
+    timeout: 30s
+    retry:
+      max_attempts: 3
+      initial_backoff: 500ms
+      max_backoff: 30s
+
+  # InfluxDB (IDC - P1)
+  influxdb_idc:
+    name: "influxdb_idc"
+    type: "influxdb"
+    enabled: false
+    timeout: 15s
+    endpoint: "http://influxdb.idc.internal:8086"
+    token: "${INFLUXDB_TOKEN}"
+    org: "my-org"
+    bucket: "my-bucket"
+    retry:
+      max_attempts: 2
+      initial_backoff: 200ms
+      max_backoff: 10s
+
+  # Elasticsearch (P1)
+  elasticsearch_prod:
+    name: "elasticsearch_prod"
+    type: "elasticsearch"
+    enabled: false
+    timeout: 30s
+    endpoints:
+      - "http://es1.internal:9200"
+      - "http://es2.internal:9200"
+    index_pattern: "app-logs-*"
+    retry:
+      max_attempts: 3
+      initial_backoff: 500ms
+      max_backoff: 30s
