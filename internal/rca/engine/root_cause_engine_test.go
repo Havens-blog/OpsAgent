@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/rca/models"
-	"github.com/yourusername/OpsAgent/internal/rca/scoring"
-	"github.com/yourusername/OpsAgent/internal/rca/sources"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/scoring"
+	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
 )
 
 // Mock implementations for source interfaces

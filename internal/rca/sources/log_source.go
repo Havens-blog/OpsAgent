@@ -5,7 +5,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 )
 
 // LogSource provides log data for RCA analysis.

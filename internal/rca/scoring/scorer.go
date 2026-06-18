@@ -6,7 +6,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 )
 
 // ScoreResult represents the result of scoring a hypothesis.

@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/yourusername/OpsAgent/internal/datasource/core"
-	"github.com/yourusername/OpsAgent/internal/datasource/credentials"
-	"github.com/yourusername/OpsAgent/internal/datasource/log"
-	apm "github.com/yourusername/OpsAgent/internal/datasource/apm"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/log"
+	apm "github.com/Havens-blog/OpsAgent/internal/datasource/apm"
 )
 
 // DataSourceEntry holds a data source instance and its metadata.

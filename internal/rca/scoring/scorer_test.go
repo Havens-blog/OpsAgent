@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 )
 
 func TestMultiDimensionalScorer(t *testing.T) {

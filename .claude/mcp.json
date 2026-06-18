@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cc-design": {
+      "command": "node",
+      "args": ["/c/Users/chengyinghao/.claude/plugins/marketplaces/cc-design/dist/index.js"]
+    }
+  }
+}

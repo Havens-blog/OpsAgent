@@ -36,6 +36,9 @@ type Settings struct {
 	// Agent configuration
 	Agent AgentConfig `yaml:"agent"`
 
+	// LLM configuration
+	LLM LLMConfig `yaml:"llm"`
+
 	// Data sources configuration
 	DataSources map[string]interface{} `yaml:"datasources"`
 
@@ -44,6 +47,9 @@ type Settings struct {
 
 	// Security configuration
 	Security SecurityConfig `yaml:"security"`
+
+	// DingTalk configuration
+	DingTalk DingTalkConfig `yaml:"dingtalk"`
 
 	// Paths
 	paths ConfigPaths
@@ -63,7 +69,7 @@ type ServerConfig struct {
 
 // AgentConfig holds agent-related configuration.
 type AgentConfig struct {
-	// AnthropicAPIKey is the API key for Anthropic
+	// AnthropicAPIKey is the API key for Anthropic (legacy, prefer LLMConfig)
 	AnthropicAPIKey string `yaml:"anthropic_api_key" env:"ANTHROPIC_API_KEY"`
 	// Model is the model to use
 	Model string `yaml:"model" env:"OPSAGENT_MODEL"`
@@ -73,6 +79,24 @@ type AgentConfig struct {
 	Timeout int `yaml:"timeout" env:"OPSAGENT_AGENT_TIMEOUT"`
 	// MaxParallelAgents is the maximum number of parallel agents
 	MaxParallelAgents int `yaml:"max_parallel_agents" env:"OPSAGENT_MAX_PARALLEL_AGENTS"`
+}
+
+// LLMConfig holds LLM provider configuration.
+type LLMConfig struct {
+	// Provider is the LLM provider (claude, openai, dashscope, volcengine, etc.)
+	Provider string `yaml:"provider" env:"LLM_PROVIDER"`
+	// BaseURL is the API base URL
+	BaseURL string `yaml:"base_url" env:"LLM_BASE_URL"`
+	// APIKey is the API key for the LLM provider
+	APIKey string `yaml:"api_key" env:"LLM_API_KEY"`
+	// Model is the model name to use
+	Model string `yaml:"model" env:"LLM_MODEL"`
+	// MaxTokens is the maximum tokens in response
+	MaxTokens int `yaml:"max_tokens" env:"LLM_MAX_TOKENS"`
+	// Temperature is the sampling temperature
+	Temperature float64 `yaml:"temperature" env:"LLM_TEMPERATURE"`
+	// Timeout is the request timeout in seconds
+	Timeout int `yaml:"timeout" env:"LLM_TIMEOUT"`
 }
 
 // ObservabilityConfig holds observability configuration.
@@ -103,6 +127,14 @@ type SecurityConfig struct {
 	VaultToken string `yaml:"vault_token" env:"VAULT_TOKEN"`
 	// VaultPath is the base path for secrets in Vault
 	VaultPath string `yaml:"vault_path" env:"OPSAGENT_VAULT_PATH"`
+}
+
+// DingTalkConfig holds DingTalk notification configuration.
+type DingTalkConfig struct {
+	// WebhookURL is the DingTalk webhook URL
+	WebhookURL string `yaml:"webhook_url" env:"DINGTALK_WEBHOOK_URL"`
+	// Secret is the DingTalk webhook secret
+	Secret string `yaml:"secret" env:"DINGTALK_SECRET"`
 }
 
 // ConfigPaths holds configuration file paths.
@@ -168,11 +200,27 @@ func (s *Settings) loadFromFile(path string) error {
 		return err
 	}
 
-	if err := yaml.Unmarshal(data, s); err != nil {
+	// Expand environment variables in the YAML content
+	expandedData := expandEnv(string(data))
+
+	if err := yaml.Unmarshal([]byte(expandedData), s); err != nil {
 		return err
 	}
 
+	// Expand environment variables in specific fields
+	s.LLM.APIKey = expandEnv(s.LLM.APIKey)
+	s.DingTalk.WebhookURL = expandEnv(s.DingTalk.WebhookURL)
+	s.DingTalk.Secret = expandEnv(s.DingTalk.Secret)
+
 	return nil
+}
+
+// expandEnv expands environment variables in the form ${VAR} or $VAR.
+func expandEnv(s string) string {
+	// Handle ${VAR} syntax
+	s = os.ExpandEnv(s)
+	// Handle $VAR syntax is already handled by ExpandEnv
+	return s
 }
 
 // loadFromEnv loads configuration from environment variables.
@@ -201,6 +249,29 @@ func (s *Settings) loadFromEnv() {
 		s.Agent.Model = model
 	}
 
+	// LLM
+	if provider := os.Getenv("LLM_PROVIDER"); provider != "" {
+		s.LLM.Provider = provider
+	}
+	if baseURL := os.Getenv("LLM_BASE_URL"); baseURL != "" {
+		s.LLM.BaseURL = baseURL
+	}
+	if apiKey := os.Getenv("LLM_API_KEY"); apiKey != "" {
+		s.LLM.APIKey = apiKey
+	}
+	if model := os.Getenv("LLM_MODEL"); model != "" {
+		s.LLM.Model = model
+	}
+	if maxTokens := os.Getenv("LLM_MAX_TOKENS"); maxTokens != "" {
+		fmt.Sscanf(maxTokens, "%d", &s.LLM.MaxTokens)
+	}
+	if temperature := os.Getenv("LLM_TEMPERATURE"); temperature != "" {
+		fmt.Sscanf(temperature, "%f", &s.LLM.Temperature)
+	}
+	if timeout := os.Getenv("LLM_TIMEOUT"); timeout != "" {
+		fmt.Sscanf(timeout, "%d", &s.LLM.Timeout)
+	}
+
 	// Observability
 	if logLevel := os.Getenv("OPSAGENT_LOG_LEVEL"); logLevel != "" {
 		s.Observability.LogLevel = logLevel
@@ -212,6 +283,14 @@ func (s *Settings) loadFromEnv() {
 	// Security
 	if enableAudit := os.Getenv("OPSAGENT_ENABLE_AUDIT_LOG"); enableAudit != "" {
 		s.Security.EnableAuditLog = strings.ToLower(enableAudit) == "true"
+	}
+
+	// DingTalk
+	if webhookURL := os.Getenv("DINGTALK_WEBHOOK_URL"); webhookURL != "" {
+		s.DingTalk.WebhookURL = webhookURL
+	}
+	if secret := os.Getenv("DINGTALK_SECRET"); secret != "" {
+		s.DingTalk.Secret = secret
 	}
 }
 
@@ -250,6 +329,23 @@ func (s *Settings) setDefaults() {
 		s.Agent.MaxParallelAgents = 5
 	}
 
+	// LLM defaults - use Claude by default
+	if s.LLM.Provider == "" {
+		s.LLM.Provider = "claude"
+	}
+	if s.LLM.Model == "" {
+		s.LLM.Model = "claude-sonnet-4-20250514"
+	}
+	if s.LLM.MaxTokens == 0 {
+		s.LLM.MaxTokens = 4096
+	}
+	if s.LLM.Temperature == 0 {
+		s.LLM.Temperature = 0.7
+	}
+	if s.LLM.Timeout == 0 {
+		s.LLM.Timeout = 120
+	}
+
 	if s.Observability.LogLevel == "" {
 		s.Observability.LogLevel = "info"
 	}
@@ -266,8 +362,21 @@ func (s *Settings) Validate() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if s.Agent.AnthropicAPIKey == "" {
-		return fmt.Errorf("ANTHROPIC_API_KEY is required")
+	// Check API key: either legacy ANTHROPIC_API_KEY or new LLM.APIKey
+	hasAPIKey := s.Agent.AnthropicAPIKey != "" || s.LLM.APIKey != ""
+	if !hasAPIKey {
+		return fmt.Errorf("either ANTHROPIC_API_KEY or LLM_API_KEY is required")
+	}
+
+	// If using legacy config, migrate to LLM config
+	if s.Agent.AnthropicAPIKey != "" && s.LLM.APIKey == "" {
+		s.LLM.APIKey = s.Agent.AnthropicAPIKey
+		if s.LLM.Provider == "" {
+			s.LLM.Provider = "claude"
+		}
+		if s.LLM.Model == "" {
+			s.LLM.Model = s.Agent.Model
+		}
 	}
 
 	switch s.Environment {
@@ -325,4 +434,12 @@ func (s *Settings) Save(path string) error {
 	}
 
 	return os.WriteFile(path, data, 0644)
+}
+
+// ToLLMConfig converts the LLM configuration to llm.Config.
+func (s *Settings) ToLLMConfig() LLMConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.LLM
 }

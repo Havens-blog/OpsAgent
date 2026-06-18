@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/datasource/core"
-	"github.com/yourusername/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
 )
 
 // BaseAPMDataSource provides common functionality for APM data sources.
@@ -333,9 +333,7 @@ func (b *BaseAPMDataSource) SetRetryer(retryer *core.Retryer) {
 // ParseTraceSummary parses a raw trace summary into a structured format.
 // This is a helper method that can be used by implementations.
 func (b *BaseAPMDataSource) ParseTraceSummary(raw map[string]interface{}) (*core.TraceSummary, error) {
-	summary := &core.TraceSummary{
-		Labels: make(map[string]string),
-	}
+	summary := &core.TraceSummary{}
 
 	// Extract trace ID
 	if traceID, ok := raw["trace_id"]; ok {
@@ -412,14 +410,7 @@ func (b *BaseAPMDataSource) ParseTraceSummary(raw map[string]interface{}) (*core
 		delete(raw, "span_count")
 	}
 
-	// Remaining fields go to Labels
-	for k, v := range raw {
-		if s, ok := v.(string); ok {
-			summary.Labels[k] = s
-		} else {
-			summary.Labels[k] = fmt.Sprintf("%v", v)
-		}
-	}
+	// Note: remaining fields in raw are ignored since TraceSummary doesn't have a Labels field
 
 	return summary, nil
 }
