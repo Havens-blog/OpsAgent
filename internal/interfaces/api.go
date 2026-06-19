@@ -48,7 +48,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		router:     http.NewServeMux(),
 		logger:     logger,
 		agentMap:   make(map[string]interface{}),
-		corsOrigins: []string{"http://localhost:3000", "http://localhost:8080"},
+		corsOrigins: []string{"http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8080"},
 
 		// Default integrations. In production these would be constructed
 		// from settings (credentials, endpoints); the defaults use the

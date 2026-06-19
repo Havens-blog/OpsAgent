@@ -6,8 +6,10 @@
  * In production, set NEXT_PUBLIC_API_URL to the backend address.
  */
 
+// Use empty string in dev to leverage Next.js rewrites (relative paths)
+// In production, set NEXT_PUBLIC_API_URL to the backend address
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") || ""
+  (process.env.NODE_ENV === "production" ? process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") : "") || ""
 
 export class ApiError extends Error {
   status: number
