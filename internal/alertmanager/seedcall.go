@@ -125,65 +125,70 @@ func (s *SeedCall) Execute(ctx context.Context, incident Incident) (*SeedCallRes
 		MaxResults: 1000,
 	}
 
-	// Collect evidence
+	// collectOne runs a single collector and merges its result into the
+	// aggregate. It is shared by both parallel and sequential paths so that
+	// error accounting stays consistent (no double-counting) and failed
+	// collectors remain discoverable via GetFailedCollectors.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	if s.config.ParallelCollection {
-		// Parallel collection
-		errChan := make(chan error, len(s.collectors))
+	collectOne := func(c EvidenceCollector) {
+		collectorCtx, cancel := context.WithTimeout(ctx, s.config.QueryTimeout)
+		defer cancel()
 
+		cr, err := c.Collect(collectorCtx, req)
+
+		// Always record a result entry so failed collectors are visible.
+		if cr == nil {
+			cr = &CollectionResult{}
+		}
+		// Backfill metadata from the collector interface so downstream
+		// grouping (GetEvidenceByType, GetFailedCollectors) works even
+		// when a collector forgets to populate these fields.
+		if cr.Collector == "" {
+			cr.Collector = c.Name()
+		}
+		if cr.Type == "" {
+			cr.Type = c.Type()
+		}
+		cr.Error = err
+
+		mu.Lock()
+		result.Results = append(result.Results, cr)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("%s collector error: %w", c.Name(), err))
+		} else {
+			result.TotalEvidence += len(cr.Evidence)
+		}
+		mu.Unlock()
+	}
+
+	if s.config.ParallelCollection {
 		for _, collector := range s.collectors {
 			wg.Add(1)
 			go func(c EvidenceCollector) {
 				defer wg.Done()
-
-				collectorCtx, cancel := context.WithTimeout(ctx, s.config.QueryTimeout)
-				defer cancel()
-
-				collectionResult, err := c.Collect(collectorCtx, req)
-
-				mu.Lock()
-				result.Results = append(result.Results, collectionResult)
-				if err != nil {
-					result.Errors = append(result.Errors, err)
-				} else if collectionResult != nil {
-					result.TotalEvidence += len(collectionResult.Evidence)
-				}
-				mu.Unlock()
-
-				if err != nil {
-					errChan <- fmt.Errorf("%s collector error: %w", c.Name(), err)
-				}
+				collectOne(c)
 			}(collector)
 		}
-
 		wg.Wait()
-		close(errChan)
-
-		// Collect errors
-		for err := range errChan {
-			result.Errors = append(result.Errors, err)
-		}
 	} else {
 		// Sequential collection
 		for _, collector := range s.collectors {
-			collectorCtx, cancel := context.WithTimeout(ctx, s.config.QueryTimeout)
-			defer cancel()
-
-			collectionResult, err := collector.Collect(collectorCtx, req)
-
-			result.Results = append(result.Results, collectionResult)
-			if err != nil {
-				result.Errors = append(result.Errors, err)
-			} else if collectionResult != nil {
-				result.TotalEvidence += len(collectionResult.Evidence)
-			}
+			collectOne(collector)
 		}
 	}
 
 	result.EndTime = time.Now()
 	result.Duration = result.EndTime.Sub(result.StartTime)
+
+	// If the overall context was cancelled (e.g. caller-imposed timeout),
+	// surface it to the caller while still returning the partial results
+	// collected so far. A single collector failing does NOT reach here
+	// because ctx itself is still alive.
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 
 	return result, nil
 }
@@ -235,10 +240,11 @@ func (r *SeedCallResult) GetFailedCollectors() []string {
 
 // MockLogCollector is a mock log collector for testing.
 type MockLogCollector struct {
-	name  string
-	delay time.Duration
-	fail  bool
-	count int
+	name         string
+	evidenceType string
+	delay        time.Duration
+	fail         bool
+	count        int
 }
 
 func (m *MockLogCollector) Collect(ctx context.Context, req CollectionRequest) (*CollectionResult, error) {
@@ -252,19 +258,27 @@ func (m *MockLogCollector) Collect(ctx context.Context, req CollectionRequest) (
 		return nil, fmt.Errorf("mock collector failed")
 	}
 
+	// Services may be empty for some incidents; avoid an index panic.
+	source := "unknown"
+	if len(req.Services) > 0 {
+		source = req.Services[0]
+	}
+
 	evidence := make([]Evidence, m.count)
 	for i := 0; i < m.count; i++ {
 		evidence[i] = Evidence{
-			Type:        "logs",
-			Source:      req.Services[0],
+			Type:        m.evidenceType,
+			Source:      source,
 			StartTime:   req.StartTime,
 			EndTime:     req.EndTime,
-			Description: fmt.Sprintf("Mock log entry %d", i),
+			Description: fmt.Sprintf("Mock %s entry %d", m.evidenceType, i),
 		}
 	}
 
 	return &CollectionResult{
-		Evidence: evidence,
+		Collector: m.name,
+		Type:      m.evidenceType,
+		Evidence:  evidence,
 	}, nil
 }
 
@@ -273,15 +287,22 @@ func (m *MockLogCollector) Name() string {
 }
 
 func (m *MockLogCollector) Type() string {
-	return "logs"
+	return m.evidenceType
 }
 
-// NewMockLogCollector creates a new mock log collector.
-func NewMockLogCollector(name string, delay time.Duration, fail bool, count int) EvidenceCollector {
+// NewMockLogCollector creates a new mock collector. evidenceType is optional
+// (variadic) and defaults to "logs", preserving backward compatibility with
+// existing 4-argument callers.
+func NewMockLogCollector(name string, delay time.Duration, fail bool, count int, evidenceType ...string) EvidenceCollector {
+	et := "logs"
+	if len(evidenceType) > 0 && evidenceType[0] != "" {
+		et = evidenceType[0]
+	}
 	return &MockLogCollector{
-		name: name,
-		delay: delay,
-		fail: fail,
-		count: count,
+		name:         name,
+		evidenceType: et,
+		delay:        delay,
+		fail:         fail,
+		count:        count,
 	}
 }

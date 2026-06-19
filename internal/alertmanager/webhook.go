@@ -350,7 +350,13 @@ type IncidentFilter struct {
 // generateIncidentID generates a unique incident ID from an alert.
 func generateIncidentID(alert Alert) string {
 	timestamp := alert.StartsAt.Format("20060102150405")
-	return fmt.Sprintf("INC-%s-%s", timestamp, alert.Fingerprint[:8])
+	// Truncate fingerprint safely — alerts may carry a short or empty
+	// fingerprint, and slicing [:8] unconditionally panics in that case.
+	fp := alert.Fingerprint
+	if len(fp) > 8 {
+		fp = fp[:8]
+	}
+	return fmt.Sprintf("INC-%s-%s", timestamp, fp)
 }
 
 // extractSeverity extracts severity from an alert.

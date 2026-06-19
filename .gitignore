@@ -1,0 +1,55 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+build/
+dist/
+*.test
+
+# Go
+vendor/
+*.sum
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+pnpm-lock.yaml
+
+# Frontend
+web/frontend/.next/
+web/frontend/out/
+web/frontend/.turbo/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test Coverage
+coverage/
+coverage.out
+coverage.html
+*.out
+
+# Logs
+*.log
+logs/
+
+# Temporary
+tmp/
+temp/
+*.tmp

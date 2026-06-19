@@ -160,11 +160,18 @@ func NewBaseAgent(cfg *AgentConfig, settings *config.Settings) (*BaseAgent, erro
 		})
 	}
 
-	// Create LLM client
+	// Create LLM client.
+	// Fall back to the legacy Agent.AnthropicAPIKey when the unified
+	// LLM.APIKey is unset — mirrors the migration in Settings.Validate().
+	apiKey := settings.LLM.APIKey
+	if apiKey == "" {
+		apiKey = settings.Agent.AnthropicAPIKey
+	}
+
 	llmConfig := &llm.Config{
 		Provider:    settings.LLM.Provider,
 		BaseURL:     settings.LLM.BaseURL,
-		APIKey:      settings.LLM.APIKey,
+		APIKey:      apiKey,
 		Model:       cfg.Model,
 		MaxTokens:   4096,
 		Temperature: 0.7,

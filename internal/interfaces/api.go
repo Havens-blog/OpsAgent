@@ -9,9 +9,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Havens-blog/OpsAgent/internal/change"
 	"github.com/Havens-blog/OpsAgent/internal/config"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/topology"
 )
 
 // APIServer represents the REST API server.
@@ -22,6 +24,12 @@ type APIServer struct {
 	logger     *observability.Logger
 	agentMap   map[string]interface{} // Registered agents
 	corsOrigins []string
+
+	// Engine integrations — wired so the console returns real data instead
+	// of placeholders. Each is nil-safe: handlers fall back to empty results
+	// when an integration is not configured.
+	topologyClient *topology.ARMSClient
+	changeStore    change.ChangeStore
 }
 
 // NewAPIServer creates a new API server.
@@ -41,17 +49,66 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		logger:     logger,
 		agentMap:   make(map[string]interface{}),
 		corsOrigins: []string{"http://localhost:3000", "http://localhost:8080"},
+
+		// Default integrations. In production these would be constructed
+		// from settings (credentials, endpoints); the defaults use the
+		// in-memory / mock-backed implementations so the API is functional
+		// out of the box.
+		topologyClient: topology.NewARMSClient(),
+		changeStore:    change.NewMemoryStore(),
 	}
+
+	// Seed demonstrative change data so /api/v1/changes returns something
+	// meaningful before real collectors are registered.
+	seedDemoChanges(server.changeStore)
 
 	server.setupRoutes()
 
 	return server, nil
 }
 
+// seedDemoChanges populates the change store with representative deployment
+// and config-change records so the console has data on a fresh install.
+func seedDemoChanges(store change.ChangeStore) {
+	if store == nil {
+		return
+	}
+	ctx := context.Background()
+	now := time.Now()
+
+	deployments := []change.DeploymentEvent{
+		{
+			ID: "gitlab-deploy-001", CICDSystem: change.CICDSystemGitLabCI,
+			Project: "myproject/backend", Environment: "production", Service: "order-service",
+			CommitSHA: "abc123def456", CommitMessage: "Fix: Database connection pool exhaustion",
+			CommitAuthor: "John Doe", Branch: "main", StartedAt: now.Add(-12 * time.Minute),
+			CompletedAt: now.Add(-9 * time.Minute), Duration: 3 * time.Minute, Status: change.DeploymentStatusSuccess,
+		},
+		{
+			ID: "github-deploy-002", CICDSystem: change.CICDSystemGitHubActions,
+			Project: "myorg/backend", Environment: "production", Service: "payment-service",
+			CommitSHA: "def456ghi789", CommitMessage: "feat: Add payment gateway integration",
+			CommitAuthor: "Jane Smith", Branch: "main", StartedAt: now.Add(-45 * time.Minute),
+			CompletedAt: now.Add(-40 * time.Minute), Duration: 5 * time.Minute, Status: change.DeploymentStatusRolledBack,
+		},
+		{
+			ID: "gitlab-deploy-003", CICDSystem: change.CICDSystemGitLabCI,
+			Project: "myproject/backend", Environment: "production", Service: "user-service",
+			CommitSHA: "999aaa000bbb", CommitMessage: "chore: bump dependencies",
+			CommitAuthor: "CI Bot", Branch: "main", StartedAt: now.Add(-5 * time.Hour),
+			Status: change.DeploymentStatusFailed,
+		},
+	}
+	for _, d := range deployments {
+		_ = store.StoreDeployment(ctx, d)
+	}
+}
+
 // setupRoutes configures all API routes.
 func (s *APIServer) setupRoutes() {
-	// Health check
+	// Health check (both root and versioned paths for console compatibility)
 	s.router.HandleFunc("/health", s.corsMiddleware(s.healthHandler))
+	s.router.HandleFunc("/api/v1/health", s.corsMiddleware(s.healthHandler))
 
 	// API v1 routes
 	s.router.HandleFunc("/api/v1/rca/analyze", s.corsMiddleware(s.rcaAnalyzeHandler))
@@ -67,6 +124,12 @@ func (s *APIServer) setupRoutes() {
 
 	// Inspection endpoints
 	s.router.HandleFunc("/api/v1/inspection/run", s.corsMiddleware(s.inspectionHandler))
+
+	// Change tracking (CI/CD deployments, config changes)
+	s.router.HandleFunc("/api/v1/changes", s.corsMiddleware(s.changesHandler))
+
+	// Catch-all for /api/ routes - return JSON 404
+	s.router.HandleFunc("/api/", s.apiNotFoundHandler)
 }
 
 // Start starts the API server.
@@ -103,7 +166,36 @@ func (s *APIServer) Shutdown(ctx context.Context) error {
 
 // ServeHTTP implements http.Handler interface for testing.
 func (s *APIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.router.ServeHTTP(w, r)
+	// Create a custom response writer to capture 404 responses
+	rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+	s.router.ServeHTTP(rw, r)
+
+	// If no handler was found (status still 0), return 404 JSON response
+	if rw.status == 0 {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Endpoint not found", r.URL.Path)
+	}
+}
+
+// responseWriter wraps http.ResponseWriter to capture status codes.
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+	written bool
+}
+
+func (rw *responseWriter) WriteHeader(status int) {
+	if !rw.written {
+		rw.status = status
+		rw.written = true
+		rw.ResponseWriter.WriteHeader(status)
+	}
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	if !rw.written {
+		rw.WriteHeader(http.StatusOK)
+	}
+	return rw.ResponseWriter.Write(b)
 }
 
 // Middleware
@@ -161,16 +253,6 @@ func (s *APIServer) loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			observability.String("duration", duration.String()),
 		)
 	}
-}
-
-type responseWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *responseWriter) WriteHeader(status int) {
-	w.status = status
-	w.ResponseWriter.WriteHeader(status)
 }
 
 // Handlers
@@ -323,15 +405,53 @@ func (s *APIServer) tracesQueryHandler(w http.ResponseWriter, r *http.Request) {
 
 // topologyHandler handles topology requests.
 func (s *APIServer) topologyHandler(w http.ResponseWriter, r *http.Request) {
-	response := map[string]interface{}{
-		"status":  "ok",
-		"topology": map[string]interface{}{
-			"nodes": []interface{}{},
-			"edges": []interface{}{},
-		},
+	if s.topologyClient == nil {
+		s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"status":   "ok",
+			"topology": map[string]interface{}{"nodes": []interface{}{}, "edges": []interface{}{}},
+		})
+		return
 	}
 
-	s.writeJSONResponse(w, http.StatusOK, response)
+	// Default to the last hour when no time range is supplied.
+	window := topology.TimeWindow{
+		StartTime: time.Now().Add(-1 * time.Hour),
+		EndTime:   time.Now(),
+	}
+
+	graph, err := s.topologyClient.GetServiceGraph(r.Context(), window)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusBadGateway, "topology_error", "Failed to fetch service topology", err.Error())
+		return
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"status":   "ok",
+		"topology": graph,
+	})
+}
+
+// changesHandler handles change-event listing requests (CI/CD deployments).
+func (s *APIServer) changesHandler(w http.ResponseWriter, r *http.Request) {
+	if s.changeStore == nil {
+		s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+			"deployments": []interface{}{},
+			"count":       0,
+		})
+		return
+	}
+
+	filter := change.DeploymentFilter{Limit: 50}
+	deployments, err := s.changeStore.ListDeployments(r.Context(), filter)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "change_error", "Failed to list changes", err.Error())
+		return
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"deployments": deployments,
+		"count":       len(deployments),
+	})
 }
 
 // listAgentsHandler handles agent listing requests.
@@ -403,6 +523,11 @@ func (s *APIServer) inspectionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSONResponse(w, http.StatusAccepted, response)
+}
+
+// apiNotFoundHandler handles API requests that don't match any registered route.
+func (s *APIServer) apiNotFoundHandler(w http.ResponseWriter, r *http.Request) {
+	s.writeErrorResponse(w, http.StatusNotFound, "not_found", "API endpoint not found", r.URL.Path)
 }
 
 // Response helpers

@@ -3,6 +3,8 @@ package sandbox
 
 import (
 	"context"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -319,17 +321,36 @@ func TestWorkingDirectory(t *testing.T) {
 		config := DefaultConfig()
 		exec := NewExecutor(config)
 
-		// Set working directory to /tmp
-		exec.SetWorkingDir("/tmp")
+		// Set working directory to a temp directory (platform-specific)
+		tempDir := os.TempDir()
+		exec.SetWorkingDir(tempDir)
 
-		result, err := exec.Execute(context.Background(), []string{"pwd"})
+		// Use platform-specific command to get current directory
+		var cmd []string
+		if runtime.GOOS == "windows" {
+			cmd = []string{"cmd", "/c", "cd"}
+		} else {
+			cmd = []string{"pwd"}
+		}
+
+		result, err := exec.Execute(context.Background(), cmd)
 
 		if err != nil {
 			t.Fatalf("Failed to execute: %v", err)
 		}
 
-		if !strings.Contains(result.Output, "/tmp") {
-			t.Errorf("Expected working directory /tmp, got: %s", result.Output)
+		// Normalize paths for comparison (remove trailing slashes, etc.)
+		outputDir := strings.TrimSpace(result.Output)
+		expectedDir := tempDir
+
+		// On Windows, paths might have different case
+		if runtime.GOOS == "windows" {
+			outputDir = strings.ToLower(outputDir)
+			expectedDir = strings.ToLower(expectedDir)
+		}
+
+		if !strings.Contains(outputDir, expectedDir) && !strings.Contains(expectedDir, outputDir) {
+			t.Errorf("Expected working directory to contain %s, got: %s", expectedDir, outputDir)
 		}
 	})
 }

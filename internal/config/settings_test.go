@@ -210,7 +210,8 @@ func TestValidate(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
+	for i := range tests {
+		tt := &tests[i] // avoid copying Settings (which embeds a sync.RWMutex)
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.settings.Validate()
 			if (err != nil) != tt.wantErr {
@@ -234,11 +235,11 @@ func TestSetDefaults(t *testing.T) {
 	if s.Server.Port != 8080 {
 		t.Errorf("expected default port 8080, got %d", s.Server.Port)
 	}
-	if s.LLM.Provider != "dashscope" {
-		t.Errorf("expected default LLM provider dashscope, got %s", s.LLM.Provider)
+	if s.LLM.Provider != "claude" {
+		t.Errorf("expected default LLM provider claude, got %s", s.LLM.Provider)
 	}
-	if s.LLM.Model != "qwen-plus" {
-		t.Errorf("expected default LLM model qwen-plus, got %s", s.LLM.Model)
+	if s.LLM.Model != "claude-sonnet-4-20250514" {
+		t.Errorf("expected default LLM model claude-sonnet-4-20250514, got %s", s.LLM.Model)
 	}
 	if s.LLM.MaxTokens != 4096 {
 		t.Errorf("expected default MaxTokens 4096, got %d", s.LLM.MaxTokens)

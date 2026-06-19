@@ -92,25 +92,34 @@ func (c *CLI) Run(args []string) error {
 	}
 
 	// Route to command handlers
+	var err error
 	switch cmd {
 	case "version":
-		return c.versionCommand()
+		err = c.versionCommand()
 	case "analyze":
-		return c.analyzeCommand(cmdArgs)
+		err = c.analyzeCommand(cmdArgs)
 	case "logs":
-		return c.logsCommand(cmdArgs)
+		err = c.logsCommand(cmdArgs)
 	case "metrics":
-		return c.metricsCommand(cmdArgs)
+		err = c.metricsCommand(cmdArgs)
 	case "status":
-		return c.statusCommand()
+		err = c.statusCommand()
 	case "config":
-		return c.configCommand(cmdArgs)
+		err = c.configCommand(cmdArgs)
 	case "help", "-h", "--help":
 		return c.showHelp()
 	default:
 		fmt.Printf("Unknown command: %s\n", cmd)
 		return c.showHelp()
 	}
+
+	// Surface command errors to stdout so they appear in CLI output.
+	// (stderr is reserved for fatal/diagnostic output; command validation
+	// errors are part of the user-facing CLI result.)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+	return err
 }
 
 // versionCommand shows version information.

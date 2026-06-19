@@ -2,14 +2,13 @@
 package alertmanager
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	"github.com/Havens-blog/OpsAgent/internal/llm"
 )
 
 // TestWebhookPayloadParsing tests parsing Alertmanager webhook payloads.
@@ -54,8 +53,8 @@ func TestWebhookPayloadParsing(t *testing.T) {
 		t.Fatalf("Failed to parse payload: %v", err)
 	}
 
-	if webhookPayload.getVersion() != "4" {
-		t.Errorf("Expected version 4, got %s", webhookPayload.getVersion())
+	if webhookPayload.Version != "4" {
+		t.Errorf("Expected version 4, got %s", webhookPayload.Version)
 	}
 
 	if len(webhookPayload.Alerts) != 1 {
@@ -298,24 +297,26 @@ func TestWebhookHandler(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(receiver.handleWebhook))
 	defer server.Close()
 
+	// Create a valid webhook payload
 	payload := WebhookPayload{
 		Version: "4",
 		GroupKey: "test-group",
 		Alerts: []Alert{
 			{
-				Status: "firing",
+				Status: "resolved",
 				Labels: map[string]string{
 					"alertname": "TestAlert",
 					"severity":  "P2",
 				},
 				StartsAt:    time.Now(),
+				EndsAt:      time.Now(),
 				Fingerprint: "test-fp",
 			},
 		},
 	}
 
 	body, _ := json.Marshal(payload)
-	resp, err := http.Post(server.URL+"/webhooks/alertmanager", "application/json", nil)
+	resp, err := http.Post(server.URL+"/webhooks/alertmanager", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("Failed to send request: %v", err)
 	}
@@ -324,22 +325,4 @@ func TestWebhookHandler(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
 	}
-}
-
-// Helper functions for accessing private fields in tests
-
-func (p WebhookPayload) getVersion() string {
-	return p.Version
-}
-
-func (r *Receiver) createOrUpdateIncident(ctx context.Context, alert Alert, payload WebhookPayload) (Incident, error) {
-	return r.createOrUpdateIncident(ctx, alert, payload)
-}
-
-func (r *Receiver) processAlert(ctx context.Context, alert Alert, payload WebhookPayload) error {
-	return r.processAlert(ctx, alert, payload)
-}
-
-func (r *Receiver) collectEvidence(ctx context.Context, incident Incident) ([]Evidence, error) {
-	return r.collectEvidence(ctx, incident)
 }

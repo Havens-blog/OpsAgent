@@ -177,7 +177,7 @@ func TestEvidenceByType(t *testing.T) {
 
 	collectors := []EvidenceCollector{
 		NewMockLogCollector("log-collector", 50*time.Millisecond, false, 5),
-		NewMockLogCollector("metric-collector", 50*time.Millisecond, false, 3),
+		NewMockLogCollector("metric-collector", 50*time.Millisecond, false, 3, "metrics"),
 	}
 
 	seedCall := NewSeedCall(config, collectors)
@@ -209,7 +209,7 @@ func TestEvidenceByType(t *testing.T) {
 		t.Errorf("Expected 5 log items, got %d", len(logEvidence))
 	}
 
-	metricEvidence, ok := evidenceByType["logs"]
+	metricEvidence, ok := evidenceByType["metrics"]
 	if !ok {
 		t.Error("Expected metrics evidence type")
 	}

@@ -46,16 +46,19 @@ func (s *MemoryIncidentStore) Get(ctx context.Context, id string) (Incident, err
 	return incident, nil
 }
 
-// Update updates an existing incident.
+// Update upserts an incident. If the incident does not yet exist it is
+// created (with CreatedAt set); otherwise it is overwritten. This makes
+// Update safe to call from the lifecycle manager, which may transition an
+// incident that was never explicitly Stored first.
 func (s *MemoryIncidentStore) Update(ctx context.Context, incident Incident) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	if _, exists := s.incidents[incident.ID]; !exists {
-		return fmt.Errorf("incident not found: %s", incident.ID)
+		incident.CreatedAt = now
 	}
-
-	incident.UpdatedAt = time.Now()
+	incident.UpdatedAt = now
 	s.incidents[incident.ID] = incident
 	return nil
 }

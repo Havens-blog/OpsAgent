@@ -82,6 +82,17 @@ func (e *Executor) Execute(ctx context.Context, command []string) (*SandboxResul
 		return nil, fmt.Errorf("empty command")
 	}
 
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		return &SandboxResult{
+			ExitCode: -1,
+			Error:    "context cancelled",
+		}, ctx.Err()
+	default:
+		// Context is valid, continue
+	}
+
 	// Create context with timeout
 	timeoutCtx, cancel := context.WithTimeout(ctx, e.config.Timeout)
 	defer cancel()
