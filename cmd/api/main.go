@@ -16,10 +16,15 @@ import (
 )
 
 func main() {
-	// Load settings. config.Get() initializes with defaults and does not
-	// require an API key — the API server itself doesn't call the LLM,
-	// it only exposes data and forwards analysis requests.
-	settings := config.Get()
+	// Load settings from config directory. Try to load full config (including LLM)
+	// but fall back to defaults if LLM is not configured — the API server should
+	// remain functional for endpoints that don't require LLM (topology, RCA, etc.).
+	settings, err := config.Load("./config")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to load config from ./config: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Using default configuration (chat assistant will not be available)")
+		settings = config.Get()
+	}
 
 	server, err := interfaces.NewAPIServer(settings)
 	if err != nil {
@@ -40,6 +45,7 @@ func main() {
 		fmt.Println("  GET  /api/v1/topology")
 		fmt.Println("  GET  /api/v1/changes")
 		fmt.Println("  GET  /api/v1/agents")
+		fmt.Println("  POST /api/v1/chat")
 		fmt.Println("  POST /api/v1/rca/analyze")
 		if err := server.Start(); err != nil {
 			errCh <- err

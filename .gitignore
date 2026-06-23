@@ -28,6 +28,11 @@ web/frontend/.turbo/
 .env.local
 .env.*.local
 
+# Sensitive configuration (contains API keys, tokens)
+config/settings.yaml
+config/settings.local.yaml
+config/settings.*.yaml
+
 # IDE
 .vscode/
 .idea/

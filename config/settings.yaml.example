@@ -23,10 +23,10 @@ llm:
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 
   # API 密钥 (推荐使用环境变量 LLM_API_KEY)
-  api_key: sk-15663e36bfd746e6a9d59eae05649ad0
+  api_key: ${LLM_API_KEY}
 
   # 模型名称
-  model: qwen3.7-plus
+  model: qwen-plus
 
   # 可选参数
   max_tokens: 4096
@@ -34,13 +34,6 @@ llm:
   timeout: 120
 
 # ==================== 其他 LLM 提供商示例 ====================
-
-# 阿里云百炼
-# llm:
-#   provider: dashscope
-#   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-#   api_key: ${LLM_API_KEY}
-#   model: qwen-plus  # qwen-turbo, qwen-plus, qwen-max
 
 # 火山引擎方舟
 # llm:
@@ -144,7 +137,7 @@ datasources:
     username: ${ELASTIC_USERNAME}
     password: ${ELASTIC_PASSWORD}
 
-# ==================== 可观��性配置 ====================
+# ==================== 可观测性配置 ====================
 observability:
   # 日志级别: debug, info, warn, error
   log_level: info

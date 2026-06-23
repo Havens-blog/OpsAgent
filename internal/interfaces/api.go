@@ -10,9 +10,13 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/change"
+	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/config"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
+	"github.com/Havens-blog/OpsAgent/internal/rca"
+	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
 	"github.com/Havens-blog/OpsAgent/internal/topology"
 )
 
@@ -30,6 +34,13 @@ type APIServer struct {
 	// when an integration is not configured.
 	topologyClient *topology.ARMSClient
 	changeStore    change.ChangeStore
+
+	// RCA engine and report store
+	rcaEngine    *engine.Engine
+	rcaStore     rca.RCAReportStore
+
+	// Chat service for conversational assistant (nil-safe)
+	chatService *chat.Service
 }
 
 // NewAPIServer creates a new API server.
@@ -41,6 +52,40 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	logger, err := observability.NewLogger("api-server", settings.Observability.LogLevel, observability.FormatJSON)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create logger: %w", err)
+	}
+
+	// Initialize RCA engine with mock sources
+	rcaEngine, err := engine.NewEngine(
+		engine.WithLogSource(sources.NewMockLogSource()),
+		engine.WithMetricSource(sources.NewMockMetricSource()),
+		engine.WithTraceSource(sources.NewMockTraceSource()),
+		engine.WithTopologySource(sources.NewMockTopologySource()),
+		engine.WithChangeSource(sources.NewMockChangeSource()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create RCA engine: %w", err)
+	}
+
+	// Initialize RCA report store
+	rcaStore := rca.NewMemoryRCAReportStore()
+
+	// Seed demo RCA reports
+	rca.SeedDemoReports(rcaStore)
+
+	// Initialize chat service (nil-safe - if LLM not configured, chat endpoints return 503)
+	llmConfig := settings.ToLLMConfig()
+	chatService, err := chat.NewService(llmConfig)
+	if err != nil {
+		logger.Warn("Chat service not available",
+			observability.Err(err),
+			observability.String("hint", "Configure LLM_API_KEY in config/settings.yaml to enable chat assistant"),
+		)
+		chatService = nil
+	} else {
+		logger.Info("Chat service initialized",
+			observability.String("provider", settings.LLM.Provider),
+			observability.String("model", settings.LLM.Model),
+		)
 	}
 
 	server := &APIServer{
@@ -56,6 +101,9 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		// out of the box.
 		topologyClient: topology.NewARMSClient(),
 		changeStore:    change.NewMemoryStore(),
+		rcaEngine:      rcaEngine,
+		rcaStore:       rcaStore,
+		chatService:    chatService,
 	}
 
 	// Seed demonstrative change data so /api/v1/changes returns something
@@ -112,11 +160,15 @@ func (s *APIServer) setupRoutes() {
 
 	// API v1 routes
 	s.router.HandleFunc("/api/v1/rca/analyze", s.corsMiddleware(s.rcaAnalyzeHandler))
-	s.router.HandleFunc("/api/v1/rca/status/", s.corsMiddleware(s.rcaStatusHandler))
+	s.router.HandleFunc("/api/v1/rca", s.corsMiddleware(s.listRCAHandler))                    // GET /api/v1/rca - list all RCA reports
+	s.router.HandleFunc("/api/v1/rca/", s.corsMiddleware(s.getRCAHandler))                     // GET /api/v1/rca/{id} - get specific RCA report
 	s.router.HandleFunc("/api/v1/logs/query", s.corsMiddleware(s.logQueryHandler))
 	s.router.HandleFunc("/api/v1/metrics/query", s.corsMiddleware(s.metricsQueryHandler))
 	s.router.HandleFunc("/api/v1/traces/query", s.corsMiddleware(s.tracesQueryHandler))
 	s.router.HandleFunc("/api/v1/topology", s.corsMiddleware(s.topologyHandler))
+
+	// Conversational assistant
+	s.router.HandleFunc("/api/v1/chat", s.corsMiddleware(s.chatHandler))
 
 	// Agent management
 	s.router.HandleFunc("/api/v1/agents", s.corsMiddleware(s.listAgentsHandler))
@@ -305,6 +357,9 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		Severity:        req.Severity,
 		AffectedServices: req.AffectedServices,
 		Description:     req.Description,
+		Source:          "api",
+		Labels:          map[string]string{"status": "running"},
+		DetectedAt:      time.Now(),
 	}
 
 	// Validate incident
@@ -318,16 +373,163 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		observability.String("severity", req.Severity),
 	)
 
-	// In real implementation, would delegate to RCA engine
-	// For now, return acceptance response
+	// Run RCA analysis in background
+	go func() {
+		ctx := context.Background()
+		report, err := s.rcaEngine.Analyze(ctx, incident)
+		if err != nil {
+			s.logger.Error("RCA analysis failed",
+				observability.String("incident_id", req.IncidentID),
+				observability.Err(err),
+			)
+			// Update incident status to failed
+			incident.Labels["status"] = "failed"
+			_ = s.rcaStore.UpdateStatus(ctx, req.IncidentID, "failed")
+			return
+		}
+
+		// Store the report
+		if err := s.rcaStore.Store(ctx, report); err != nil {
+			s.logger.Error("Failed to store RCA report",
+				observability.String("incident_id", req.IncidentID),
+				observability.Err(err),
+			)
+			return
+		}
+
+		s.logger.Info("RCA analysis completed",
+			observability.String("incident_id", req.IncidentID),
+			observability.Float64("confidence", report.Confidence),
+		)
+	}()
+
+	// Return immediate acceptance response
 	response := map[string]interface{}{
 		"incident_id": req.IncidentID,
 		"status":      "accepted",
-		"message":     "RCA analysis queued for processing",
-		"estimated_duration": "2-5 minutes",
+		"message":     "RCA analysis started",
 	}
 
 	s.writeJSONResponse(w, http.StatusAccepted, response)
+}
+
+// listRCAHandler handles listing all RCA reports.
+func (s *APIServer) listRCAHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed", "")
+		return
+	}
+
+	ctx := r.Context()
+	reports, err := s.rcaStore.List(ctx)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to list reports", err.Error())
+		return
+	}
+
+	// Convert to frontend format
+	type reportResponse struct {
+		IncidentID       string                       `json:"incident_id"`
+		Severity         string                       `json:"severity"`
+		Description      string                       `json:"description"`
+		StartTime        string                       `json:"start_time"`
+		EndTime          string                       `json:"end_time,omitempty"`
+		AffectedServices []string                     `json:"affected_services"`
+		Status           string                       `json:"status"`
+		Candidates       []models.ScoredHypothesis    `json:"candidates"`
+		TopCandidate     *models.ScoredHypothesis     `json:"top_candidate,omitempty"`
+		Confidence       float64                      `json:"confidence"`
+		DurationMS       int64                        `json:"duration_ms,omitempty"`
+		GeneratedAt      string                       `json:"generated_at,omitempty"`
+	}
+
+	result := make([]reportResponse, 0, len(reports))
+	for _, report := range reports {
+		if report.Incident == nil {
+			continue
+		}
+		status := "running"
+		if report.Incident.Labels != nil {
+			if s, ok := report.Incident.Labels["status"]; ok {
+				status = s
+			}
+		}
+
+		result = append(result, reportResponse{
+			IncidentID:       report.Incident.ID,
+			Severity:         report.Incident.Severity,
+			Description:      report.Incident.Description,
+			StartTime:        report.Incident.StartTime.Format(time.RFC3339),
+			EndTime:          formatTimePtr(report.Incident.EndTime),
+			AffectedServices: report.Incident.AffectedServices,
+			Status:           status,
+			Candidates:       report.Candidates,
+			TopCandidate:     report.TopCandidate,
+			Confidence:        report.Confidence,
+			DurationMS:       int64(report.Duration.Seconds() * 1000),
+			GeneratedAt:      formatTimePtr(report.GeneratedAt),
+		})
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"reports": result,
+		"count":   len(result),
+	})
+}
+
+// getRCAHandler handles getting a specific RCA report.
+func (s *APIServer) getRCAHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Only GET is allowed", "")
+		return
+	}
+
+	// Extract incident ID from path
+	incidentID := strings.TrimPrefix(r.URL.Path, "/api/v1/rca/")
+	if incidentID == "" {
+		s.writeErrorResponse(w, http.StatusBadRequest, "missing_id", "Incident ID is required", "")
+		return
+	}
+
+	ctx := r.Context()
+	report, err := s.rcaStore.Get(ctx, incidentID)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "RCA report not found", err.Error())
+		return
+	}
+
+	// Convert to frontend format
+	status := "running"
+	if report.Incident.Labels != nil {
+		if s, ok := report.Incident.Labels["status"]; ok {
+			status = s
+		}
+	}
+
+	result := map[string]interface{}{
+		"incident_id":       report.Incident.ID,
+		"severity":          report.Incident.Severity,
+		"description":       report.Incident.Description,
+		"start_time":        report.Incident.StartTime.Format(time.RFC3339),
+		"end_time":          formatTimePtr(report.Incident.EndTime),
+		"affected_services": report.Incident.AffectedServices,
+		"status":            status,
+		"candidates":        report.Candidates,
+		"top_candidate":     report.TopCandidate,
+		"confidence":         report.Confidence,
+		"duration_ms":       int64(report.Duration.Seconds() * 1000),
+		"generated_at":      formatTimePtr(report.GeneratedAt),
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, result)
+}
+
+// formatTimePtr formats a time pointer or returns empty string if nil.
+func formatTimePtr(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 // rcaStatusHandler handles RCA status requests.

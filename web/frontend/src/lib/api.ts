@@ -121,6 +121,67 @@ export interface DeploymentEvent {
   status: string
 }
 
+/* ---------- RCA types ---------- */
+
+/** Multi-dimensional scoring breakdown (mirrors models.ScoreBreakdown). */
+export interface ScoreBreakdown {
+  time_correlation: number
+  topology_score: number
+  change_proximity: number
+  metric_severity: number
+  error_frequency: number
+  trace_evidence: number
+}
+
+/** A single root-cause candidate hypothesis. */
+export interface Hypothesis {
+  type: string // error_spike | metric_anomaly | change | dependency | latency | resource
+  service: string
+  description: string
+  metric?: string
+  change_id?: string
+  evidence: string[]
+  confidence: number
+}
+
+/** A hypothesis with its computed score and breakdown. */
+export interface ScoredHypothesis extends Hypothesis {
+  score: number
+  breakdown: ScoreBreakdown
+}
+
+/** A complete RCA report — the payload of GET /api/v1/rca/:id. */
+export interface RCAReport {
+  incident_id: string
+  severity: string
+  description: string
+  start_time: string
+  end_time?: string
+  affected_services: string[]
+  status: "running" | "completed" | "failed"
+  candidates: ScoredHypothesis[]
+  top_candidate?: ScoredHypothesis
+  confidence: number
+  duration_ms?: number
+  generated_at?: string
+}
+
+/* ---------- Chat types ---------- */
+
+export interface ChatMessage {
+  role: "user" | "assistant"
+  content: string
+}
+
+export interface ChatResponse {
+  reply: string
+  agent: string
+  timestamp: string
+  model?: string
+  thinking?: { step: string; detail: string }[]
+  tools?: { tool: string; params: Record<string, unknown>; result: string }[]
+}
+
 /* ---------- Endpoints ---------- */
 
 export const api = {
@@ -138,6 +199,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  listRCA: () =>
+    request<{ reports: RCAReport[]; count: number }>("/api/v1/rca"),
+
+  getRCA: (id: string) => request<RCAReport>(`/api/v1/rca/${id}`),
 
   queryLogs: (body: {
     query: string
@@ -162,4 +228,10 @@ export const api = {
 
   getTopology: () =>
     request<{ status: string; topology: ServiceGraph }>("/api/v1/topology"),
+
+  chat: (messages: ChatMessage[]) =>
+    request<ChatResponse>("/api/v1/chat", {
+      method: "POST",
+      body: JSON.stringify({ messages }),
+    }),
 }
