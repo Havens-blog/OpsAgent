@@ -2,8 +2,6 @@
 package observability
 
 import (
-	"context"
-	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -197,11 +195,11 @@ func (l *Logger) With(fields ...Field) *Logger {
 
 	zapFields := l.convertFields(fields)
 	return &Logger{
-		zapLogger:    l.zapLogger.With(zapFields...),
+		zapLogger:    l.zapLogger,
 		sugarLogger:  l.sugarLogger.With(zapFields...),
 		level:        l.level,
 		format:       l.format,
-		serviceName:  l.serviceName,
+		serviceName:   l.serviceName,
 		serviceVersion: l.serviceVersion,
 	}
 }

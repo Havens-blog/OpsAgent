@@ -5,8 +5,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"github.com/yourusername/OpsAgent/internal/guardrails"
 )
 
 // ToolFunc represents the function that implements a tool.

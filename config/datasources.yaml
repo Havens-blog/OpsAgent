@@ -38,6 +38,21 @@ datasources:
       max_backoff: 30s
       backoff_multiplier: 2.0
 
+  # Alibaba Cloud ARMS Prometheus (cn-shenzhen)
+  aliyun_arms_prometheus:
+    name: "aliyun_arms_prometheus"
+    type: "prometheus"
+    enabled: true
+    timeout: 30s
+    endpoint: "http://cn-shenzhen.arms.aliyuncs.com:9090/api/v1/prometheus/6469bbee182a75c7bd061aea31573b1/1210557380197478/cms-25ef75ffbedf12c809ef4/cn-shenzhen"
+    bearer_token: "${ARMS_PROMETHEUS_BEARER_TOKEN}"
+    retry:
+      max_attempts: 3
+      initial_backoff: 500ms
+      max_backoff: 30s
+      backoff_multiplier: 2.0
+      retryable_errors: ["timeout", "network", "rate_limit", "temporary"]
+
   # Prometheus (IDC - P1)
   prometheus_idc:
     name: "prometheus_idc"

@@ -40,6 +40,11 @@ func (s SideEffectLevel) RequiresConfirmation() bool {
 	return s == SideEffectMutating || s == SideEffectExternal
 }
 
+// IsExternal returns true if this level represents external effects.
+func (s SideEffectLevel) IsExternal() bool {
+	return s == SideEffectExternal
+}
+
 // Validate checks if the side effect level is valid.
 func (s SideEffectLevel) Validate() bool {
 	switch s {

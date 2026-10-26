@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/datasource/core"
-	"github.com/yourusername/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
 )
 
 // AliyunARMSConfig represents the ARMS-specific configuration.
@@ -80,7 +80,7 @@ func (c *AliyunARMSClient) Connect(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("connection failed: %s", string(body)))
+		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("connection failed: %s", string(body)), nil)
 	}
 
 	c.connected = true
@@ -195,7 +195,7 @@ func (c *AliyunARMSClient) Type() core.DataSourceType {
 }
 
 // buildAPIRequest builds an HTTP request for ARMS API.
-func (c *AliyunARMSClient) buildAPIRequest(ctx context.Context, version, action, params map[string]string) (*http.Request, error) {
+func (c *AliyunARMSClient) buildAPIRequest(ctx context.Context, version string, action string, params map[string]string) (*http.Request, error) {
 	endpoint := c.config.Endpoint
 	if endpoint == "" {
 		endpoint = fmt.Sprintf("https://arms.%s.aliyuncs.com", c.config.Region)
@@ -461,8 +461,8 @@ func (c *AliyunARMSClient) parseAPMDataPoint(raw map[string]interface{}) (*core.
 		case float64:
 			dp.Value = v
 		case string:
-			if f, err := fmt.Sprintf(v); err == nil {
-				_ = f // handled below
+			if f, err := fmt.Sscanf(v, "%f", &dp.Value); err == nil && f == 1 {
+				// value parsed
 			}
 		}
 	}

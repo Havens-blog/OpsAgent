@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/datasource/core"
-	"github.com/yourusername/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
 )
 
 // AliyunSLSConfig represents the SLS-specific configuration.
@@ -77,7 +77,7 @@ func (c *AliyunSLSClient) Connect(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("connection failed: %s", string(body)))
+		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("connection failed: %s", string(body)), nil)
 	}
 
 	c.connected = true

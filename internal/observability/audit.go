@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -170,9 +171,6 @@ func (w *FileAuditWriter) redactValue(key string, value interface{}) interface{}
 
 	return value
 }
-
-// strings package is needed for strings.ToLower and strings.Contains
-import "strings"
 
 // AuditLogger manages audit logging.
 type AuditLogger struct {

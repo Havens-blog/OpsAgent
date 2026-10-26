@@ -219,31 +219,31 @@ make typecheck
 - [x] 假设生成与评分
 - [x] 单元测试框架
 
-### Phase 2 — 告警驱动工作流
-- [ ] Alertmanager Webhook 接入
-- [ ] Incident Lifecycle 模型
-- [ ] Seed Call 自动证据获取
+### Phase 2 — 告警驱动工作流 ✅
+- [x] Alertmanager Webhook 接入
+- [x] Incident Lifecycle 模型
+- [x] Seed Call 自动证据获取
 
-### Phase 3 — 变更关联增强
-- [ ] CI/CD 部署记录集成
-- [ ] 配置变更日志采集
-- [ ] 变更-故障时间窗口分析
+### Phase 3 — 变更关联增强 ✅
+- [x] CI/CD 部署记录集成
+- [x] 配置变更日志采集
+- [x] 变更-故障时间窗口分析
 
-### Phase 4 — 拓扑感知 RCA
-- [ ] ARMS Service Graph 集成
-- [ ] 上下游传播分析
-- [ ] 拓扑路径评分
+### Phase 4 — 拓扑感知 RCA ✅
+- [x] ARMS Service Graph 集成
+- [x] 上下游传播分析
+- [x] 拓扑路径评分
 
-### Phase 5 — Multi-Agent 协作
-- [ ] Agent 通信协议
-- [ ] 证据共享机制
-- [ ] 冲突裁决策略
+### Phase 5 — Multi-Agent 协作 ✅
+- [x] Agent 通信协议
+- [x] 证据共享机制
+- [x] 冲突裁决策略
 
-### Phase 6 — 生产就绪
-- [ ] Web 控制台
-- [ ] REST API
-- [ ] 钉钉/企业微信集成
-- [ ] Docker/K8s 部署
+### Phase 6 — 生产就绪 ✅
+- [x] Web 控制台
+- [x] REST API
+- [x] 钉钉/企业微信集成
+- [x] Docker/K8s 部署
 
 ---
 

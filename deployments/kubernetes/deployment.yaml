@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opsagent
+  namespace: default
+  labels:
+    app: opsagent
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: opsagent
+  template:
+    metadata:
+      labels:
+        app: opsagent
+        version: v1
+    spec:
+      containers:
+      - name: opsagent
+        image: opsagent:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: OPSAGENT_ENVIRONMENT
+          value: "production"
+        - name: OPSAGENT_HOST
+          value: "0.0.0.0"
+        - name: OPSAGENT_PORT
+          value: "8080"
+        - name: OPSAGENT_LOG_LEVEL
+          value: "info"
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: opsagent-secrets
+              key: anthropic-api-key
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: data
+          mountPath: /app/data
+        - name: logs
+          mountPath: /app/logs
+      volumes:
+      - name: config
+        configMap:
+          name: opsagent-config
+      - name: data
+        emptyDir: {}
+      - name: logs
+        emptyDir: {}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opsagent
+  namespace: default
+  labels:
+    app: opsagent
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: http
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: metrics
+    protocol: TCP
+  selector:
+    app: opsagent
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opsagent-config
+  namespace: default
+data:
+  settings.yaml: |
+    environment: production
+    server:
+      host: "0.0.0.0"
+      port: 8080
+      read_timeout: 30
+      write_timeout: 30
+    agent:
+      model: "claude-sonnet-4-20250514"
+      max_turns: 10
+      timeout: 300
+      max_parallel_agents: 5
+    observability:
+      log_level: "info"
+      log_format: "json"
+      enable_tracing: false
+      enable_metrics: true
+      metrics_port: 9090
+    security:
+      enable_audit_log: true
+      audit_log_path: "/app/logs/audit.log"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: opsagent-secrets
+  namespace: default
+type: Opaque
+stringData:
+  anthropic-api-key: "your-api-key-here"

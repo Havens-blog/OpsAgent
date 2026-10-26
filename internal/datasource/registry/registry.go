@@ -4,12 +4,15 @@ package registry
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 
-	"github.com/yourusername/OpsAgent/internal/datasource/core"
-	"github.com/yourusername/OpsAgent/internal/datasource/credentials"
-	"github.com/yourusername/OpsAgent/internal/datasource/log"
-	apm "github.com/yourusername/OpsAgent/internal/datasource/apm"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/log"
+	apm "github.com/Havens-blog/OpsAgent/internal/datasource/apm"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/metrics"
 )
 
 // DataSourceEntry holds a data source instance and its metadata.
@@ -21,8 +24,8 @@ type DataSourceEntry struct {
 
 // Registry manages data source registration and discovery.
 type Registry struct {
-	mu      sync.RWMutex
-	entries map[string]*DataSourceEntry
+	mu           sync.RWMutex
+	entries      map[string]*DataSourceEntry
 	credProvider credentials.Provider
 }
 
@@ -77,6 +80,21 @@ func (r *Registry) GetLogDataSource(name string) (core.LogDataSource, error) {
 	return logDS, nil
 }
 
+// GetMetricsDataSource retrieves a metrics data source by name.
+func (r *Registry) GetMetricsDataSource(name string) (core.MetricsDataSource, error) {
+	ds, err := r.Get(name)
+	if err != nil {
+		return nil, err
+	}
+
+	metricsDS, ok := ds.(core.MetricsDataSource)
+	if !ok {
+		return nil, fmt.Errorf("data source %s is not a metrics data source", name)
+	}
+
+	return metricsDS, nil
+}
+
 // GetAPMDataSource retrieves an APM data source by name.
 func (r *Registry) GetAPMDataSource(name string) (core.APMDataSource, error) {
 	ds, err := r.Get(name)
@@ -126,6 +144,20 @@ func (r *Registry) ListLogDataSources() []string {
 	names := make([]string, 0)
 	for name, entry := range r.entries {
 		if _, ok := entry.DataSource.(core.LogDataSource); ok {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+// ListMetricsDataSources returns all metrics data source names.
+func (r *Registry) ListMetricsDataSources() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	names := make([]string, 0)
+	for name, entry := range r.entries {
+		if _, ok := entry.DataSource.(core.MetricsDataSource); ok {
 			names = append(names, name)
 		}
 	}
@@ -220,6 +252,19 @@ func (r *Registry) SetupFromConfig(ctx context.Context, configs map[string]inter
 				return fmt.Errorf("failed to connect ARMS %s: %w", name, err)
 			}
 
+		case core.DataSourceTypePrometheus:
+			promConfig := r.parsePrometheusConfig(name, cfgMap)
+			client, err := metrics.NewPrometheusClient(promConfig)
+			if err != nil {
+				return fmt.Errorf("failed to create Prometheus client %s: %w", name, err)
+			}
+			if err := r.Register(name, client, &promConfig.Config); err != nil {
+				return err
+			}
+			if err := client.Connect(ctx); err != nil {
+				return fmt.Errorf("failed to connect Prometheus %s: %w", name, err)
+			}
+
 		default:
 			// Unsupported data source type, skip
 			continue
@@ -311,6 +356,41 @@ func (r *Registry) parseARMSConfig(name string, cfg map[string]interface{}) *cor
 	}
 	if v, ok := cfg["security_token"].(string); ok {
 		config.SecurityToken = v
+	}
+
+	return config
+}
+
+// parsePrometheusConfig parses Prometheus configuration from a map.
+func (r *Registry) parsePrometheusConfig(name string, cfg map[string]interface{}) *core.PrometheusConfig {
+	config := &core.PrometheusConfig{
+		Config: core.Config{
+			Name:    name,
+			Type:    core.DataSourceTypePrometheus,
+			Enabled: true,
+		},
+	}
+
+	if v, ok := cfg["endpoint"].(string); ok {
+		config.Endpoint = v
+	}
+	if v, ok := cfg["username"].(string); ok {
+		config.Username = v
+	}
+	if v, ok := cfg["password"].(string); ok {
+		config.Password = v
+	}
+
+	// Bearer token from config or environment
+	if v, ok := cfg["bearer_token"].(string); ok && v != "" {
+		// Check if it's an environment variable reference
+		if strings.HasPrefix(v, "${") && strings.HasSuffix(v, "}") {
+			envVar := strings.TrimPrefix(v, "${")
+			envVar = strings.TrimSuffix(envVar, "}")
+			config.BearerToken = os.Getenv(envVar)
+		} else {
+			config.BearerToken = v
+		}
 	}
 
 	return config

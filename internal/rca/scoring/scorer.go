@@ -6,7 +6,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 )
 
 // ScoreResult represents the result of scoring a hypothesis.
@@ -64,14 +64,16 @@ func (s *MultiDimensionalScorer) Score(ctx context.Context, hypothesis *models.H
 func (s *MultiDimensionalScorer) scoreTimeCorrelation(hypothesis *models.Hypothesis, signals *models.NormalizedSignals, incident *models.Incident) float64 {
 	score := 0.0
 
-	// Check if logs spike during incident window
+	// Check if logs spike during incident window.计数按假设的服务过滤:
+	// 归因对象是该服务,用全局窗口计数会把别的服务的流量算进该假设的
+	// 时间相关性(全局计数曾让噪声服务的尖峰抬高所有假设的得分)。
 	if hypothesis.Service != "" {
 		for i, window := range signals.TimeWindows {
 			isIncidentWindow := window.End.After(incident.StartTime) && window.Start.Before(incident.EndTime)
-			logCount := len(signals.LogByWindow[i])
+			logCount := countLogsForService(signals.LogByWindow[i], hypothesis.Service)
 
 			if isIncidentWindow && logCount > 0 {
-				baselineAvg := s.getBaselineLogCount(signals, i)
+				baselineAvg := s.getServiceBaselineLogCount(signals, i, hypothesis.Service)
 				if baselineAvg > 0 {
 					ratio := float64(logCount) / baselineAvg
 					if ratio > 2.0 {
@@ -81,6 +83,15 @@ func (s *MultiDimensionalScorer) scoreTimeCorrelation(hypothesis *models.Hypothe
 					} else if ratio > 1.2 {
 						score = max(score, 0.4)
 					}
+				} else if i > 0 {
+					// 基线窗口存在(非窗口 0 构造性无前置)但该服务零采样,
+					// 而事故窗有日志:日志源为"最近优先"采样截断(联邦/云侧
+					// limit),高流量舰队下基线窗口恒采不到 —— 能走到这里的
+					// error-spike 假设已通过生成侧 incident > 2×baseline &&
+					// > 10 的尖峰判定,采样形状本身即尖峰证据,按满值计时间
+					// 相关,不把"零基线采样"当"无时间证据"(那会系统性抹掉
+					// 日志维度假设)。窗口 0 无前置窗口,无从判定,不得分。
+					score = max(score, 1.0)
 				}
 			}
 		}
@@ -293,6 +304,38 @@ func (s *MultiDimensionalScorer) getBaselineLogCount(signals *models.NormalizedS
 		return 0
 	}
 	return float64(total) / float64(count)
+}
+
+// getServiceBaselineLogCount 单服务版基线均值(事故窗之前窗口里该服务的
+// 平均采样条数),与 scoreTimeCorrelation 的按服务计数同口径。
+func (s *MultiDimensionalScorer) getServiceBaselineLogCount(signals *models.NormalizedSignals, incidentWindowIndex int, service string) float64 {
+	if incidentWindowIndex <= 0 {
+		return 0
+	}
+
+	total := 0
+	count := 0
+	for i := 0; i < incidentWindowIndex && i < len(signals.TimeWindows); i++ {
+		total += countLogsForService(signals.LogByWindow[i], service)
+		count++
+	}
+
+	if count == 0 {
+		return 0
+	}
+	return float64(total) / float64(count)
+}
+
+// countLogsForService 统计一个窗口内属于指定服务的日志条数(时间相关性
+// 与基线共用的单一口径;IsError 不在此过滤 —— 与生成侧尖峰判定同口径)。
+func countLogsForService(logs []models.LogEntry, service string) int {
+	n := 0
+	for _, l := range logs {
+		if l.Service == service {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *MultiDimensionalScorer) normalizeConfidence(score float64) float64 {

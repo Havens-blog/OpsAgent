@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 )
 
 func TestMultiDimensionalScorer(t *testing.T) {
@@ -663,5 +663,79 @@ func TestMaxFunction(t *testing.T) {
 		if result != tt.want {
 			t.Errorf("max(%v, %v) = %v, want %v", tt.a, tt.b, result, tt.want)
 		}
+	}
+}
+
+// TestScoreTimeCorrelationPerService 锁定两个修复:
+//  1. 时间相关性按假设的服务计数(别的服务的日志不再抬分);
+//  2. 基线窗口零采样但事故窗有该服务日志(最近优先采样截断的尖峰形态)
+//     按满值计时间相关,不当作无证据;窗口 0 构造性无前置,不得分。
+func TestScoreTimeCorrelationPerService(t *testing.T) {
+	scorer := NewMultiDimensionalScorer(DefaultWeights())
+	// 显式窗口:4 个事故前基线窗 + 4 个事故窗(镜像引擎 generateTimeWindows 的
+	// [start-windowSize, end] 形状,事故覆盖后半段)。
+	base := time.Now().Add(-2 * time.Hour)
+	incStart := base.Add(4 * 10 * time.Minute)
+	incEnd := incStart.Add(4 * 10 * time.Minute)
+	incident := &models.Incident{ID: "t", StartTime: incStart, EndTime: incEnd, Severity: "P1"}
+	var windows []models.TimeWindow
+	for i := 0; i < 8; i++ {
+		st := base.Add(time.Duration(i) * 10 * time.Minute)
+		windows = append(windows, models.TimeWindow{Start: st, End: st.Add(10 * time.Minute)})
+	}
+
+	// 形态一:全部日志只属于 svc-a 且全在事故窗;基线窗零采样(采样截断尖峰)。
+	normalized := &models.NormalizedSignals{TimeWindows: windows, LogByWindow: map[int][]models.LogEntry{}}
+	for i := 4; i < 8; i++ {
+		normalized.LogByWindow[i] = append(normalized.LogByWindow[i],
+			models.LogEntry{Service: "svc-a", Level: "error", IsError: true},
+			models.LogEntry{Service: "svc-noise", Level: "error", IsError: true},
+		)
+	}
+	hyp := &models.Hypothesis{Type: models.HypothesisTypeErrorSpike, Service: "svc-a"}
+	if got := scorer.scoreTimeCorrelation(hyp, normalized, incident); got != 1.0 {
+		t.Fatalf("零基线尖峰形态应计满分时间相关, got %v", got)
+	}
+
+	// 形态二:svc-noise 基线 1 条/窗,事故窗 4 条/窗(4 倍尖峰)→ 满分。
+	normalized2 := &models.NormalizedSignals{TimeWindows: windows, LogByWindow: map[int][]models.LogEntry{}}
+	for i := 0; i < 8; i++ {
+		e := models.LogEntry{Service: "svc-noise", Level: "error", IsError: true}
+		if i >= 4 {
+			normalized2.LogByWindow[i] = append(normalized2.LogByWindow[i], e, e, e, e)
+		} else {
+			normalized2.LogByWindow[i] = append(normalized2.LogByWindow[i], e)
+		}
+	}
+	hyp2 := &models.Hypothesis{Type: models.HypothesisTypeErrorSpike, Service: "svc-noise"}
+	if got := scorer.scoreTimeCorrelation(hyp2, normalized2, incident); got != 1.0 {
+		t.Fatalf("4 倍于基线的尖峰应计满分, got %v", got)
+	}
+
+	// 形态三:svc-calm 基线 5 条/窗,事故窗 1 条/窗(0.2 倍,无尖峰)→ 0 分。
+	normalized3 := &models.NormalizedSignals{TimeWindows: windows, LogByWindow: map[int][]models.LogEntry{}}
+	for i := 0; i < 8; i++ {
+		e := models.LogEntry{Service: "svc-calm", Level: "info", IsError: false}
+		if i >= 4 {
+			normalized3.LogByWindow[i] = append(normalized3.LogByWindow[i], e)
+		} else {
+			normalized3.LogByWindow[i] = append(normalized3.LogByWindow[i], e, e, e, e, e)
+		}
+	}
+	hyp3 := &models.Hypothesis{Type: models.HypothesisTypeErrorSpike, Service: "svc-calm"}
+	if got := scorer.scoreTimeCorrelation(hyp3, normalized3, incident); got != 0 {
+		t.Fatalf("事故窗低于基线不应得分, got %v", got)
+	}
+
+	// 形态四:按服务归因 —— svc-a 的假设不得因 svc-noise 的日志而得分
+	// (基线与事故窗都只有 svc-noise 日志;svc-a 全程零日志)。
+	normalized4 := &models.NormalizedSignals{TimeWindows: windows, LogByWindow: map[int][]models.LogEntry{}}
+	for i := 0; i < 8; i++ {
+		normalized4.LogByWindow[i] = append(normalized4.LogByWindow[i],
+			models.LogEntry{Service: "svc-noise", Level: "error", IsError: true})
+	}
+	hyp4 := &models.Hypothesis{Type: models.HypothesisTypeErrorSpike, Service: "svc-a"}
+	if got := scorer.scoreTimeCorrelation(hyp4, normalized4, incident); got != 0 {
+		t.Fatalf("其他服务的日志不应抬分(按服务归因), got %v", got)
 	}
 }

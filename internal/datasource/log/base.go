@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourusername/OpsAgent/internal/datasource/core"
-	"github.com/yourusername/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
 )
 
 // BaseLogDataSource provides common functionality for log data sources.

@@ -1,0 +1,105 @@
+# LLM 配置示例
+# 复制此文件为 config/llm.yaml 并根据需要修改
+
+# 阿里云百炼配置
+dashscope:
+  provider: dashscope
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key: ${LLM_API_KEY}  # 从环境变量读取
+  model: qwen-plus
+  max_tokens: 4096
+  temperature: 0.7
+  timeout: 120
+
+# 可选模型: qwen-turbo, qwen-plus, qwen-max, qwen-max-longcontext
+
+---
+
+# 火山引擎方舟配置
+volcengine:
+  provider: volcengine
+  base_url: https://ark.cn-beijing.volces.com/api/v3
+  api_key: ${LLM_API_KEY}
+  model: ep-xxxxx  # 推理接入点 ID，或使用预置模型名
+  max_tokens: 4096
+  temperature: 0.7
+  timeout: 120
+
+# 预置模型: doubao-pro-32k, doubao-pro-4k, doubao-lite-4k
+
+---
+
+# DeepSeek 配置
+deepseek:
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  api_key: ${LLM_API_KEY}
+  model: deepseek-chat
+  max_tokens: 4096
+  temperature: 0.7
+
+---
+
+# 智谱 AI 配置
+zhipu:
+  provider: zhipu
+  base_url: https://open.bigmodel.cn/api/paas/v4
+  api_key: ${LLM_API_KEY}
+  model: glm-4
+  max_tokens: 4096
+  temperature: 0.7
+
+---
+
+# Moonshot AI 配置
+moonshot:
+  provider: moonshot
+  base_url: https://api.moonshot.cn/v1
+  api_key: ${LLM_API_KEY}
+  model: moonshot-v1-8k
+  max_tokens: 4096
+  temperature: 0.7
+
+---
+
+# 百川智能配置
+baichuan:
+  provider: baichuan
+  base_url: https://api.baichuan-ai.com/v1
+  api_key: ${LLM_API_KEY}
+  model: Baichuan2-Turbo
+  max_tokens: 4096
+  temperature: 0.7
+
+---
+
+# MiniMax 配置
+minimax:
+  provider: minimax
+  base_url: https://api.minimax.chat/v1
+  api_key: ${LLM_API_KEY}
+  model: abab6.5s-chat
+  max_tokens: 4096
+  temperature: 0.7
+
+---
+
+# OpenAI 配置 (国际)
+openai:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  model: gpt-3.5-turbo
+  max_tokens: 4096
+  temperature: 0.7
+
+---
+
+# Azure OpenAI 配置
+azure:
+  provider: azure
+  base_url: https://{resource}.openai.azure.com/openai/deployments/{deployment}
+  api_key: ${AZURE_OPENAI_API_KEY}
+  model: gpt-35-turbo
+  max_tokens: 4096
+  temperature: 0.7
