@@ -30,6 +30,7 @@ type ECamLogSource struct {
 	endpoint      string // e.g. http://127.0.0.1:8001 (no trailing slash)
 	token         string // bearer JWT (static fallback when no token provider)
 	tokenProvider TokenProvider
+	pathPrefix    string // 老会话路径 /api/v1/cam/logs;配 S2S 后 /api/s2s/logs
 	logType       string // federation log type; default "app"
 	client        *http.Client
 }
@@ -44,10 +45,11 @@ func NewECamLogSource(endpoint, token, logType string, timeout time.Duration) *E
 		timeout = 30 * time.Second
 	}
 	return &ECamLogSource{
-		endpoint: strings.TrimRight(endpoint, "/"),
-		token:    token,
-		logType:  logType,
-		client:   &http.Client{Timeout: timeout},
+		endpoint:   strings.TrimRight(endpoint, "/"),
+		token:      token,
+		pathPrefix: "/api/v1/cam/logs",
+		logType:    logType,
+		client:     &http.Client{Timeout: timeout},
 	}
 }
 
@@ -55,6 +57,8 @@ func NewECamLogSource(endpoint, token, logType string, timeout time.Duration) *E
 // 未注入时回退静态 token（向后兼容 mktok 会话令牌）。
 func (s *ECamLogSource) WithTokenProvider(p TokenProvider) *ECamLogSource {
 	s.tokenProvider = p
+	// S2S 令牌走独立验签路由组；路径与鉴权方式必须同步切换，避免错位 401
+	s.pathPrefix = "/api/s2s/logs"
 	return s
 }
 
@@ -188,7 +192,7 @@ func (s *ECamLogSource) GetLogCount(ctx context.Context, service string, start, 
 		Metric:    "count",
 	}
 	var data ecamAggregateData
-	err := s.post(ctx, "/api/v1/cam/logs/aggregate", body, &data)
+	err := s.post(ctx, s.pathPrefix+"/aggregate", body, &data)
 	if err == nil {
 		return data.Total, nil
 	}
@@ -204,7 +208,7 @@ func (s *ECamLogSource) GetLogCount(ctx context.Context, service string, start, 
 // Ping probes the federation for reachability (pinger interface): the types
 // endpoint is the cheapest authenticated call and doubles as a token check.
 func (s *ECamLogSource) Ping(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint+"/api/v1/cam/logs/types", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.endpoint+s.pathPrefix+"/types", nil)
 	if err != nil {
 		return fmt.Errorf("ecam log source: build request: %w", err)
 	}
@@ -234,7 +238,7 @@ func (s *ECamLogSource) Ping(ctx context.Context) error {
 // search posts a search request and maps entries into RCA models.
 func (s *ECamLogSource) search(ctx context.Context, body ecamSearchRequest) ([]models.LogEntry, error) {
 	var data ecamSearchData
-	if err := s.post(ctx, "/api/v1/cam/logs/search", body, &data); err != nil {
+	if err := s.post(ctx, s.pathPrefix+"/search", body, &data); err != nil {
 		return nil, err
 	}
 	out := make([]models.LogEntry, 0, len(data.Entries))
