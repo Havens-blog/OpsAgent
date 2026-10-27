@@ -62,3 +62,6 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Runtime data (conversation persistence)
+data/
