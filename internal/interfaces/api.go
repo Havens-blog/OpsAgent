@@ -199,6 +199,23 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		)
 	}
 
+	// Conversation persistence: use the disk-backed store when it can be
+	// created, falling back to memory so the server still starts if the data
+	// directory is unwritable or the snapshot is corrupt.
+	convPath := strings.TrimSpace(os.Getenv("OPSAGENT_CONVERSATIONS_PATH"))
+	if convPath == "" {
+		convPath = "data/conversations.json"
+	}
+	conversationStore := chat.ConversationStore(chat.NewMemoryConversationStore())
+	if ps, err := chat.NewPersistentConversationStore(convPath); err != nil {
+		logger.Warn("Persistent conversation store unavailable, using in-memory fallback",
+			observability.String("path", convPath),
+			observability.Err(err),
+		)
+	} else {
+		conversationStore = ps
+	}
+
 	server := &APIServer{
 		settings:       settings,
 		router:         http.NewServeMux(),
@@ -216,7 +233,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		changeStore:       change.NewMemoryStore(),
 		rcaEngine:         rcaEngine,
 		rcaStore:          rcaStore,
-		conversationStore: chat.NewMemoryConversationStore(),
+		conversationStore: conversationStore,
 		chatService:       chatService,
 		approvalMgr:       approvalMgr,
 		pendingApprovals:  pendingApprovals,
