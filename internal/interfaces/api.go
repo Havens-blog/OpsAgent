@@ -62,6 +62,9 @@ type APIServer struct {
 	rcaEngine *engine.Engine
 	rcaStore  rca.RCAReportStore
 
+	// Conversation store for the chat assistant (tenant-scoped, in-memory).
+	conversationStore chat.ConversationStore
+
 	// Chat service for conversational assistant (nil-safe).
 	// Guarded by chatMu because the config endpoints can rebuild it at runtime
 	// while chat requests read it concurrently.
@@ -194,12 +197,13 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		// from settings (credentials, endpoints); the defaults use the
 		// in-memory / mock-backed implementations so the API is functional
 		// out of the box.
-		topologySource: rcaSources.TopologySource,
-		changeStore:    change.NewMemoryStore(),
-		rcaEngine:      rcaEngine,
-		rcaStore:       rcaStore,
-		chatService:    chatService,
-		auditLog:       newRecentAuditLog(100),
+		topologySource:    rcaSources.TopologySource,
+		changeStore:       change.NewMemoryStore(),
+		rcaEngine:         rcaEngine,
+		rcaStore:          rcaStore,
+		conversationStore: chat.NewMemoryConversationStore(),
+		chatService:       chatService,
+		auditLog:          newRecentAuditLog(100),
 	}
 
 	// Construct and register the coordinator + specialist agents (nil-safe:
@@ -276,6 +280,8 @@ func (s *APIServer) setupRoutes() {
 
 	// Conversational assistant
 	s.router.HandleFunc("/api/v1/chat", s.protected(s.chatHandler))
+	s.router.HandleFunc("/api/v1/conversations", s.protected(s.conversationsHandler))
+	s.router.HandleFunc("/api/v1/conversations/", s.protected(s.conversationHandler))
 
 	// LLM provider catalog and configuration
 	s.router.HandleFunc("/api/v1/providers", s.protected(s.providersHandler))

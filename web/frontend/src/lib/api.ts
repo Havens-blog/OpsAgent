@@ -80,6 +80,88 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return JSON.parse(text) as T
 }
 
+function processSSEEvent(
+  raw: string,
+  callbacks: {
+    onDelta: (content: string) => void
+    onDone: (messageId: string, conversationId: string) => void
+    onError: (message: string) => void
+  }
+) {
+  const line = raw.trim()
+  if (!line.startsWith("data:")) return
+  const data = line.slice(5).trim()
+  if (!data) return
+
+  let event: StreamEvent
+  try {
+    event = JSON.parse(data) as StreamEvent
+  } catch {
+    return
+  }
+
+  if (event.type === "delta") callbacks.onDelta(event.content)
+  else if (event.type === "done") callbacks.onDone(event.message_id, event.conversation_id)
+  else if (event.type === "error") callbacks.onError(event.message)
+}
+
+async function sendMessageStream(
+  conversationId: string,
+  content: string,
+  callbacks: {
+    onDelta: (content: string) => void
+    onDone: (messageId: string, conversationId: string) => void
+    onError: (message: string) => void
+    signal?: AbortSignal
+  }
+): Promise<void> {
+  const res = await fetch(
+    `${API_BASE}/api/v1/conversations/${conversationId}/messages`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+      cache: "no-store",
+      credentials: "same-origin",
+      signal: callbacks.signal,
+    }
+  )
+
+  if (!res.ok || !res.body) {
+    if (res.status === 401) redirectToLogin()
+    let detail = res.statusText
+    try {
+      const body = await res.json()
+      detail = body?.error?.message || detail
+    } catch {
+      /* keep statusText */
+    }
+    throw new ApiError(res.status, detail)
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+
+      let idx: number
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const raw = buffer.slice(0, idx)
+        buffer = buffer.slice(idx + 2)
+        processSSEEvent(raw, callbacks)
+      }
+    }
+    if (buffer.trim()) processSSEEvent(buffer, callbacks)
+  } finally {
+    reader.releaseLock()
+  }
+}
+
 /* ---------- Types ---------- */
 
 export interface HealthResponse {
@@ -259,6 +341,30 @@ export interface ChatResponse {
   thinking?: { step: string; detail: string }[]
   tools?: { tool: string; params: Record<string, unknown>; result: string }[]
 }
+
+/* ---------- Conversation types ---------- */
+
+export interface Conversation {
+  id: string
+  tenant_id: number
+  user_id: number
+  title: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ConversationMessage {
+  id: string
+  conversation_id: string
+  role: "user" | "assistant"
+  content: string
+  created_at: string
+}
+
+export type StreamEvent =
+  | { type: "delta"; content: string }
+  | { type: "done"; message_id: string; conversation_id: string }
+  | { type: "error"; message: string }
 
 /* ---------- LLM config types ---------- */
 
@@ -492,4 +598,25 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ messages }),
     }),
+
+  listConversations: () =>
+    request<{ conversations: Conversation[]; count: number }>(
+      "/api/v1/conversations"
+    ),
+
+  createConversation: (title?: string) =>
+    request<{ conversation: Conversation }>("/api/v1/conversations", {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    }),
+
+  getConversation: (id: string) =>
+    request<{ conversation: Conversation; messages: ConversationMessage[] }>(
+      `/api/v1/conversations/${id}`
+    ),
+
+  deleteConversation: (id: string) =>
+    request<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
+
+  sendMessageStream,
 }

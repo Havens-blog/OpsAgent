@@ -24,18 +24,27 @@ const (
 请用简洁专业的中文回答。如果需要查询实时数据（日志、指标、拓扑等）但目前无法访问，请如实告知并给出可行的替代排查建议。`
 )
 
+// ChatClient is the narrow LLM client surface the Service depends on.
+type ChatClient interface {
+	Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error)
+	ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error
+}
+
 // Service provides conversational AI capabilities.
 type Service struct {
-	client       *llm.Client
+	client       ChatClient
 	systemPrompt string
 	available    bool
 	model        string
 }
 
-// Message represents a chat message.
+// Message represents a chat message, both as LLM input and persisted history.
 type Message struct {
-	Role    string `json:"role"`    // "user" or "assistant"
-	Content string `json:"content"`
+	ID             string    `json:"id,omitempty"`
+	ConversationID string    `json:"conversation_id,omitempty"`
+	Role           string    `json:"role"` // "user" or "assistant"
+	Content        string    `json:"content"`
+	CreatedAt      time.Time `json:"created_at,omitempty"`
 }
 
 // NewService creates a new chat service from LLM configuration.
@@ -98,6 +107,17 @@ func NewService(cfg config.LLMConfig) (*Service, error) {
 	}, nil
 }
 
+// NewServiceWithClient builds a Service around an injected ChatClient. It is a
+// test hook; production wiring uses NewService.
+func NewServiceWithClient(client ChatClient, model string) *Service {
+	return &Service{
+		client:       client,
+		systemPrompt: DefaultSystemPrompt,
+		available:    true,
+		model:        model,
+	}
+}
+
 // IsAvailable returns whether the service is ready to handle requests.
 func (s *Service) IsAvailable() bool {
 	return s != nil && s.available
@@ -142,6 +162,49 @@ func (s *Service) Chat(ctx context.Context, messages []Message) (string, error) 
 	}
 
 	return response.Choices[0].Message.Content, nil
+}
+
+// ChatStream streams a reply, invoking onDelta with each text delta. The
+// system prompt is prepended to the supplied history. An error returned by
+// onDelta aborts consumption; ctx cancellation is propagated as ctx.Err().
+func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta func(string) error) error {
+	if !s.IsAvailable() {
+		return fmt.Errorf("chat service not available")
+	}
+
+	llmMessages := make([]llm.Message, 0, len(messages)+1)
+	llmMessages = append(llmMessages, llm.Message{
+		Role:    "system",
+		Content: s.systemPrompt,
+	})
+	for _, m := range messages {
+		llmMessages = append(llmMessages, llm.Message{
+			Role:    m.Role,
+			Content: m.Content,
+		})
+	}
+
+	var deltaErr error
+	err := s.client.ChatStream(ctx, llmMessages, func(chunk llm.ChatChunk) {
+		if deltaErr != nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
+			return
+		}
+		if content := chunk.Choices[0].Delta.Content; content != "" {
+			if e := onDelta(content); e != nil {
+				deltaErr = e
+			}
+		}
+	})
+	if deltaErr != nil {
+		return deltaErr
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("LLM stream failed: %w", err)
+	}
+	return nil
 }
 
 // isPlaceholderKey detects common placeholder/invalid API keys.
