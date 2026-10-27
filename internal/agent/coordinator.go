@@ -3,11 +3,14 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/config"
+	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 )
 
@@ -272,65 +275,184 @@ type ExecutionPlan struct {
 	Dependencies map[string][]string // task ID -> dependent task IDs
 }
 
-// createExecutionPlan analyzes the task and creates an execution plan.
-func (c *CoordinatorAgent) createExecutionPlan(ctx context.Context, task *Task) (*ExecutionPlan, error) {
-	// In a real implementation, this would use LLM to analyze the task
-	// For now, use a simple rule-based approach
+// knownTypeAgent maps an explicit task type to its specialist agent. These are
+// the fast-path routes: when a caller already labels the task, there is no
+// reason to spend an LLM call deciding where it goes.
+var knownTypeAgent = map[string]string{
+	"rca":          "monitor",
+	"log_analysis": "log_analyst",
+	"inspection":   "inspector",
+}
 
+// createExecutionPlan analyzes the task and creates an execution plan.
+//
+// Routing precedence (most specific first):
+//  1. Explicit task.Params["type"] matching a known specialist — zero-cost
+//     deterministic route (back-compatible with the original behavior).
+//  2. LLM intent routing — when no explicit type is given, ask the model which
+//     registered specialists should handle the free-text request and whether
+//     they can run in parallel.
+//  3. "direct" fallback — when the LLM is unavailable, returns nothing usable,
+//     or no specialists are registered, the coordinator answers directly. This
+//     mirrors the progressive-enhancement used across the data sources: real
+//     intelligence when available, a safe deterministic path otherwise.
+func (c *CoordinatorAgent) createExecutionPlan(ctx context.Context, task *Task) (*ExecutionPlan, error) {
 	plan := &ExecutionPlan{
 		Strategy:     "sequential",
 		Delegations:  []TaskDelegation{},
 		Dependencies: make(map[string][]string),
 	}
 
-	// Check if task type is specified
+	// (1) Explicit type fast-path.
 	if taskType, ok := task.Params["type"].(string); ok {
-		switch taskType {
-		case "rca":
-			// RCA tasks go to monitor agent
-			plan.Delegations = append(plan.Delegations, TaskDelegation{
-				AgentName: "monitor",
-				Task: &Task{
-					ID:          fmt.Sprintf("%s-rca", task.ID),
-					Description: task.Description,
-					Params:      task.Params,
-					CreatedAt:   time.Now(),
-					Status:      "pending",
-				},
-			})
-		case "log_analysis":
-			// Log analysis tasks go to log analyst
-			plan.Delegations = append(plan.Delegations, TaskDelegation{
-				AgentName: "log_analyst",
-				Task: &Task{
-					ID:          fmt.Sprintf("%s-log", task.ID),
-					Description: task.Description,
-					Params:      task.Params,
-					CreatedAt:   time.Now(),
-					Status:      "pending",
-				},
-			})
-		case "inspection":
-			// Inspection tasks go to inspector
-			plan.Delegations = append(plan.Delegations, TaskDelegation{
-				AgentName: "inspector",
-				Task: &Task{
-					ID:          fmt.Sprintf("%s-inspect", task.ID),
-					Description: task.Description,
-					Params:      task.Params,
-					CreatedAt:   time.Now(),
-					Status:      "pending",
-				},
-			})
-		default:
-			// Unknown type, handle in coordinator
-			plan.Strategy = "direct"
+		if agentName, known := knownTypeAgent[taskType]; known {
+			plan.Delegations = append(plan.Delegations, c.newDelegation(agentName, taskType, task))
+			return plan, nil
 		}
-	} else {
-		// No type specified, handle directly
-		plan.Strategy = "direct"
+		// Unknown explicit type: fall through to LLM / direct rather than
+		// silently misrouting.
 	}
 
+	// (2) LLM intent routing.
+	if llmPlan, err := c.routeWithLLM(ctx, task); err == nil && len(llmPlan.Delegations) > 0 {
+		return llmPlan, nil
+	} else if err != nil {
+		c.logger.Info("LLM routing unavailable, handling directly",
+			observability.String("task_id", task.ID),
+			observability.String("reason", err.Error()),
+		)
+	}
+
+	// (3) Direct fallback.
+	plan.Strategy = "direct"
+	return plan, nil
+}
+
+// newDelegation builds a sub-task delegation for the named agent.
+func (c *CoordinatorAgent) newDelegation(agentName, suffix string, task *Task) TaskDelegation {
+	return TaskDelegation{
+		AgentName: agentName,
+		Task: &Task{
+			ID:          fmt.Sprintf("%s-%s", task.ID, suffix),
+			Description: task.Description,
+			Params:      task.Params,
+			CreatedAt:   time.Now(),
+			Status:      "pending",
+		},
+	}
+}
+
+// routeWithLLM asks the LLM to choose which registered specialists should
+// handle a free-text task and whether they can run in parallel. It returns an
+// error (triggering the direct fallback) when no specialists are registered,
+// the LLM client is unavailable, or the response cannot be parsed into at
+// least one valid, registered agent.
+func (c *CoordinatorAgent) routeWithLLM(ctx context.Context, task *Task) (*ExecutionPlan, error) {
+	if c.llmClient == nil {
+		return nil, fmt.Errorf("no LLM client configured")
+	}
+
+	// Snapshot registered agents and their advertised capabilities.
+	c.mu.RLock()
+	type agentInfo struct {
+		name string
+		desc string
+		caps []string
+	}
+	infos := make([]agentInfo, 0, len(c.agents))
+	for name, ag := range c.agents {
+		info := agentInfo{name: name}
+		if ag != nil && ag.config != nil {
+			info.desc = ag.config.Description
+			info.caps = ag.config.Capabilities
+		}
+		infos = append(infos, info)
+	}
+	c.mu.RUnlock()
+
+	if len(infos) == 0 {
+		return nil, fmt.Errorf("no specialist agents registered")
+	}
+
+	// Build the capability catalog for the prompt.
+	var catalog strings.Builder
+	valid := make(map[string]bool, len(infos))
+	for _, in := range infos {
+		valid[in.name] = true
+		fmt.Fprintf(&catalog, "- %s: %s", in.name, in.desc)
+		if len(in.caps) > 0 {
+			fmt.Fprintf(&catalog, " (capabilities: %s)", strings.Join(in.caps, ", "))
+		}
+		catalog.WriteString("\n")
+	}
+
+	prompt := fmt.Sprintf(`You are routing an operations request to specialist agents.
+
+Available agents:
+%s
+User request:
+%q
+
+Choose the agent(s) best suited to handle this request. Respond with ONLY a
+JSON object, no prose, in this exact shape:
+{"strategy":"sequential|parallel","agents":["<agent-name>", ...]}
+
+Rules:
+- "agents" must be a non-empty subset of the available agent names above.
+- Use "parallel" only when the chosen agents can work independently.
+- If a single agent suffices, return just that one.`, catalog.String(), task.Description)
+
+	messages := []llm.ClaudeMessage{{Role: "user", Content: prompt}}
+	raw, err := c.llmClient.Chat(ctx, messages)
+	if err != nil {
+		return nil, fmt.Errorf("LLM routing call failed: %w", err)
+	}
+
+	return c.parsePlanJSON(raw, valid, task)
+}
+
+// parsePlanJSON tolerantly parses the LLM routing response into an execution
+// plan. It extracts the first JSON object (the model may wrap it in prose or
+// code fences), keeps only agents that are actually registered, and errors if
+// nothing valid remains so the caller can fall back to direct handling.
+func (c *CoordinatorAgent) parsePlanJSON(raw string, valid map[string]bool, task *Task) (*ExecutionPlan, error) {
+	start := strings.IndexByte(raw, '{')
+	end := strings.LastIndexByte(raw, '}')
+	if start < 0 || end <= start {
+		return nil, fmt.Errorf("no JSON object in LLM response")
+	}
+
+	var parsed struct {
+		Strategy string   `json:"strategy"`
+		Agents   []string `json:"agents"`
+	}
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &parsed); err != nil {
+		return nil, fmt.Errorf("malformed routing JSON: %w", err)
+	}
+
+	strategy := "sequential"
+	if parsed.Strategy == "parallel" {
+		strategy = "parallel"
+	}
+
+	plan := &ExecutionPlan{
+		Strategy:     strategy,
+		Delegations:  []TaskDelegation{},
+		Dependencies: make(map[string][]string),
+	}
+	seen := make(map[string]bool)
+	for _, name := range parsed.Agents {
+		name = strings.TrimSpace(name)
+		if !valid[name] || seen[name] {
+			continue // drop unknown/duplicate agents
+		}
+		seen[name] = true
+		plan.Delegations = append(plan.Delegations, c.newDelegation(name, name, task))
+	}
+
+	if len(plan.Delegations) == 0 {
+		return nil, fmt.Errorf("LLM selected no valid registered agents")
+	}
 	return plan, nil
 }
 

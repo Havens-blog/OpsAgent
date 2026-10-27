@@ -71,8 +71,9 @@ func TestChangesEndpoint(t *testing.T) {
 	})
 }
 
-// TestTopologyEndpoint verifies the topology endpoint returns a non-empty
-// service graph from the wired topology client.
+// TestTopologyEndpoint verifies the topology endpoint returns 200 with an
+// honest (empty) graph when no real ARMS source is configured — never
+// fabricated demo nodes.
 func TestTopologyEndpoint(t *testing.T) {
 	server, err := NewAPIServer(testSettings())
 	if err != nil {
@@ -108,23 +109,13 @@ func TestTopologyEndpoint(t *testing.T) {
 		if resp.Status != "ok" {
 			t.Errorf("Expected status ok, got %s", resp.Status)
 		}
-		if len(resp.Topology.Nodes) == 0 {
-			t.Error("Expected non-empty topology nodes")
+		// No real ARMS source under test settings → the honest empty source
+		// serves an empty graph. Fabricated demo nodes must NOT leak through.
+		if len(resp.Topology.Nodes) != 0 {
+			t.Errorf("Expected empty topology nodes (no real source), got %d", len(resp.Topology.Nodes))
 		}
-		if len(resp.Topology.Edges) == 0 {
-			t.Error("Expected non-empty topology edges")
-		}
-
-		// Verify a known node is present.
-		found := false
-		for _, n := range resp.Topology.Nodes {
-			if n.ID == "api-gateway" {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Error("Expected api-gateway node in topology")
+		if len(resp.Topology.Edges) != 0 {
+			t.Errorf("Expected empty topology edges (no real source), got %d", len(resp.Topology.Edges))
 		}
 	})
 }

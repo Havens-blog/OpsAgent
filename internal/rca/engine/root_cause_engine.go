@@ -347,14 +347,22 @@ func groupLogsByService(logByWindow map[int][]models.LogEntry) map[string][]mode
 }
 
 func hasSignificantErrorSpike(logs []models.LogEntry, normalized *models.NormalizedSignals, incident *models.Incident) bool {
+	// Detect the spike using THIS service's logs, not the global log stream.
+	// The caller groups logs by service and passes one service's logs here, so
+	// bucket exactly those into the same time windows. Reading the shared
+	// normalized.LogByWindow (every service combined) was a bug: it made every
+	// service inherit the global error volume, so one noisy service would raise
+	// false spikes for all others and attribution became meaningless.
+	byWindow := bucketLogsByTime(logs, normalized.TimeWindows)
+
 	incidentCount := 0
 	baselineCount := 0
 	for i, window := range normalized.TimeWindows {
 		isIncidentWindow := window.End.After(incident.StartTime) && window.Start.Before(incident.EndTime)
 		if isIncidentWindow {
-			incidentCount += len(normalized.LogByWindow[i])
+			incidentCount += len(byWindow[i])
 		} else {
-			baselineCount += len(normalized.LogByWindow[i])
+			baselineCount += len(byWindow[i])
 		}
 	}
 	return incidentCount > baselineCount*2 && incidentCount > 10

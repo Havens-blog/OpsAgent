@@ -4,36 +4,105 @@
 
 @layer base {
   :root {
-    --background: 222 47% 11%;
-    --foreground: 210 40% 98%;
+    /* Linear design system — aligned to haven-console theme-variables.scss.
+       Backgrounds (near-black, 3 surface tiers) */
+    --background: 240 6% 4%;        /* #08090a bg-base/page */
+    --card: 240 5% 9%;             /* #191a1b bg-surface */
+    --popover: 240 5% 9%;          /* #191a1b dialog/dropdown */
 
-    --card: 222 47% 14%;
-    --card-foreground: 210 40% 98%;
+    --foreground: 220 9% 97%;      /* #f7f8f8 text-primary */
 
-    --popover: 222 47% 14%;
-    --popover-foreground: 210 40% 98%;
+    --primary: 234 55% 60%;        /* #5e6ad2 accent-primary (靛紫) */
+    --primary-foreground: 0 0% 100%;
 
-    --primary: 199 89% 48%;
-    --primary-foreground: 222 47% 11%;
+    --secondary: 240 4% 13%;       /* #28282c-ish bg-hover */
+    --secondary-foreground: 220 9% 97%;
 
-    --secondary: 217 33% 17%;
-    --secondary-foreground: 210 40% 98%;
+    --muted: 240 4% 13%;
+    --muted-foreground: 220 8% 58%; /* #8a8f98 text-secondary */
 
-    --muted: 217 33% 17%;
-    --muted-foreground: 215 20% 65%;
+    --accent: 240 5% 14%;
+    --accent-foreground: 220 9% 97%;
 
-    --accent: 217 33% 20%;
-    --accent-foreground: 210 40% 98%;
+    --destructive: 0 84% 60%;      /* #ef4444 */
+    --destructive-foreground: 220 9% 97%;
 
-    --destructive: 0 72% 51%;
-    --destructive-foreground: 210 40% 98%;
-
-    --border: 217 33% 22%;
-    --input: 217 33% 22%;
-    --ring: 199 89% 48%;
+    --border: 240 4% 18%;          /* ≈ rgba(255,255,255,0.08) on #08090a */
+    --input: 240 4% 18%;
+    --ring: 244 100% 67%;          /* #7170ff accent-blue */
 
     --radius: 0.5rem;
+
+    /* Linear multi-tier tokens not natively in the old theme. Mapped to
+       Tailwind color utilities so components can use them directly. */
+    --bg-elevated: 240 5% 6%;      /* #0f1011 */
+    --bg-surface: 240 5% 9%;       /* #191a1b */
+    --bg-hover: 240 4% 13%;        /* #28282c */
+    --text-regular: 220 14% 82%;  /* #d0d6e0 */
+    --text-secondary: 220 8% 58%; /* #8a8f98 */
+    --text-tertiary: 230 5% 39%;  /* #62666d */
+    --accent-blue: 244 100% 67%;   /* #7170ff */
+    --accent-purple: 258 84% 66%; /* #8b5cf6 */
+
+    /* Border strength tiers + glassmorphism (aligned to watch-alert
+       theme-variables.css, byte-equal to haven-console). Full color strings —
+       reference directly via bg-[var(--glass-bg)] style utilities. */
+    --border-strong: rgba(255, 255, 255, 0.12);
+    --glass-bg: rgba(255, 255, 255, 0.03);
+    --glass-bg-hover: rgba(255, 255, 255, 0.06);
   }
+
+  /* 浅色主题 — Linear light mode 映射，值同 watch-alert theme-variables.css。
+     html.light 由 lib/theme.ts 切换（hc_theme 契约，与 haven-console/watch-alert 共享）。 */
+  :root.light {
+    --background: 220 9% 97%;      /* #f7f8f8 bg-page */
+    --card: 0 0% 100%;             /* #ffffff bg-surface */
+    --popover: 0 0% 100%;
+
+    --foreground: 0 0% 7%;         /* #111111 text-primary */
+
+    --primary: 234 55% 60%;        /* #5e6ad2 accent-primary（浅色主色同 Linear light） */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 14% 96%;      /* #f3f4f5 bg-hover */
+    --secondary-foreground: 0 0% 7%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 0 0% 40%;  /* #666666 text-secondary */
+
+    --accent: 220 14% 96%;
+    --accent-foreground: 0 0% 7%;
+
+    --destructive: 0 84% 60%;      /* #ef4444 */
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 0 0% 90%;            /* #e6e6e6 */
+    --input: 0 0% 90%;
+    --ring: 244 100% 67%;          /* #7170ff */
+
+    --bg-elevated: 0 0% 100%;      /* #ffffff */
+    --bg-surface: 0 0% 100%;
+    --bg-hover: 220 14% 96%;       /* #f3f4f5 */
+    --text-regular: 0 0% 20%;      /* #333333 */
+    --text-secondary: 0 0% 40%;    /* #666666 */
+    --text-tertiary: 0 0% 60%;     /* #999999 */
+    --accent-blue: 244 100% 67%;   /* #7170ff（两主题一致） */
+    --accent-purple: 258 84% 66%;
+
+    --border-strong: #d0d6e0;
+    --glass-bg: rgba(255, 255, 255, 0.8);
+    --glass-bg-hover: rgba(255, 255, 255, 0.9);
+  }
+}
+
+/* 主题过渡动画（同 watch-alert theme-variables.css 尾段） */
+:root {
+  --theme-transition: background-color 0.3s ease, color 0.3s ease,
+    border-color 0.3s ease, box-shadow 0.3s ease;
+}
+html,
+body {
+  transition: var(--theme-transition);
 }
 
 @layer base {

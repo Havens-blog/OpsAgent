@@ -1,6 +1,6 @@
 "use client"
 
-import { use, useState } from "react"
+import { use, useEffect, useState } from "react"
 import Link from "next/link"
 import {
   Card,
@@ -11,83 +11,7 @@ import {
 } from "@/components/ui/card"
 import { Badge, severityVariant } from "@/components/ui/badge"
 import { confidencePct, formatTime } from "@/lib/utils"
-import type { Evidence } from "@/lib/api"
-
-interface IncidentDetail {
-  id: string
-  severity: string
-  title: string
-  description: string
-  start_time: string
-  end_time?: string
-  status: string
-  affected_services: string[]
-  root_cause: string
-  confidence: number
-  evidence: Evidence[]
-  timeline: { time: string; event: string }[]
-}
-
-// Demo detail data. In production this would be fetched from
-// GET /api/v1/incidents/:id once the backend exposes it.
-const DEMO: Record<string, IncidentDetail> = {
-  "INC-20260619-order": {
-    id: "INC-20260619-order",
-    severity: "P1",
-    title: "order-service 错误率激增至 2.5%",
-    description: "上游 api-gateway 报告订单接口 5xx 增加",
-    start_time: new Date(Date.now() - 8 * 60 * 1000).toISOString(),
-    status: "active",
-    affected_services: ["order-service", "postgres-order"],
-    root_cause: "postgres-order 连接池耗尽导致 order-service 请求超时级联失败",
-    confidence: 0.82,
-    evidence: [
-      {
-        type: "metric",
-        source: "order-service",
-        start_time: new Date(Date.now() - 8 * 60 * 1000).toISOString(),
-        end_time: new Date().toISOString(),
-        description: "错误率从 0.1% 升至 2.5%，延迟 P99 从 120ms 升至 480ms",
-      },
-      {
-        type: "log",
-        source: "order-service",
-        start_time: new Date(Date.now() - 7 * 60 * 1000).toISOString(),
-        end_time: new Date().toISOString(),
-        description: "出现大量 connection pool exhausted 错误日志",
-      },
-      {
-        type: "trace",
-        source: "postgres-order",
-        start_time: new Date(Date.now() - 7 * 60 * 1000).toISOString(),
-        end_time: new Date().toISOString(),
-        description: "数据库查询延迟升高，活跃连接数达上限",
-      },
-      {
-        type: "change",
-        source: "kubernetes",
-        start_time: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
-        end_time: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
-        description: "deployment order-service 副本数从 5 扩至 8（12 分钟前）",
-      },
-      {
-        type: "topology",
-        source: "arms",
-        start_time: new Date(Date.now() - 8 * 60 * 1000).toISOString(),
-        end_time: new Date().toISOString(),
-        description: "order-service → postgres-order 边错误率 1.5%，健康降级",
-      },
-    ],
-    timeline: [
-      { time: "-12m", event: "order-service 扩容（变更）" },
-      { time: "-8m", event: "告警触发：错误率 > 1%" },
-      { time: "-7m", event: "RCA 引擎启动证据采集" },
-      { time: "-5m", event: "LogAnalyst 识别连接池错误模式" },
-      { time: "-3m", event: "Inspector 关联扩容变更" },
-      { time: "-1m", event: "Coordinator 汇总根因假设" },
-    ],
-  },
-}
+import { api, type Evidence, type IncidentDetail } from "@/lib/api"
 
 const EVIDENCE_STYLE: Record<string, string> = {
   metric: "success",
@@ -103,8 +27,55 @@ export default function IncidentDetailPage({
   params: Promise<{ id: string }>
 }) {
   const { id } = use(params)
+  const [incident, setIncident] = useState<IncidentDetail | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
   const [selectedEvidence, setSelectedEvidence] = useState<Evidence | null>(null)
-  const incident = DEMO[id] ?? DEMO["INC-20260619-order"]
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      setLoading(true)
+      setError(null)
+      try {
+        const detail = await api.getIncident(id)
+        if (!cancelled) setIncident(detail)
+      } catch (err) {
+        if (!cancelled)
+          setError(err instanceof Error ? err.message : "加载事件失败")
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [id])
+
+  if (loading) {
+    return (
+      <div className="space-y-8">
+        <Link href="/incidents" className="inline-flex items-center gap-3 text-sm text-muted-foreground hover:text-foreground">
+          ← Incidents
+        </Link>
+        <p className="text-sm text-muted-foreground">加载中…</p>
+      </div>
+    )
+  }
+
+  if (error || !incident) {
+    return (
+      <div className="space-y-8">
+        <Link href="/incidents" className="inline-flex items-center gap-3 text-sm text-muted-foreground hover:text-foreground">
+          ← Incidents
+        </Link>
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+          加载事件失败：{error || "未找到该事件"}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-8">

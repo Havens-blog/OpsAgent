@@ -39,10 +39,10 @@ type Message struct {
 
 // Conversation represents a conversation with the agent.
 type Conversation struct {
-	ID        string     `json:"id"`
-	Messages  []Message  `json:"messages"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID        string    `json:"id"`
+	Messages  []Message `json:"messages"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	mu        sync.RWMutex
 }
 
@@ -107,7 +107,7 @@ type BaseAgent struct {
 	logger       *observability.Logger
 	auditor      *observability.AuditLogger
 	conversation *Conversation
-	llmClient    *llm.ClaudeClient
+	llmClient    llm.AgentLLM
 
 	mu sync.RWMutex
 }
@@ -168,17 +168,43 @@ func NewBaseAgent(cfg *AgentConfig, settings *config.Settings) (*BaseAgent, erro
 		apiKey = settings.Agent.AnthropicAPIKey
 	}
 
+	// Resolve the effective model. The agent configs hard-code a Claude model
+	// name, which is meaningless for OpenAI-compatible providers (dashscope,
+	// deepseek, ...). For those, use the configured LLM.Model instead.
+	model := cfg.Model
+	if llm.IsOpenAICompatible(settings.LLM.Provider) {
+		if settings.LLM.Model != "" {
+			model = settings.LLM.Model
+		} else if p, ok := llm.GetProvider(settings.LLM.Provider); ok {
+			model = p.DefaultModel
+		}
+		cfg.Model = model // keep reported model accurate
+	}
+
+	maxTokens := settings.LLM.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
+
 	llmConfig := &llm.Config{
 		Provider:    settings.LLM.Provider,
 		BaseURL:     settings.LLM.BaseURL,
 		APIKey:      apiKey,
-		Model:       cfg.Model,
-		MaxTokens:   4096,
-		Temperature: 0.7,
+		Model:       model,
+		MaxTokens:   maxTokens,
+		Temperature: settings.LLM.Temperature,
 		Timeout:     120 * time.Second,
 	}
 
-	llmClient, err := llm.NewClaudeClient(llmConfig)
+	// Select the client implementation by provider protocol:
+	//   - OpenAI-compatible providers -> OpenAIAgentClient (chat/completions)
+	//   - claude / anthropic          -> ClaudeClient (Anthropic Messages API)
+	var llmClient llm.AgentLLM
+	if llm.IsOpenAICompatible(settings.LLM.Provider) {
+		llmClient, err = llm.NewOpenAIAgentClient(llmConfig)
+	} else {
+		llmClient, err = llm.NewClaudeClient(llmConfig)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create LLM client: %w", err)
 	}
@@ -298,12 +324,12 @@ func (a *BaseAgent) ExecuteTool(ctx context.Context, toolName string, params map
 	if t.Metadata.RequiresConfirmation() {
 		// Try session-level approval first
 		sessionReq := guardrails.ApprovalRequest{
-			ToolName:    toolName,
-			Operation:   "execute",
-			Params:      params,
-			Reason:      t.Metadata.ApprovalReason,
-			Scope:       guardrails.ScopeSession,
-			SessionID:   a.conversation.ID,
+			ToolName:  toolName,
+			Operation: "execute",
+			Params:    params,
+			Reason:    t.Metadata.ApprovalReason,
+			Scope:     guardrails.ScopeSession,
+			SessionID: a.conversation.ID,
 		}
 		if err := a.approvalMgr.RequireApproval(sessionReq); err != nil {
 			// Session-level approval not found, try one-shot
@@ -509,9 +535,9 @@ func (a *BaseAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResu
 
 	if err != nil {
 		return &ExecutionResult{
-			Success: false,
-			Error:   err,
-			Response: fmt.Sprintf("LLM call failed: %v", err),
+			Success:   false,
+			Error:     err,
+			Response:  fmt.Sprintf("LLM call failed: %v", err),
 			Data:      make(map[string]interface{}),
 			ToolsUsed: make([]string, 0),
 			Metadata:  make(map[string]interface{}),

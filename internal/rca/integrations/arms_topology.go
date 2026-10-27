@@ -153,3 +153,28 @@ func (a *ARMSTopologySource) signRequest(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 }
+
+// Ping verifies the ARMS OpenAPI endpoint is reachable by issuing the health
+// request for the configured Pid. Returns nil only on a successful round-trip,
+// so a successful Ping means the source is genuinely usable rather than merely
+// constructed.
+func (a *ARMSTopologySource) Ping(ctx context.Context) error {
+	url := fmt.Sprintf("%s/api/v1/arms/health?Pid=%s", a.endpoint, a.pid)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+	a.signRequest(req)
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ARMS ping failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	return nil
+}

@@ -17,12 +17,16 @@ import (
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls carries assistant tool-call requests (OpenAI format).
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// ToolCallID links a tool-result message back to its call.
+	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
 // Tool represents a function/tool definition.
 type Tool struct {
-	Type     string                 `json:"type"`
-	Function FunctionDefinition      `json:"function,omitempty"`
+	Type     string             `json:"type"`
+	Function FunctionDefinition `json:"function,omitempty"`
 }
 
 // FunctionDefinition represents a function definition for tool calling.
@@ -34,9 +38,9 @@ type FunctionDefinition struct {
 
 // ToolCall represents a tool call from the LLM.
 type ToolCall struct {
-	ID       string                 `json:"id"`
-	Type     string                 `json:"type"`
-	Function FunctionCall           `json:"function"`
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function FunctionCall `json:"function"`
 }
 
 // FunctionCall represents a function call.
@@ -47,15 +51,15 @@ type FunctionCall struct {
 
 // ChatRequest represents a chat completion request.
 type ChatRequest struct {
-	Model            string         `json:"model"`
-	Messages         []Message      `json:"messages"`
-	Tools            []Tool         `json:"tools,omitempty"`
-	ToolChoice       interface{}    `json:"tool_choice,omitempty"`
-	Temperature      float64        `json:"temperature,omitempty"`
-	MaxTokens        int            `json:"max_tokens,omitempty"`
-	TopP             float64        `json:"top_p,omitempty"`
-	Stream           bool           `json:"stream,omitempty"`
-	ResponseFormat   *ResponseFormat `json:"response_format,omitempty"`
+	Model          string          `json:"model"`
+	Messages       []Message       `json:"messages"`
+	Tools          []Tool          `json:"tools,omitempty"`
+	ToolChoice     interface{}     `json:"tool_choice,omitempty"`
+	Temperature    float64         `json:"temperature,omitempty"`
+	MaxTokens      int             `json:"max_tokens,omitempty"`
+	TopP           float64         `json:"top_p,omitempty"`
+	Stream         bool            `json:"stream,omitempty"`
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 }
 
 // ResponseFormat represents the response format.
@@ -75,24 +79,24 @@ type ChatResponse struct {
 
 // Choice represents a choice in the response.
 type Choice struct {
-	Index        int          `json:"index"`
+	Index        int             `json:"index"`
 	Message      ResponseMessage `json:"message"`
-	Delta        *Delta       `json:"delta,omitempty"`
-	FinishReason string       `json:"finish_reason,omitempty"`
-	ToolCalls    []ToolCall   `json:"tool_calls,omitempty"`
+	Delta        *Delta          `json:"delta,omitempty"`
+	FinishReason string          `json:"finish_reason,omitempty"`
+	ToolCalls    []ToolCall      `json:"tool_calls,omitempty"`
 }
 
 // ResponseMessage represents a message in the response.
 type ResponseMessage struct {
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
+	Role      string     `json:"role"`
+	Content   string     `json:"content"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 // Delta represents a delta in streaming mode.
 type Delta struct {
-	Role      string    `json:"role,omitempty"`
-	Content   string    `json:"content,omitempty"`
+	Role      string     `json:"role,omitempty"`
+	Content   string     `json:"content,omitempty"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
@@ -114,13 +118,13 @@ type ChatChunk struct {
 
 // Config represents the LLM client configuration.
 type Config struct {
-	Provider   string
-	BaseURL    string
-	APIKey     string
-	Model      string
-	MaxTokens  int
+	Provider    string
+	BaseURL     string
+	APIKey      string
+	Model       string
+	MaxTokens   int
 	Temperature float64
-	Timeout    time.Duration
+	Timeout     time.Duration
 }
 
 // Client represents an OpenAI-compatible LLM client.
@@ -150,9 +154,9 @@ func NewClient(config *Config) *Client {
 // Chat sends a chat completion request.
 func (c *Client) Chat(ctx context.Context, messages []Message) (*ChatResponse, error) {
 	req := &ChatRequest{
-		Model:     c.config.Model,
-		Messages:  messages,
-		MaxTokens: c.config.MaxTokens,
+		Model:       c.config.Model,
+		Messages:    messages,
+		MaxTokens:   c.config.MaxTokens,
 		Temperature: c.config.Temperature,
 	}
 
@@ -286,7 +290,8 @@ func (c *Client) handleStream(resp *http.Response, handler func(ChatChunk)) (*Ch
 	return nil, fmt.Errorf("no valid response received")
 }
 
-// GetModels returns available models for the current provider.
+// GetModels returns available models for the current provider by querying its
+// OpenAI-compatible GET /models endpoint.
 func (c *Client) GetModels(ctx context.Context) ([]string, error) {
 	baseURL := strings.TrimSuffix(c.config.BaseURL, "/")
 	url := fmt.Sprintf("%s/models", baseURL)
@@ -304,6 +309,13 @@ func (c *Client) GetModels(ctx context.Context) ([]string, error) {
 	}
 	defer resp.Body.Close()
 
+	// Surface non-2xx responses instead of silently decoding an error body
+	// into an empty model list.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("provider returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
 	var result struct {
 		Data []struct {
 			ID string `json:"id"`
@@ -314,9 +326,11 @@ func (c *Client) GetModels(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	models := make([]string, len(result.Data))
-	for i, m := range result.Data {
-		models[i] = m.ID
+	models := make([]string, 0, len(result.Data))
+	for _, m := range result.Data {
+		if m.ID != "" {
+			models = append(models, m.ID)
+		}
 	}
 
 	return models, nil

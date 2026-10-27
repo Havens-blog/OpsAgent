@@ -113,6 +113,16 @@ type AliyunSLSConfig struct {
 	AccessKeySecret string `json:"access_key_secret" yaml:"access_key_secret"`
 	// SecurityToken is the STS token (optional).
 	SecurityToken string `json:"security_token,omitempty" yaml:"security_token,omitempty"`
+	// ServiceField is the index field name that holds the service identifier
+	// in this project's logs (deployment-specific; defaults to "service").
+	// Used when translating a QueryIntent.ServiceName into the SLS dialect.
+	ServiceField string `json:"service_field,omitempty" yaml:"service_field,omitempty"`
+	// LevelField is the index field name that holds the log level in this
+	// project's logs (deployment-specific; defaults to "level"). Used when
+	// translating a QueryIntent.ErrorsOnly into the SLS dialect. Application
+	// logs usually have it; access logs (nginx/tomcat) usually do not — point
+	// error-intent queries at a project/logstore that indexes this field.
+	LevelField string `json:"level_field,omitempty" yaml:"level_field,omitempty"`
 }
 
 // Validate validates the SLS configuration.
@@ -125,6 +135,59 @@ func (c *AliyunSLSConfig) Validate() error {
 	}
 	if c.Project == "" {
 		return fmt.Errorf("SLS project is required")
+	}
+	if c.AccessKeyID == "" {
+		return fmt.Errorf("access_key_id is required")
+	}
+	if c.AccessKeySecret == "" {
+		return fmt.Errorf("access_key_secret is required")
+	}
+	return nil
+}
+
+// VolcengineTLSConfig represents configuration for Volcengine TLS (Tinder Log
+// Service) — the Volcengine counterpart of Alibaba Cloud SLS.
+type VolcengineTLSConfig struct {
+	Config
+	// Endpoint is the TLS endpoint (e.g., https://tls-cn-beijing.volces.com).
+	Endpoint string `json:"endpoint" yaml:"endpoint"`
+	// Region is the Volcengine region (e.g., cn-beijing). Required by the SDK
+	// for request signing — this is the key shape difference from SLS.
+	Region string `json:"region" yaml:"region"`
+	// TopicID is the TLS topic to query. It is the TLS unit of log location,
+	// analogous to an SLS logstore, and is required by SearchLogs.
+	TopicID string `json:"topic_id" yaml:"topic_id"`
+	// AccessKeyID is the Volcengine Access Key ID.
+	AccessKeyID string `json:"access_key_id" yaml:"access_key_id"`
+	// AccessKeySecret is the Volcengine Secret Access Key.
+	AccessKeySecret string `json:"access_key_secret" yaml:"access_key_secret"`
+	// SecurityToken is the STS token (optional).
+	SecurityToken string `json:"security_token,omitempty" yaml:"security_token,omitempty"`
+	// ServiceField is the index field name that holds the service identifier
+	// in this topic's logs (deployment-specific; defaults to "service").
+	// Used when translating a QueryIntent.ServiceName into the TLS dialect.
+	ServiceField string `json:"service_field,omitempty" yaml:"service_field,omitempty"`
+	// LevelField is the index field name that holds the log level in this
+	// topic's logs (deployment-specific; defaults to "level"). Used when
+	// translating a QueryIntent.ErrorsOnly into the TLS dialect. Application
+	// logs usually have it; access logs usually do not — point error-intent
+	// queries at a topic that indexes this field.
+	LevelField string `json:"level_field,omitempty" yaml:"level_field,omitempty"`
+}
+
+// Validate validates the Volcengine TLS configuration.
+func (c *VolcengineTLSConfig) Validate() error {
+	if err := c.Config.Validate(); err != nil {
+		return err
+	}
+	if c.Endpoint == "" {
+		return fmt.Errorf("TLS endpoint is required")
+	}
+	if c.Region == "" {
+		return fmt.Errorf("TLS region is required")
+	}
+	if c.TopicID == "" {
+		return fmt.Errorf("TLS topic_id is required")
 	}
 	if c.AccessKeyID == "" {
 		return fmt.Errorf("access_key_id is required")

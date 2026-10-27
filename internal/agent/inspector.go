@@ -21,12 +21,12 @@ type InspectorAgent struct {
 // NewInspectorAgent creates a new InspectorAgent.
 func NewInspectorAgent(settings *config.Settings) (*InspectorAgent, error) {
 	cfg := &AgentConfig{
-		Name:         "inspector-agent",
-		Type:         AgentTypeInspector,
-		Description:  "Perform operations inspection and compliance checks",
-		Model:        "claude-sonnet-4-20250514",
-		MaxTurns:     10,
-		Timeout:      10 * time.Minute,
+		Name:        "inspector-agent",
+		Type:        AgentTypeInspector,
+		Description: "Perform operations inspection and compliance checks",
+		Model:       "claude-sonnet-4-20250514",
+		MaxTurns:    10,
+		Timeout:     10 * time.Minute,
 		SystemPrompt: `You are an InspectorAgent specialized in operations inspection and compliance.
 
 Your capabilities include:
@@ -57,30 +57,30 @@ When performing inspections:
 
 // InspectionParams holds parameters for an inspection task.
 type InspectionParams struct {
-	Type          string   `json:"type"`                    // cloud_resources, elasticsearch, compliance
-	Providers     []string `json:"providers,omitempty"`     // aliyun, aws, etc.
-	Services      []string `json:"services,omitempty"`      // ecs, rds, etc.
-	ClusterURL    string   `json:"cluster_url,omitempty"`   // For ES inspection
-	CheckIndices  bool     `json:"check_indices,omitempty"` // Check ES indices
-	CheckNodes    bool     `json:"check_nodes,omitempty"`   // Check ES nodes
-	ComplianceID  string   `json:"compliance_id,omitempty"` // Compliance policy ID
+	Type         string   `json:"type"`                    // cloud_resources, elasticsearch, compliance
+	Providers    []string `json:"providers,omitempty"`     // aliyun, aws, etc.
+	Services     []string `json:"services,omitempty"`      // ecs, rds, etc.
+	ClusterURL   string   `json:"cluster_url,omitempty"`   // For ES inspection
+	CheckIndices bool     `json:"check_indices,omitempty"` // Check ES indices
+	CheckNodes   bool     `json:"check_nodes,omitempty"`   // Check ES nodes
+	ComplianceID string   `json:"compliance_id,omitempty"` // Compliance policy ID
 	ResourceType string   `json:"resource_type,omitempty"` // Resource type to check
 }
 
 // InspectionReport represents the result of an inspection.
 type InspectionReport struct {
-	ID          string            `json:"id"`
-	Type        string            `json:"type"`
-	Status      string            `json:"status"`
-	StartTime   time.Time         `json:"start_time"`
-	EndTime     time.Time         `json:"end_time"`
-	Duration    time.Duration     `json:"duration"`
-	Summary     InspectionSummary `json:"summary"`
-	Findings    []Finding         `json:"findings"`
-	Resources   int               `json:"resources_checked"`
-	Passed      int               `json:"checks_passed"`
-	Failed      int               `json:"checks_failed"`
-	Warning     int               `json:"warnings"`
+	ID        string            `json:"id"`
+	Type      string            `json:"type"`
+	Status    string            `json:"status"`
+	StartTime time.Time         `json:"start_time"`
+	EndTime   time.Time         `json:"end_time"`
+	Duration  time.Duration     `json:"duration"`
+	Summary   InspectionSummary `json:"summary"`
+	Findings  []Finding         `json:"findings"`
+	Resources int               `json:"resources_checked"`
+	Passed    int               `json:"checks_passed"`
+	Failed    int               `json:"checks_failed"`
+	Warning   int               `json:"warnings"`
 }
 
 // InspectionSummary provides a high-level summary of the inspection.
@@ -94,16 +94,16 @@ type InspectionSummary struct {
 
 // Finding represents a single inspection finding.
 type Finding struct {
-	ID          string                 `json:"id"`
-	ResourceID  string                 `json:"resource_id"`
-	ResourceType string                `json:"resource_type"`
-	Severity    string                 `json:"severity"` // critical, warning, info
-	Title       string                 `json:"title"`
-	Description string                 `json:"description"`
-	Remediation string                 `json:"remediation,omitempty"`
-	Labels      map[string]string      `json:"labels,omitempty"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
-	Timestamp   time.Time              `json:"timestamp"`
+	ID           string                 `json:"id"`
+	ResourceID   string                 `json:"resource_id"`
+	ResourceType string                 `json:"resource_type"`
+	Severity     string                 `json:"severity"` // critical, warning, info
+	Title        string                 `json:"title"`
+	Description  string                 `json:"description"`
+	Remediation  string                 `json:"remediation,omitempty"`
+	Labels       map[string]string      `json:"labels,omitempty"`
+	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+	Timestamp    time.Time              `json:"timestamp"`
 }
 
 // RunInspection executes an inspection with the given parameters.
@@ -405,8 +405,8 @@ func (i *InspectorAgent) executeInspectionTask(ctx context.Context, task *Task) 
 	report, err := i.RunInspection(ctx, params)
 	if err != nil {
 		return &ExecutionResult{
-			Success: false,
-			Error:   err,
+			Success:  false,
+			Error:    err,
 			Response: fmt.Sprintf("Inspection failed: %v", err),
 		}, nil
 	}
@@ -418,15 +418,15 @@ func (i *InspectorAgent) executeInspectionTask(ctx context.Context, task *Task) 
 		Success:  true,
 		Response: response,
 		Data: map[string]interface{}{
-			"inspection_id":    report.ID,
-			"type":            report.Type,
-			"status":          report.Status,
-			"score":           report.Summary.Score,
-			"overall_status":  report.Summary.OverallStatus,
-			"findings_count":  len(report.Findings),
-			"critical_count":  report.Summary.CriticalCount,
-			"warning_count":   report.Summary.WarningCount,
-			"duration":        report.Duration.String(),
+			"inspection_id":  report.ID,
+			"type":           report.Type,
+			"status":         report.Status,
+			"score":          report.Summary.Score,
+			"overall_status": report.Summary.OverallStatus,
+			"findings_count": len(report.Findings),
+			"critical_count": report.Summary.CriticalCount,
+			"warning_count":  report.Summary.WarningCount,
+			"duration":       report.Duration.String(),
 		},
 		ToolsUsed: []string{"inspection"},
 	}, nil
@@ -479,13 +479,16 @@ func (i *InspectorAgent) formatInspectionReport(report *InspectionReport) string
 
 // executeTask implements the default task execution.
 func (i *InspectorAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResult, error) {
-	return &ExecutionResult{
-		Success:  true,
-		Response: fmt.Sprintf("InspectorAgent processed task: %s\n\nUse type='inspection' parameter to perform inspection.", task.Description),
-		Data: map[string]interface{}{
-			"capabilities": i.GetConfig().Capabilities,
-		},
-	}, nil
+	// Delegate to the base agent's real LLM-backed execution (Go uses static
+	// dispatch, so forward explicitly rather than relying on virtual dispatch).
+	result, err := i.BaseAgent.executeTask(ctx, task)
+	if result != nil {
+		if result.Data == nil {
+			result.Data = map[string]interface{}{}
+		}
+		result.Data["capabilities"] = i.GetConfig().Capabilities
+	}
+	return result, err
 }
 
 // CreateInspectorTools creates the standard set of tools for InspectorAgent.

@@ -1,15 +1,28 @@
 /**
  * API client for the OpsAgent backend.
  *
- * In development, Next.js rewrites /api/v1/* to the Go backend
- * (see next.config.ts), so the frontend can call same-origin URLs.
- * In production, set NEXT_PUBLIC_API_URL to the backend address.
+ * The browser ALWAYS calls same-origin {basePath}/api/v1/* (relative paths).
+ * Those requests are handled by the server-side proxy at
+ * src/app/api/v1/[...path]/route.ts, which injects the EIAM/bearer credential
+ * and forwards to the Go backend. The browser never holds the token and never
+ * talks to the backend directly — so a direct backend address must NOT be used
+ * here (that would bypass the proxy and fail auth).
+ *
+ * API_BASE must equal next.config basePath (/opsagent): Next.js auto-prefixes
+ * the route handler to /opsagent/api/v1/*, but fetch() does NOT inherit
+ * basePath, so the base is prepended explicitly here. Kept env-overridable and
+ * in lock-step with next.config's NEXT_BASE_PATH default.
  */
 
-// Use empty string in dev to leverage Next.js rewrites (relative paths)
-// In production, set NEXT_PUBLIC_API_URL to the backend address
-const API_BASE =
-  (process.env.NODE_ENV === "production" ? process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") : "") || ""
+// Same-origin, basePath-prefixed: the Next.js server proxies to the backend.
+const API_BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "/opsagent"
+
+// Where to send an unauthenticated browser to start EIAM login. Browser-
+// visible (NEXT_PUBLIC_), not a secret. Defaults to the console login route,
+// matching the legacy ops console. The current URL is appended as `redirect`
+// so EIAM can return the user after login.
+const EIAM_LOGIN_URL =
+  process.env.NEXT_PUBLIC_EIAM_LOGIN_URL || "/console/login"
 
 export class ApiError extends Error {
   status: number
@@ -17,6 +30,17 @@ export class ApiError extends Error {
     super(message)
     this.status = status
   }
+}
+
+// redirectToLogin sends the browser to EIAM login. It NEVER clears any cookie
+// (the EIAM session cookie is owned by EIAM) and guards against redirect loops
+// by not re-navigating when already on the login route.
+function redirectToLogin() {
+  if (typeof window === "undefined") return
+  const current = window.location.href
+  if (window.location.pathname.startsWith(EIAM_LOGIN_URL)) return
+  const sep = EIAM_LOGIN_URL.includes("?") ? "&" : "?"
+  window.location.href = `${EIAM_LOGIN_URL}${sep}redirect=${encodeURIComponent(current)}`
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -29,9 +53,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
     // Always fetch fresh data — this is a live operations console.
     cache: "no-store",
+    // Send the same-origin EIAM session cookie so the proxy can forward it.
+    credentials: "same-origin",
   })
 
   if (!res.ok) {
+    // 401 = unauthenticated → bounce to EIAM login (contract: never clear the
+    // session cookie). 403 (tenant not selected) is deliberately NOT a login
+    // redirect — the user is authenticated and selects a tenant via EIAM.
+    if (res.status === 401) {
+      redirectToLogin()
+    }
     let detail = res.statusText
     try {
       const body = await res.json()
@@ -79,9 +111,55 @@ export interface Evidence {
   description: string
 }
 
+export interface IncidentTimeline {
+  time: string
+  event: string
+}
+
+/** A single incident with root-cause + evidence, as returned by
+ * GET /api/v1/incidents/:id. */
+export interface IncidentDetail extends Incident {
+  evidence: Evidence[]
+  timeline: IncidentTimeline[]
+}
+
+export interface AgentDetail {
+  id: string
+  name: string
+  type: string
+  description: string
+  capabilities: string[]
+}
+
 export interface AgentInfo {
   agents: string[]
   count: number
+  details?: AgentDetail[]
+}
+
+export interface DataSourceDimension {
+  dimension: string
+  source: string
+  real: boolean
+  env: string[]
+}
+
+export interface DataSourceStatus {
+  dimensions: DataSourceDimension[]
+  real_count: number
+  total: number
+  all_mock: boolean
+}
+
+export interface AgentExecResult {
+  agent_id: string
+  task_id: string
+  success: boolean
+  response: string
+  data?: Record<string, unknown>
+  tools_used?: string[]
+  duration_ms: number
+  error?: string
 }
 
 export interface ServiceNode {
@@ -182,10 +260,152 @@ export interface ChatResponse {
   tools?: { tool: string; params: Record<string, unknown>; result: string }[]
 }
 
+/* ---------- LLM config types ---------- */
+
+export interface ProviderInfo {
+  id: string
+  name: string
+  base_url: string
+  default_model: string
+  models: string[]
+}
+
+export interface LLMConfig {
+  provider: string
+  base_url: string
+  model: string
+  has_api_key: boolean
+  api_key_masked: string
+  max_tokens: number
+  temperature: number
+  timeout: number
+  available: boolean
+}
+
+export interface LLMConfigInput {
+  provider: string
+  base_url?: string
+  model: string
+  api_key?: string
+  max_tokens?: number
+  temperature?: number
+  timeout?: number
+}
+
+export interface LLMTestResult {
+  success: boolean
+  error?: string
+  model?: string
+  latency_ms?: number
+  reply?: string
+}
+
+export interface SaveLLMResult {
+  saved: boolean
+  persisted: boolean
+  persist_error?: string
+  config: LLMConfig
+}
+
+export interface ModelsResult {
+  models: string[]
+  source: "provider" | "fallback"
+  error?: string
+}
+
+export interface NotificationConfig {
+  platform: string
+  webhook_url: string
+  has_secret: boolean
+  secret_masked: string
+  severities: string[]
+  start_time: string
+  end_time: string
+}
+
+export interface NotificationConfigInput {
+  platform: string
+  webhook_url: string
+  secret?: string
+  severities: string[]
+  start_time: string
+  end_time: string
+}
+
+export interface AuditLogEntry {
+  time: string
+  user: string
+  operation: string
+  ip: string
+  result: "success" | "failed"
+  detail?: string
+}
+
+export interface SecurityConfig {
+  enable_audit_log: boolean
+  audit_log_path: string
+  audit_retention_days: number
+  ip_whitelist: string
+  rate_limit: number
+  audit_logs: AuditLogEntry[]
+}
+
+export interface SecurityConfigInput {
+  enable_audit_log: boolean
+  audit_log_path: string
+  audit_retention_days: number
+  ip_whitelist: string
+  rate_limit: number
+}
+
+export interface NotificationTestInput {
+  platform: string
+  webhook_url: string
+  secret?: string
+}
+
+export interface NotificationTestResult {
+  success: boolean
+  platform: string
+  http_status?: number
+  response?: string
+  error?: string
+  latency_ms?: number
+}
+
+interface SaveResult {
+  status: string
+  persisted: boolean
+  error?: string
+}
+
 /* ---------- Endpoints ---------- */
 
 export const api = {
   health: () => request<HealthResponse>("/api/v1/health"),
+
+  listProviders: () =>
+    request<{ providers: ProviderInfo[] }>("/api/v1/providers"),
+
+  getLLMConfig: () => request<LLMConfig>("/api/v1/config/llm"),
+
+  saveLLMConfig: (body: LLMConfigInput) =>
+    request<SaveLLMResult>("/api/v1/config/llm", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  testLLMConfig: (body: LLMConfigInput) =>
+    request<LLMTestResult>("/api/v1/config/llm/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  listModels: (body: LLMConfigInput) =>
+    request<ModelsResult>("/api/v1/config/llm/models", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   triggerRCA: (body: {
     incident_id: string
@@ -204,6 +424,11 @@ export const api = {
     request<{ reports: RCAReport[]; count: number }>("/api/v1/rca"),
 
   getRCA: (id: string) => request<RCAReport>(`/api/v1/rca/${id}`),
+
+  getIncidents: () =>
+    request<{ incidents: Incident[]; count: number }>("/api/v1/incidents"),
+
+  getIncident: (id: string) => request<IncidentDetail>(`/api/v1/incidents/${id}`),
 
   queryLogs: (body: {
     query: string
@@ -225,6 +450,39 @@ export const api = {
     }),
 
   listAgents: () => request<AgentInfo>("/api/v1/agents"),
+
+  executeAgent: (agentId: string, description: string, params?: Record<string, unknown>) =>
+    request<AgentExecResult>(`/api/v1/agents/${agentId}`, {
+      method: "POST",
+      body: JSON.stringify({ description, params }),
+    }),
+
+  getDataSources: () =>
+    request<DataSourceStatus>("/api/v1/config/datasources"),
+
+  getNotificationConfig: () =>
+    request<NotificationConfig>("/api/v1/config/notifications"),
+
+  saveNotificationConfig: (body: NotificationConfigInput) =>
+    request<SaveResult & { config: NotificationConfig }>("/api/v1/config/notifications", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  testNotificationConfig: (body: NotificationTestInput) =>
+    request<NotificationTestResult>("/api/v1/config/notifications/test", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  getSecurityConfig: () =>
+    request<SecurityConfig>("/api/v1/config/security"),
+
+  saveSecurityConfig: (body: SecurityConfigInput) =>
+    request<SaveResult & { config: SecurityConfig }>("/api/v1/config/security", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
 
   getTopology: () =>
     request<{ status: string; topology: ServiceGraph }>("/api/v1/topology"),

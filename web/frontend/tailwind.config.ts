@@ -1,4 +1,5 @@
 import type { Config } from 'tailwindcss'
+import tailwindcssAnimate from 'tailwindcss-animate'
 
 const config: Config = {
   darkMode: ['class'],
@@ -50,6 +51,15 @@ const config: Config = {
           DEFAULT: 'hsl(var(--card))',
           foreground: 'hsl(var(--card-foreground))',
         },
+        // Linear multi-tier tokens aligned to haven-console (theme-variables.scss).
+        surface: 'hsl(var(--bg-surface))',
+        elevated: 'hsl(var(--bg-elevated))',
+        'bg-hover': 'hsl(var(--bg-hover))',
+        'text-regular': 'hsl(var(--text-regular))',
+        'text-secondary': 'hsl(var(--text-secondary))',
+        'text-tertiary': 'hsl(var(--text-tertiary))',
+        'accent-blue': 'hsl(var(--accent-blue))',
+        'accent-purple': 'hsl(var(--accent-purple))',
         // Severity colors for incidents
         severity: {
           p0: 'hsl(0, 84%, 60%)',    // Red
@@ -92,7 +102,7 @@ const config: Config = {
       },
     },
   },
-  plugins: [require('tailwindcss-animate')],
+  plugins: [tailwindcssAnimate],
 }
 
 export default config

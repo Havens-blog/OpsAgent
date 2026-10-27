@@ -172,3 +172,33 @@ func (k *K8sChangeSource) GetLastChange(ctx context.Context, service string) (*m
 func (k *K8sChangeSource) signRequest(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+k.token)
 }
+
+// Ping verifies the Kubernetes API server is reachable and the token is
+// accepted, by listing at most one deployment in the configured namespace.
+// Returns nil only on a successful round-trip, so a successful Ping means the
+// source is genuinely usable rather than merely constructed.
+func (k *K8sChangeSource) Ping(ctx context.Context) error {
+	ns := k.namespace
+	if ns == "" {
+		ns = "default"
+	}
+	url := fmt.Sprintf("%s/apis/apps/v1/namespaces/%s/deployments?limit=1", k.endpoint, ns)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+	k.signRequest(req)
+
+	resp, err := k.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("K8s ping failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	return nil
+}

@@ -351,8 +351,8 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 		return nil, fmt.Errorf("data source config is required")
 	}
 
-	sources := &RCASources{}
-	sources.LogSource = buildLogSources(cfg)
+	result := &RCASources{}
+	result.LogSource = buildLogSources(cfg)
 
 	if cfg.PrometheusEndpoint != "" {
 		promSource, err := integrations.NewPrometheusMetricSourceWithToken(cfg.PrometheusEndpoint, cfg.PrometheusToken)
@@ -360,7 +360,7 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 			return nil, fmt.Errorf("failed to create Prometheus source: %w", err)
 		}
 		if pingOK(promSource) {
-			sources.MetricSource = promSource
+			result.MetricSource = promSource
 		}
 	}
 
@@ -373,7 +373,7 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 			return nil, fmt.Errorf("failed to create ARMS APM topology source: %w", err)
 		}
 		if pingOK(apmSource) {
-			sources.TopologySource = apmSource
+			result.TopologySource = apmSource
 		}
 	} else if cfg.ARMSEndpoint != "" && cfg.ARMSPid != "" {
 		armsSource, err := integrations.NewARMSTopologySource(cfg.ARMSEndpoint, cfg.ARMSPid, cfg.ARMSAccessKey, cfg.ARMSSecretKey)
@@ -381,7 +381,7 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 			return nil, fmt.Errorf("failed to create ARMS source: %w", err)
 		}
 		if pingOK(armsSource) {
-			sources.TopologySource = armsSource
+			result.TopologySource = armsSource
 		}
 	}
 
@@ -391,11 +391,11 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 			return nil, fmt.Errorf("failed to create K8s source: %w", err)
 		}
 		if pingOK(k8sSource) {
-			sources.ChangeSource = k8sSource
+			result.ChangeSource = k8sSource
 		}
 	}
 
-	return sources, nil
+	return result, nil
 }
 
 // CreateRCASourcesWithFallback builds real data sources from cfg and fills any

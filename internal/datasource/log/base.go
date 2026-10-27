@@ -183,8 +183,12 @@ func (b *BaseLogDataSource) ValidateQueryRequest(req *core.LogQueryRequest) erro
 		return fmt.Errorf("limit cannot exceed 10000")
 	}
 
-	if req.Query == "" {
-		return fmt.Errorf("query cannot be empty")
+	// A request must carry EITHER a raw Query string OR a structured Intent.
+	// Under the "express intent, not dialect" design, intent-based requests
+	// leave Query empty and each data source builds its own dialect from
+	// Intent, so an empty Query is valid as long as Intent is set.
+	if req.Query == "" && req.Intent == nil {
+		return fmt.Errorf("either query or intent is required")
 	}
 
 	return nil
@@ -329,6 +333,29 @@ func (b *BaseLogDataSource) ParseLogEntry(raw map[string]interface{}) (*core.Log
 	}
 
 	return entry, nil
+}
+
+// backfillSource fills entry.Source from the configured service field when the
+// parser could not populate it from a conventional "source" key. The service
+// identifier is deployment-specific — e.g. this cluster's Volcengine TLS logs
+// carry it in "document_type", not "service" — so the datasource layer, which
+// alone knows its serviceField config, is the right place to resolve it. This
+// is what lets a real log line reach RCA WITH a service name, so error-spike
+// hypotheses can be attributed to a service and correlated with topology,
+// instead of collapsing into one empty-service bucket.
+//
+// No-op when Source is already set, the field name is empty, or the field is
+// absent/non-string — so a deployment that does not configure serviceField
+// behaves exactly as before (no regression).
+func backfillSource(entry *core.LogEntry, serviceField string) {
+	if entry == nil || entry.Source != "" || serviceField == "" {
+		return
+	}
+	if v, ok := entry.Fields[serviceField]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			entry.Source = s
+		}
+	}
 }
 
 // IsHealthy returns true if the data source is healthy.

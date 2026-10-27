@@ -28,6 +28,8 @@ const (
 	DataSourceTypeElasticsearch DataSourceType = "elasticsearch"
 	// DataSourceTypeGeneric represents generic data sources
 	DataSourceTypeGeneric DataSourceType = "generic"
+	// DataSourceTypeMCP represents Model Context Protocol tools
+	DataSourceTypeMCP DataSourceType = "mcp"
 )
 
 // ToolMetadata contains metadata about a tool.

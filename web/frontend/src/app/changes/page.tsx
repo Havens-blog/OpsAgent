@@ -24,6 +24,10 @@ interface ChangeItem {
   correlation?: number
 }
 
+// Fixed demo timestamps (ISO, +08:00). Deterministic ON PURPOSE: this is a
+// SSR-ed client component, so Date.now()-at-render diverges between the server
+// pass and client hydration and trips a hydration mismatch. Real timestamps
+// will arrive from the backend once this page is wired to live data.
 const CHANGES: ChangeItem[] = [
   {
     id: "gitlab-deploy-001",
@@ -32,7 +36,7 @@ const CHANGES: ChangeItem[] = [
     service: "order-service",
     message: "Fix: Database connection pool exhaustion",
     author: "John Doe",
-    time: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
+    time: "2026-10-26T17:16:51+08:00",
     status: "success",
     correlation: 0.62,
   },
@@ -43,7 +47,7 @@ const CHANGES: ChangeItem[] = [
     service: "order-service",
     message: "ConfigMap app-config 更新: DATABASE_URL, REDIS_HOST",
     author: "ops-bot",
-    time: new Date(Date.now() - 18 * 60 * 1000).toISOString(),
+    time: "2026-10-26T17:10:51+08:00",
     status: "success",
     correlation: 0.71,
   },
@@ -54,7 +58,7 @@ const CHANGES: ChangeItem[] = [
     service: "payment-service",
     message: "feat: Add payment gateway integration",
     author: "Jane Smith",
-    time: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+    time: "2026-10-26T16:43:51+08:00",
     status: "rolled_back",
     correlation: 0.88,
   },
@@ -65,7 +69,7 @@ const CHANGES: ChangeItem[] = [
     service: "api-gateway",
     message: "Secret api-keys 更新: API_KEY",
     author: "security",
-    time: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    time: "2026-10-26T15:28:51+08:00",
     status: "success",
     correlation: 0.15,
   },
@@ -76,7 +80,7 @@ const CHANGES: ChangeItem[] = [
     service: "user-service",
     message: "chore: bump dependencies",
     author: "CI",
-    time: new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString(),
+    time: "2026-10-26T12:16:51+08:00",
     status: "failed",
     correlation: 0.09,
   },
@@ -145,10 +149,12 @@ export default function ChangesPage() {
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
-            {CHANGES.sort(
-              (a, b) =>
-                new Date(b.time).getTime() - new Date(a.time).getTime()
-            ).map((c) => {
+            {[...CHANGES]
+              .sort(
+                (a, b) =>
+                  new Date(b.time).getTime() - new Date(a.time).getTime()
+              )
+              .map((c) => {
               const Icon = c.kind === "deployment" ? GitBranch : Settings
               return (
                 <div

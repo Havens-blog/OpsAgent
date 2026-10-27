@@ -169,3 +169,143 @@ func TestCoordinatorAgentExecute(t *testing.T) {
 		}
 	})
 }
+
+// TestCoordinatorRouting exercises createExecutionPlan's three-tier routing:
+// explicit type fast-path, LLM intent routing, and the direct fallback.
+func TestCoordinatorRouting(t *testing.T) {
+	settings := &config.Settings{
+		Environment:   config.EnvDevelopment,
+		LLM:           config.LLMConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "test-key"},
+		Observability: config.ObservabilityConfig{LogLevel: "info", LogFormat: "json"},
+		Security:      config.SecurityConfig{EnableAuditLog: false},
+		DataSources:   make(map[string]interface{}),
+	}
+
+	newCoord := func(t *testing.T, llmReply string) *CoordinatorAgent {
+		t.Helper()
+		coord, err := NewCoordinatorAgent(settings)
+		if err != nil {
+			t.Fatalf("NewCoordinatorAgent failed: %v", err)
+		}
+		// Register two specialists the router can choose between.
+		for _, name := range []string{"monitor", "log_analyst"} {
+			m, err := NewMockAgent(settings)
+			if err != nil {
+				t.Fatalf("NewMockAgent failed: %v", err)
+			}
+			if err := coord.RegisterAgent(name, m.BaseAgent); err != nil {
+				t.Fatalf("RegisterAgent(%s) failed: %v", name, err)
+			}
+		}
+		// Deterministic LLM so routing never hits a real provider.
+		coord.llmClient = &stubLLM{reply: llmReply}
+		return coord
+	}
+
+	ctx := context.Background()
+
+	t.Run("explicit type fast-path skips LLM", func(t *testing.T) {
+		// A reply that WOULD route elsewhere if the LLM were consulted; the
+		// explicit type must win and the LLM must not be used.
+		coord := newCoord(t, `{"strategy":"sequential","agents":["log_analyst"]}`)
+		defer coord.Shutdown(ctx)
+
+		task := &Task{
+			ID:          "t1",
+			Description: "run RCA",
+			Params:      map[string]interface{}{"type": "rca"},
+			CreatedAt:   time.Now(),
+			Status:      "pending",
+		}
+		plan, err := coord.createExecutionPlan(ctx, task)
+		if err != nil {
+			t.Fatalf("createExecutionPlan failed: %v", err)
+		}
+		if len(plan.Delegations) != 1 || plan.Delegations[0].AgentName != "monitor" {
+			t.Fatalf("expected single delegation to monitor, got %+v", plan.Delegations)
+		}
+	})
+
+	t.Run("LLM routes free-text to chosen agents (parallel)", func(t *testing.T) {
+		coord := newCoord(t, `Here you go: {"strategy":"parallel","agents":["monitor","log_analyst"]}`)
+		defer coord.Shutdown(ctx)
+
+		task := &Task{
+			ID:          "t2",
+			Description: "errors spiking and logs look weird",
+			CreatedAt:   time.Now(),
+			Status:      "pending",
+		}
+		plan, err := coord.createExecutionPlan(ctx, task)
+		if err != nil {
+			t.Fatalf("createExecutionPlan failed: %v", err)
+		}
+		if plan.Strategy != "parallel" {
+			t.Errorf("expected parallel strategy, got %q", plan.Strategy)
+		}
+		if len(plan.Delegations) != 2 {
+			t.Fatalf("expected 2 delegations, got %d", len(plan.Delegations))
+		}
+	})
+
+	t.Run("invalid/unknown agents are dropped", func(t *testing.T) {
+		coord := newCoord(t, `{"strategy":"sequential","agents":["ghost","monitor","ghost"]}`)
+		defer coord.Shutdown(ctx)
+
+		task := &Task{
+			ID:          "t3",
+			Description: "investigate",
+			CreatedAt:   time.Now(),
+			Status:      "pending",
+		}
+		plan, err := coord.createExecutionPlan(ctx, task)
+		if err != nil {
+			t.Fatalf("createExecutionPlan failed: %v", err)
+		}
+		if len(plan.Delegations) != 1 || plan.Delegations[0].AgentName != "monitor" {
+			t.Fatalf("expected only valid agent monitor, got %+v", plan.Delegations)
+		}
+	})
+
+	t.Run("unparseable LLM reply falls back to direct", func(t *testing.T) {
+		coord := newCoord(t, "I cannot help with that.")
+		defer coord.Shutdown(ctx)
+
+		task := &Task{
+			ID:          "t4",
+			Description: "something ambiguous",
+			CreatedAt:   time.Now(),
+			Status:      "pending",
+		}
+		plan, err := coord.createExecutionPlan(ctx, task)
+		if err != nil {
+			t.Fatalf("createExecutionPlan failed: %v", err)
+		}
+		if plan.Strategy != "direct" {
+			t.Errorf("expected direct fallback, got %q", plan.Strategy)
+		}
+		if len(plan.Delegations) != 0 {
+			t.Errorf("expected no delegations on fallback, got %d", len(plan.Delegations))
+		}
+	})
+
+	t.Run("nil LLM client falls back to direct", func(t *testing.T) {
+		coord := newCoord(t, "")
+		defer coord.Shutdown(ctx)
+		coord.llmClient = nil
+
+		task := &Task{
+			ID:          "t5",
+			Description: "no llm available",
+			CreatedAt:   time.Now(),
+			Status:      "pending",
+		}
+		plan, err := coord.createExecutionPlan(ctx, task)
+		if err != nil {
+			t.Fatalf("createExecutionPlan failed: %v", err)
+		}
+		if plan.Strategy != "direct" {
+			t.Errorf("expected direct fallback with nil LLM, got %q", plan.Strategy)
+		}
+	})
+}

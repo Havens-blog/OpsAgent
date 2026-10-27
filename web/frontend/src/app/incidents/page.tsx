@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Link from "next/link"
 import {
   Card,
@@ -13,46 +13,32 @@ import { Badge, severityVariant } from "@/components/ui/badge"
 import { api, ApiError, type Incident } from "@/lib/api"
 import { formatTime } from "@/lib/utils"
 
-// Demo incidents so the console is useful even before the backend
-// has a list-incidents endpoint wired to real data.
-const DEMO_INCIDENTS: Incident[] = [
-  {
-    id: "INC-20260619-order",
-    severity: "P1",
-    title: "order-service 错误率激增至 2.5%",
-    description: "上游 api-gateway 报告订单接口 5xx 增加",
-    start_time: new Date(Date.now() - 8 * 60 * 1000).toISOString(),
-    status: "active",
-    affected_services: ["order-service", "postgres-order"],
-    root_cause: "数据库连接池耗尽（假设）",
-    confidence: 0.82,
-  },
-  {
-    id: "INC-20260619-payment",
-    severity: "P2",
-    title: "payment-service 延迟 P99 升高",
-    description: "支付链路延迟从 85ms 升至 320ms",
-    start_time: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
-    end_time: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
-    status: "resolved",
-    affected_services: ["payment-service"],
-  },
-  {
-    id: "INC-20260618-cache",
-    severity: "P3",
-    title: "redis-cache 短暂抖动",
-    description: "缓存命中率下降，已自动恢复",
-    start_time: new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString(),
-    end_time: new Date(Date.now() - 25.5 * 60 * 60 * 1000).toISOString(),
-    status: "resolved",
-    affected_services: ["redis-cache"],
-  },
-]
-
 export default function IncidentsPage() {
   const [submitting, setSubmitting] = useState(false)
   const [result, setResult] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+
+  const [incidents, setIncidents] = useState<Incident[]>([])
+  const [loadingIncidents, setLoadingIncidents] = useState(true)
+  const [listError, setListError] = useState<string | null>(null)
+
+  async function loadIncidents() {
+    setLoadingIncidents(true)
+    setListError(null)
+    try {
+      const res = await api.getIncidents()
+      setIncidents(res.incidents ?? [])
+    } catch (err) {
+      setListError(err instanceof Error ? err.message : "加载事件失败")
+    } finally {
+      setLoadingIncidents(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadIncidents()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const [form, setForm] = useState({
     incident_id: "",
@@ -89,6 +75,8 @@ export default function IncidentsPage() {
         description: form.description,
       })
       setResult(`已提交 RCA 分析 (incident: ${res.incident_id}, 状态: ${res.status})`)
+      // Refresh the list so the newly submitted incident appears.
+      void loadIncidents()
     } catch (err) {
       if (err instanceof ApiError) {
         setError(`API ${err.status}: ${err.message}`)
@@ -203,7 +191,18 @@ export default function IncidentsPage() {
 
       <div className="space-y-3">
         <h2 className="text-xl font-semibold">事件列表</h2>
-        {DEMO_INCIDENTS.map((inc) => (
+        {loadingIncidents && (
+          <p className="text-sm text-muted-foreground">加载中…</p>
+        )}
+        {listError && (
+          <p className="text-sm text-destructive">加载事件失败：{listError}</p>
+        )}
+        {!loadingIncidents && !listError && incidents.length === 0 && (
+          <div className="rounded-md border border-dashed bg-muted/30 p-6 text-center text-sm text-muted-foreground">
+            暂无事件。触发一次 RCA 分析，或等待 watch-alert 告警接入后自动产生。
+          </div>
+        )}
+        {incidents.map((inc) => (
           <Link key={inc.id} href={`/incidents/${inc.id}`}>
             <Card className="transition-colors hover:border-primary/50 hover:bg-accent/30">
               <CardContent className="flex items-center justify-between py-4">

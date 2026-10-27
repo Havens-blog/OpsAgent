@@ -103,13 +103,38 @@ type HealthInfo struct {
 	Details     map[string]interface{} `json:"details,omitempty"`
 }
 
+// QueryIntent expresses WHAT the caller wants from logs in a cloud-neutral
+// way, decoupled from any provider's query dialect. Each log data source
+// translates the intent into its own search syntax (SLS: "level: ERROR";
+// Volcengine TLS: its own grammar; Elasticsearch: Lucene/DSL). This is the
+// core of the "express intent, not dialect" design: callers never embed a
+// provider-specific query string, so the same RCA logic works across clouds.
+//
+// When Intent is nil the raw Query string is used verbatim (an escape hatch
+// for advanced, provider-specific queries). When Intent is non-nil a source
+// SHOULD build its dialect from the intent; a source MAY still honor a
+// non-empty Query as an additional constraint.
+type QueryIntent struct {
+	// ErrorsOnly restricts the result to error-level logs. Each source maps
+	// this to its own level predicate(s).
+	ErrorsOnly bool `json:"errors_only,omitempty"`
+	// ServiceName restricts the result to a single service. Each source maps
+	// this against its configured service field (see LogDataSource config),
+	// because the field name is deployment-specific, not universal.
+	ServiceName string `json:"service_name,omitempty"`
+}
+
 // LogQueryRequest represents a request to query logs.
 type LogQueryRequest struct {
 	// StartTime is the start time of the query range.
 	StartTime time.Time `json:"start_time"`
 	// EndTime is the end time of the query range.
 	EndTime time.Time `json:"end_time"`
-	// Query is the query string or filter.
+	// Intent expresses the query goal in a cloud-neutral way; when set, each
+	// data source translates it into its own dialect. Preferred over Query.
+	Intent *QueryIntent `json:"intent,omitempty"`
+	// Query is a raw, provider-specific query string. Used verbatim when
+	// Intent is nil (advanced escape hatch).
 	Query string `json:"query"`
 	// Limit is the maximum number of logs to return.
 	Limit int `json:"limit,omitempty"`

@@ -22,6 +22,10 @@ pnpm-lock.yaml
 web/frontend/.next/
 web/frontend/out/
 web/frontend/.turbo/
+web/frontend/.next-start.err
+
+# TypeScript incremental build cache
+*.tsbuildinfo
 
 # Environment
 .env

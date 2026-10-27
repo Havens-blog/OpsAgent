@@ -152,6 +152,10 @@ func TestMonitorAgentExecute(t *testing.T) {
 	}
 	defer agent.Shutdown(context.Background())
 
+	// Inject a deterministic LLM so the Non-RCA default branch (which routes to
+	// the base agent's LLM call) does not hit a real provider.
+	useStubLLM(agent.BaseAgent)
+
 	ctx := context.Background()
 
 	t.Run("RCA task", func(t *testing.T) {

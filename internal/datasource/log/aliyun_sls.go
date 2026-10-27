@@ -3,17 +3,15 @@ package log
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
 	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
+
+	sls "github.com/aliyun/aliyun-log-go-sdk"
 )
 
 // AliyunSLSConfig represents the SLS-specific configuration.
@@ -21,21 +19,29 @@ type AliyunSLSConfig struct {
 	*core.AliyunSLSConfig
 }
 
-// AliyunSLSClient is the client for Alibaba Cloud SLS.
+// AliyunSLSClient is the client for Alibaba Cloud SLS using the official SDK.
 type AliyunSLSClient struct {
 	*BaseLogDataSource
-	config *AliyunSLSConfig
-	client *http.Client
-	mu     sync.RWMutex
+	config    *AliyunSLSConfig
+	slsClient sls.ClientInterface
+	mu        sync.RWMutex
 }
 
-// NewAliyunSLSClient creates a new Alibaba Cloud SLS client.
+// NewAliyunSLSClient creates a new Alibaba Cloud SLS client using the official SDK.
 func NewAliyunSLSClient(config *core.AliyunSLSConfig) (*AliyunSLSClient, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid SLS config: %w", err)
 	}
 
-	// Create credentials
+	// Create SLS client using official SDK
+	slsClient := sls.CreateNormalInterface(
+		config.Endpoint,
+		config.AccessKeyID,
+		config.AccessKeySecret,
+		config.SecurityToken,
+	)
+
+	// Create credentials for base datasource
 	creds := &credentials.Credentials{
 		Type:            credentials.CredentialTypeAccessKey,
 		AccessKeyID:     config.AccessKeyID,
@@ -52,9 +58,7 @@ func NewAliyunSLSClient(config *core.AliyunSLSConfig) (*AliyunSLSClient, error) 
 	return &AliyunSLSClient{
 		BaseLogDataSource: base,
 		config:           &AliyunSLSConfig{AliyunSLSConfig: config},
-		client: &http.Client{
-			Timeout: config.Timeout,
-		},
+		slsClient:        slsClient,
 	}, nil
 }
 
@@ -63,21 +67,10 @@ func (c *AliyunSLSClient) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Test connection by performing a simple list log stores operation
-	req, err := c.buildRequest(ctx, "GET", fmt.Sprintf("/projects/%s/logstores", c.config.Project), nil)
+	// Test connection by getting logstore info
+	_, err := c.slsClient.GetLogStore(c.config.Project, c.config.LogStore)
 	if err != nil {
-		return core.NewNetworkError(string(c.Type()), "connect", err)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return core.NewNetworkError(string(c.Type()), "connect", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("connection failed: %s", string(body)), nil)
+		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("failed to get logstore: %v", err), nil)
 	}
 
 	c.connected = true
@@ -89,26 +82,11 @@ func (c *AliyunSLSClient) Connect(ctx context.Context) error {
 
 // ping checks if SLS is reachable.
 func (c *AliyunSLSClient) ping(ctx context.Context) error {
-	// Simple ping by listing log stores
-	req, err := c.buildRequest(ctx, "GET", fmt.Sprintf("/projects/%s/logstores", c.config.Project), nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ping failed with status %d", resp.StatusCode)
-	}
-
-	return nil
+	_, err := c.slsClient.GetLogStore(c.config.Project, c.config.LogStore)
+	return err
 }
 
-// QueryLogs queries logs from SLS.
+// QueryLogs queries logs from SLS using the official SDK.
 func (c *AliyunSLSClient) QueryLogs(ctx context.Context, req *core.LogQueryRequest) (*core.LogQueryResponse, error) {
 	// Validate request
 	if err := c.ValidateQueryRequest(req); err != nil {
@@ -125,12 +103,9 @@ func (c *AliyunSLSClient) QueryLogs(ctx context.Context, req *core.LogQueryReque
 	// Apply defaults
 	c.ApplyDefaults(req)
 
-	// Build SLS query request
-	slsReq := c.buildLogsQueryRequest(req)
-
 	// Execute with retry
 	result, err := c.ExecuteWithRetry(ctx, func() (interface{}, error) {
-		return c.executeLogsQuery(ctx, slsReq)
+		return c.executeLogsQuery(req)
 	})
 
 	if err != nil {
@@ -154,11 +129,8 @@ func (c *AliyunSLSClient) GetLogCount(ctx context.Context, req *core.LogQueryReq
 		return 0, core.NewInternalError(string(c.Type()), "get_log_count", fmt.Errorf("not connected"))
 	}
 
-	// For SLS, we can get count from the histogram API
-	slsReq := c.buildHistogramRequest(req)
-
 	result, err := c.ExecuteWithRetry(ctx, func() (interface{}, error) {
-		return c.executeHistogramQuery(ctx, slsReq)
+		return c.executeHistogramQuery(req)
 	})
 
 	if err != nil {
@@ -173,141 +145,129 @@ func (c *AliyunSLSClient) Type() core.DataSourceType {
 	return core.DataSourceTypeSLS
 }
 
-// buildRequest builds an HTTP request for SLS API.
-func (c *AliyunSLSClient) buildRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
-	// Construct full URL
-	fullURL := c.config.Endpoint + path
-
-	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
-	if err != nil {
-		return nil, err
+// serviceField returns the configured service index field, defaulting to
+// "service" when unset.
+func (c *AliyunSLSClient) serviceField() string {
+	if c.config.ServiceField != "" {
+		return c.config.ServiceField
 	}
-
-	// Add headers
-	req.Header.Set("x-log-signaturemethod", "hmac-sha1")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	// Add authentication headers
-	if err := c.signRequest(req); err != nil {
-		return nil, err
-	}
-
-	return req, nil
+	return "service"
 }
 
-// signRequest signs the request with Alibaba Cloud signature.
-func (c *AliyunSLSClient) signRequest(req *http.Request) error {
-	creds := c.GetCredentials()
-	if creds == nil || !creds.IsValid() {
-		return fmt.Errorf("invalid credentials")
+// levelField returns the configured log-level field name, defaulting to
+// "level". Made configurable because the field is deployment-specific and not
+// every log type has it (e.g. access logs), which otherwise makes an
+// ErrorsOnly intent fail against SLS with a missing-key-index error.
+func (c *AliyunSLSClient) levelField() string {
+	if c.config.LevelField != "" {
+		return c.config.LevelField
 	}
-
-	// Add common headers
-	req.Header.Set("x-log-apiversion", "0.6.0")
-	req.Header.Set("x-log-appid", "opsagent")
-
-	// Sign the request (simplified - actual SLS signing is more complex)
-	// In production, use the official SDK or implement proper HMAC-SHA1 signing
-
-	return nil
+	return "level"
 }
 
-// slsLogsQueryRequest represents an SLS logs query request.
-type slsLogsQueryRequest struct {
-	Project     string                 `json:"project"`
-	LogStore    string                 `json:"logstore"`
-	From        int64                  `json:"from"`
-	To          int64                  `json:"to"`
-	Query       string                 `json:"query"`
-	Limit       int                    `json:"limit"`
-	Offset      int                    `json:"offset,omitempty"`
-	Line        bool                   `json:"line"`
-	Reverse     bool                   `json:"reverse"`
-	PowerSQL    bool                   `json:"powerSql"`
-	ProgressIn  bool                   `json:"progressIn"`
-	Format      string                 `json:"format,omitempty"`
-	Filter      map[string]interface{} `json:"filter,omitempty"`
+// buildQuery resolves the effective SLS search string for a request. When the
+// request carries a structured Intent, it is translated into SLS dialect here
+// (so callers never embed SLS-specific syntax); otherwise the raw Query is
+// used verbatim. A non-empty raw Query is AND-combined with an Intent when
+// both are present, letting callers add an extra constraint on top of intent.
+func (c *AliyunSLSClient) buildQuery(req *core.LogQueryRequest) string {
+	if req.Intent == nil {
+		return req.Query
+	}
+
+	var clauses []string
+	if req.Intent.ErrorsOnly {
+		// The level field commonly holds ERROR/ERR; match either.
+		lf := c.levelField()
+		clauses = append(clauses, fmt.Sprintf("(%s: ERROR OR %s: ERR)", lf, lf))
+	}
+	if req.Intent.ServiceName != "" {
+		clauses = append(clauses, fmt.Sprintf("%s: %s", c.serviceField(), req.Intent.ServiceName))
+	}
+	if req.Query != "" {
+		clauses = append(clauses, "("+req.Query+")")
+	}
+
+	if len(clauses) == 0 {
+		// Intent present but empty: match everything in the time range.
+		return ""
+	}
+	return joinClauses(clauses, " AND ")
 }
 
-// buildLogsQueryRequest builds an SLS logs query request.
-func (c *AliyunSLSClient) buildLogsQueryRequest(req *core.LogQueryRequest) *slsLogsQueryRequest {
-	return &slsLogsQueryRequest{
-		Project:  c.config.Project,
-		LogStore: c.config.LogStore,
-		From:     req.StartTime.Unix(),
-		To:       req.EndTime.Unix(),
-		Query:    req.Query,
-		Limit:    req.Limit,
-		Offset:   req.Offset,
-		Reverse:  req.Sort == "desc",
-		Line:     true,
-		Format:   "json",
+// joinClauses joins non-empty clauses with the given separator.
+func joinClauses(clauses []string, sep string) string {
+	out := ""
+	for i, cl := range clauses {
+		if i > 0 {
+			out += sep
+		}
+		out += cl
 	}
+	return out
 }
 
-// executeLogsQuery executes an SLS logs query.
-func (c *AliyunSLSClient) executeLogsQuery(ctx context.Context, slsReq *slsLogsQueryRequest) (*core.LogQueryResponse, error) {
-	path := fmt.Sprintf("/projects/%s/logstores/%s?type=log", slsReq.Project, slsReq.LogStore)
-
-	body, err := json.Marshal(slsReq)
+// executeLogsQuery executes a log query using the official SDK.
+func (c *AliyunSLSClient) executeLogsQuery(req *core.LogQueryRequest) (*core.LogQueryResponse, error) {
+	// Use GetLogs from SDK
+	// topic is empty (legacy, now use __topic__ in query)
+	resp, err := c.slsClient.GetLogs(
+		c.config.Project,
+		c.config.LogStore,
+		"", // topic - use __topic__ in query instead
+		req.StartTime.Unix(),
+		req.EndTime.Unix(),
+		c.buildQuery(req),
+		int64(req.Limit),
+		int64(req.Offset),
+		req.Sort == "desc", // reverse
+	)
 	if err != nil {
-		return nil, core.NewInternalError(string(c.Type()), "execute_logs_query", err)
-	}
-
-	req, err := c.buildRequest(ctx, "POST", path, strings.NewReader(string(body)))
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_logs_query", err)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_logs_query", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, core.NewInternalError(string(c.Type()), "execute_logs_query", fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(body)))
-	}
-
-	// Parse response
-	var slsResp slsLogsQueryResponse
-	if err := json.NewDecoder(resp.Body).Decode(&slsResp); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "execute_logs_query", "failed to parse response", err)
+		return nil, core.NewInternalError(string(c.Type()), "execute_logs_query", fmt.Errorf("query failed: %w", err))
 	}
 
 	// Convert to our format
-	return c.convertSLSResponse(&slsResp)
+	return c.convertSDKLogsResponse(resp)
 }
 
-// slsLogsQueryResponse represents an SLS logs query response.
-type slsLogsQueryResponse struct {
-	TotalCount   int64            `json:"totalCount"`
-	HasMore      bool             `json:"hasMore"`
-	Logs         []json.RawMessage `json:"logs"`
-	Count        int              `json:"count"`
-	ProcessTime  float64          `json:"processTime"`
-}
-
-// convertSLSResponse converts SLS response to our format.
-func (c *AliyunSLSClient) convertSLSResponse(slsResp *slsLogsQueryResponse) (*core.LogQueryResponse, error) {
+// convertSDKLogsResponse converts SDK response to our format.
+func (c *AliyunSLSClient) convertSDKLogsResponse(resp *sls.GetLogsResponse) (*core.LogQueryResponse, error) {
 	response := &core.LogQueryResponse{
-		Logs:       make([]core.LogEntry, 0, len(slsResp.Logs)),
-		TotalCount: slsResp.TotalCount,
-		HasMore:    slsResp.HasMore,
+		Logs:       make([]core.LogEntry, 0),
+		TotalCount: resp.Count,
+		HasMore:    resp.Progress != "Complete",
 	}
 
-	for _, rawLog := range slsResp.Logs {
-		var logMap map[string]interface{}
-		if err := json.Unmarshal(rawLog, &logMap); err != nil {
-			continue
+	// SDK returns logs as []map[string]string
+	for _, logMap := range resp.Logs {
+		// Parse timestamp if present
+		var timestamp time.Time
+		if timeStr, ok := logMap["time"]; ok {
+			if sec, err := strconv.ParseInt(timeStr, 10, 64); err == nil {
+				timestamp = time.Unix(sec, 0)
+			}
 		}
 
-		entry, err := c.ParseLogEntry(logMap)
+		// Convert map[string]string to map[string]interface{}
+		logData := make(map[string]interface{})
+		for k, v := range logMap {
+			logData[k] = v
+		}
+
+		entry, err := c.ParseLogEntry(logData)
 		if err != nil {
 			continue
 		}
+
+		// Override timestamp if extracted
+		if !timestamp.IsZero() {
+			entry.Timestamp = timestamp
+		}
+
+		// Resolve the service identifier from the configured field when the
+		// parser could not fill it from a "source" key, so the entry reaches
+		// RCA attributed to a service rather than an empty bucket.
+		backfillSource(entry, c.serviceField())
 
 		response.Logs = append(response.Logs, *entry)
 	}
@@ -315,68 +275,34 @@ func (c *AliyunSLSClient) convertSLSResponse(slsResp *slsLogsQueryResponse) (*co
 	return response, nil
 }
 
-// slsHistogramRequest represents an SLS histogram request.
-type slsHistogramRequest struct {
-	Project  string `json:"project"`
-	LogStore string `json:"logstore"`
-	From     int64  `json:"from"`
-	To       int64  `json:"to"`
-	Query    string `json:"query"`
-	Interval string `json:"interval,omitempty"`
-}
-
-// buildHistogramRequest builds an SLS histogram request.
-func (c *AliyunSLSClient) buildHistogramRequest(req *core.LogQueryRequest) *slsHistogramRequest {
-	return &slsHistogramRequest{
-		Project:  c.config.Project,
-		LogStore: c.config.LogStore,
-		From:     req.StartTime.Unix(),
-		To:       req.EndTime.Unix(),
-		Query:    req.Query,
-	}
-}
-
-// executeHistogramQuery executes an SLS histogram query.
-func (c *AliyunSLSClient) executeHistogramQuery(ctx context.Context, slsReq *slsHistogramRequest) (int64, error) {
-	path := fmt.Sprintf("/projects/%s/logstores/%s?type=histogram", slsReq.Project, slsReq.LogStore)
-
-	body, err := json.Marshal(slsReq)
+// executeHistogramQuery executes a histogram query using the official SDK.
+func (c *AliyunSLSClient) executeHistogramQuery(req *core.LogQueryRequest) (int64, error) {
+	// Use GetHistograms from SDK
+	// topic is empty (legacy, now use __topic__ in query)
+	resp, err := c.slsClient.GetHistograms(
+		c.config.Project,
+		c.config.LogStore,
+		"", // topic - use __topic__ in query instead
+		req.StartTime.Unix(),
+		req.EndTime.Unix(),
+		c.buildQuery(req),
+	)
 	if err != nil {
-		return 0, core.NewInternalError(string(c.Type()), "execute_histogram_query", err)
+		return 0, core.NewInternalError(string(c.Type()), "execute_histogram_query", fmt.Errorf("histogram query failed: %w", err))
 	}
 
-	req, err := c.buildRequest(ctx, "POST", path, strings.NewReader(string(body)))
-	if err != nil {
-		return 0, core.NewNetworkError(string(c.Type()), "execute_histogram_query", err)
+	// Get total count from histogram response
+	totalCount := int64(0)
+	for _, histogram := range resp.Histograms {
+		totalCount += histogram.Count
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, core.NewNetworkError(string(c.Type()), "execute_histogram_query", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return 0, core.NewInternalError(string(c.Type()), "execute_histogram_query", fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(body)))
+	// If count is provided directly, use it
+	if resp.Count > 0 && resp.Progress == "Complete" {
+		totalCount = resp.Count
 	}
 
-	// Parse response
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, core.NewParsingError(string(c.Type()), "execute_histogram_query", "failed to parse response", err)
-	}
-
-	// Extract total count from histogram
-	if count, ok := result["total_count"].(float64); ok {
-		return int64(count), nil
-	}
-
-	if count, ok := result["count"].(float64); ok {
-		return int64(count), nil
-	}
-
-	return 0, fmt.Errorf("failed to extract count from histogram response")
+	return totalCount, nil
 }
 
 // GetLogStores returns a list of log stores for the configured project.
@@ -384,31 +310,17 @@ func (c *AliyunSLSClient) GetLogStores(ctx context.Context) ([]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	req, err := c.buildRequest(ctx, "GET", fmt.Sprintf("/projects/%s/logstores", c.config.Project), nil)
+	if !c.connected {
+		return nil, core.NewInternalError(string(c.Type()), "get_logstores", fmt.Errorf("not connected"))
+	}
+
+	// Use ListLogStoreV2 (note: singular name in SDK)
+	logStores, err := c.slsClient.ListLogStoreV2(c.config.Project, 0, 100, "")
 	if err != nil {
-		return nil, err
+		return nil, core.NewInternalError(string(c.Type()), "get_logstores", err)
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "get_logstores", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, core.NewInternalError(string(c.Type()), "get_logstores", fmt.Errorf("failed with status %d", resp.StatusCode))
-	}
-
-	var result struct {
-		LogStores []string `json:"logstores"`
-		Count     int      `json:"count"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "get_logstores", "failed to parse response", err)
-	}
-
-	return result.LogStores, nil
+	return logStores, nil
 }
 
 // GetIndexFields returns the index fields for a log store.
@@ -416,39 +328,30 @@ func (c *AliyunSLSClient) GetIndexFields(ctx context.Context, logStore string) (
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	path := fmt.Sprintf("/projects/%s/logstores/%s/index", c.config.Project, logStore)
-	req, err := c.buildRequest(ctx, "GET", path, nil)
+	if !c.connected {
+		return nil, core.NewInternalError(string(c.Type()), "get_index_fields", fmt.Errorf("not connected"))
+	}
+
+	index, err := c.slsClient.GetIndex(c.config.Project, logStore)
 	if err != nil {
-		return nil, err
+		return nil, core.NewInternalError(string(c.Type()), "get_index_fields", err)
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "get_index_fields", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, core.NewInternalError(string(c.Type()), "get_index_fields", fmt.Errorf("failed with status %d", resp.StatusCode))
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "get_index_fields", "failed to parse response", err)
+	// Convert index to map format
+	result := make(map[string]interface{})
+	if index.Keys != nil {
+		for key, value := range index.Keys {
+			result[key] = map[string]interface{}{
+				"type":          value.Type,
+				"alias":         value.Alias,
+				"doc_value":     value.DocValue,
+				"case_sensitive": value.CaseSensitive,
+				"token":         value.Token,
+			}
+		}
 	}
 
 	return result, nil
-}
-
-// buildURL builds a URL with query parameters.
-func (c *AliyunSLSClient) buildURL(basePath string, params map[string]string) string {
-	u, _ := url.Parse(basePath)
-	q := u.Query()
-	for k, v := range params {
-		q.Set(k, v)
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
 }
 
 // Close closes the SLS client.
@@ -458,7 +361,6 @@ func (c *AliyunSLSClient) Close() error {
 
 	c.connected = false
 	c.healthStatus = core.StatusUnknown
-	c.client.CloseIdleConnections()
 
 	return nil
 }

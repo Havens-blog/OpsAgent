@@ -72,8 +72,12 @@ func (s *APIServer) chatHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Snapshot the chat service under lock — the config endpoints can rebuild
+	// it concurrently when the user saves a new model configuration.
+	chatSvc := s.getChatService()
+
 	// Check if chat service is available
-	if s.chatService == nil || !s.chatService.IsAvailable() {
+	if chatSvc == nil || !chatSvc.IsAvailable() {
 		s.writeErrorResponse(w, http.StatusServiceUnavailable, "service_unavailable",
 			"Chat service not available. Please configure LLM_API_KEY in config/settings.yaml or environment variables.", "")
 		return
@@ -81,7 +85,7 @@ func (s *APIServer) chatHandler(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("Chat request received",
 		observability.Int("message_count", len(req.Messages)),
-		observability.String("model", s.chatService.GetModel()),
+		observability.String("model", chatSvc.GetModel()),
 	)
 
 	// Convert to chat service format
@@ -97,7 +101,7 @@ func (s *APIServer) chatHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	reply, err := s.chatService.Chat(ctx, messages)
+	reply, err := chatSvc.Chat(ctx, messages)
 	if err != nil {
 		s.logger.Error("Chat service call failed",
 			observability.Err(err),
@@ -111,7 +115,7 @@ func (s *APIServer) chatHandler(w http.ResponseWriter, r *http.Request) {
 		Reply:     reply,
 		Agent:     "Coordinator", // MVP: single agent
 		Timestamp: time.Now().Format(time.RFC3339),
-		Model:     s.chatService.GetModel(),
+		Model:     chatSvc.GetModel(),
 		// Thinking and Tools are empty for MVP (no tool-calling yet)
 	}
 

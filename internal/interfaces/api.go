@@ -3,12 +3,16 @@ package interfaces
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Havens-blog/OpsAgent/internal/agent"
 	"github.com/Havens-blog/OpsAgent/internal/change"
 	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/config"
@@ -17,30 +21,77 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
-	"github.com/Havens-blog/OpsAgent/internal/topology"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // APIServer represents the REST API server.
 type APIServer struct {
-	settings   *config.Settings
-	router     *http.ServeMux
-	server     *http.Server
-	logger     *observability.Logger
-	agentMap   map[string]interface{} // Registered agents
+	settings    *config.Settings
+	router      *http.ServeMux
+	server      *http.Server
+	logger      *observability.Logger
+	agents      map[string]executableAgent // Registered executable agents
 	corsOrigins []string
+
+	// apiAuthToken, when non-empty, is the shared bearer token every
+	// /api/v1/* request must present (health is exempt). Empty disables
+	// enforcement (progressive-enhancement: secure when configured, open
+	// out-of-the-box) and emits a startup warning so the gap is never silent.
+	apiAuthToken string
+
+	// EIAM session integration. When eiamSessionKey is non-empty, /api/v1/*
+	// requests are authenticated by verifying the EIAM-issued HS256 session
+	// JWT (see eiam_auth.go). Empty disables EIAM enforcement and the server
+	// falls back to the apiAuthToken bearer check. eiamCookieName is the
+	// browser cookie carrying the token when no Authorization header is sent.
+	eiamSessionKey string
+	eiamCookieName string
 
 	// Engine integrations — wired so the console returns real data instead
 	// of placeholders. Each is nil-safe: handlers fall back to empty results
 	// when an integration is not configured.
-	topologyClient *topology.ARMSClient
+	// topologySource is the single, shared service-topology source (real ARMS
+	// APM when configured, mock otherwise). The /api/v1/topology handler reads
+	// THIS, not a separate client, so the console shows the same topology the
+	// RCA engine reasons over. Previously a separate mock topology.ARMSClient
+	// served this endpoint, so real topology never reached the console.
+	topologySource sources.TopologySource
 	changeStore    change.ChangeStore
 
 	// RCA engine and report store
-	rcaEngine    *engine.Engine
-	rcaStore     rca.RCAReportStore
+	rcaEngine *engine.Engine
+	rcaStore  rca.RCAReportStore
 
-	// Chat service for conversational assistant (nil-safe)
+	// Chat service for conversational assistant (nil-safe).
+	// Guarded by chatMu because the config endpoints can rebuild it at runtime
+	// while chat requests read it concurrently.
+	chatMu      sync.RWMutex
 	chatService *chat.Service
+
+	// agentMeta holds display metadata for registered agents (keyed by id).
+	agentMeta map[string]*agentEntry
+
+	// dataSourceStatus records which RCA dimensions use a real integration
+	// (true) versus a mock fallback (false). Populated by initAgents.
+	dataSourceStatus map[string]bool
+
+	// auditLog is the bounded in-memory ring of recent config-change records,
+	// read back by the security settings page. See audit_hook.go.
+	auditLog *recentAuditLog
+}
+
+// getChatService returns the current chat service under a read lock.
+func (s *APIServer) getChatService() *chat.Service {
+	s.chatMu.RLock()
+	defer s.chatMu.RUnlock()
+	return s.chatService
+}
+
+// setChatService replaces the chat service under a write lock.
+func (s *APIServer) setChatService(svc *chat.Service) {
+	s.chatMu.Lock()
+	defer s.chatMu.Unlock()
+	s.chatService = svc
 }
 
 // NewAPIServer creates a new API server.
@@ -54,23 +105,44 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		return nil, fmt.Errorf("failed to create logger: %w", err)
 	}
 
-	// Initialize RCA engine with mock sources
+	// Build RCA data sources ONCE with progressive enhancement (real where
+	// credentials exist in env, mock otherwise), then share the exact same
+	// source set between the HTTP RCA engine (/api/v1/rca/analyze) and the
+	// MonitorAgent. Previously these were two independent engines and the HTTP
+	// one was hard-wired to mock, so real data never reached /api/v1/rca.
+	dsCfg := agent.NewDataSourceConfigFromEnv()
+	rcaSources, dsActive := agent.CreateRCASourcesWithFallback(dsCfg)
+
+	// The fallback factory always supplies a trace source (empty when no real
+	// tracing integration is configured), so this is just a defensive nil guard
+	// — and the guard uses the honest empty source, never a fabricating mock.
+	traceSource := rcaSources.TraceSource
+	if traceSource == nil {
+		traceSource = sources.NewEmptyTraceSource()
+	}
+
 	rcaEngine, err := engine.NewEngine(
-		engine.WithLogSource(sources.NewMockLogSource()),
-		engine.WithMetricSource(sources.NewMockMetricSource()),
-		engine.WithTraceSource(sources.NewMockTraceSource()),
-		engine.WithTopologySource(sources.NewMockTopologySource()),
-		engine.WithChangeSource(sources.NewMockChangeSource()),
+		engine.WithLogSource(rcaSources.LogSource),
+		engine.WithMetricSource(rcaSources.MetricSource),
+		engine.WithTraceSource(traceSource),
+		engine.WithTopologySource(rcaSources.TopologySource),
+		engine.WithChangeSource(rcaSources.ChangeSource),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create RCA engine: %w", err)
 	}
+	logger.Info("RCA data sources configured",
+		observability.Bool("metrics_real", dsActive["metrics"]),
+		observability.Bool("topology_real", dsActive["topology"]),
+		observability.Bool("changes_real", dsActive["changes"]),
+		observability.Bool("logs_real", dsActive["logs"]),
+	)
 
 	// Initialize RCA report store
+	// Start with an empty report store. Reports appear here only from real
+	// analyses run via POST /api/v1/rca/analyze, so the console never shows
+	// seeded/demo data masquerading as real results.
 	rcaStore := rca.NewMemoryRCAReportStore()
-
-	// Seed demo RCA reports
-	rca.SeedDemoReports(rcaStore)
 
 	// Initialize chat service (nil-safe - if LLM not configured, chat endpoints return 503)
 	llmConfig := settings.ToLLMConfig()
@@ -88,23 +160,51 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		)
 	}
 
+	// Bearer token for /api/v1/* access. Read from env (single source of
+	// truth shared with the frontend proxy). Empty => enforcement disabled.
+	apiAuthToken := strings.TrimSpace(os.Getenv("API_AUTH_TOKEN"))
+
+	// EIAM session integration. When the shared session key is configured,
+	// /api/v1/* is authenticated by verifying EIAM-issued session JWTs; this
+	// takes precedence over the static apiAuthToken (which stays as the
+	// service-to-service / no-EIAM fallback).
+	eiamSessionKey := strings.TrimSpace(settings.EIAM.SessionKey)
+
+	switch {
+	case eiamSessionKey != "":
+		logger.Info("EIAM session authentication enabled on /api/v1/* (verifying EIAM-issued HS256 session JWTs)")
+	case apiAuthToken != "":
+		logger.Info("API authentication enabled (static bearer token required on /api/v1/*)")
+	default:
+		logger.Warn("API authentication DISABLED",
+			observability.String("hint", "set OPSAGENT_SESSION_ENCRYPTED_KEY (EIAM) or API_AUTH_TOKEN to protect /api/v1/*"),
+		)
+	}
+
 	server := &APIServer{
-		settings:   settings,
-		router:     http.NewServeMux(),
-		logger:     logger,
-		agentMap:   make(map[string]interface{}),
-		corsOrigins: []string{"http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8080"},
+		settings:       settings,
+		router:         http.NewServeMux(),
+		logger:         logger,
+		apiAuthToken:   apiAuthToken,
+		eiamSessionKey: eiamSessionKey,
+		eiamCookieName: settings.EIAM.CookieName,
+		corsOrigins:    []string{"http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8080"},
 
 		// Default integrations. In production these would be constructed
 		// from settings (credentials, endpoints); the defaults use the
 		// in-memory / mock-backed implementations so the API is functional
 		// out of the box.
-		topologyClient: topology.NewARMSClient(),
+		topologySource: rcaSources.TopologySource,
 		changeStore:    change.NewMemoryStore(),
 		rcaEngine:      rcaEngine,
 		rcaStore:       rcaStore,
 		chatService:    chatService,
+		auditLog:       newRecentAuditLog(100),
 	}
+
+	// Construct and register the coordinator + specialist agents (nil-safe:
+	// a failed construction simply omits that agent).
+	server.initAgents()
 
 	// Seed demonstrative change data so /api/v1/changes returns something
 	// meaningful before real collectors are registered.
@@ -158,27 +258,44 @@ func (s *APIServer) setupRoutes() {
 	s.router.HandleFunc("/health", s.corsMiddleware(s.healthHandler))
 	s.router.HandleFunc("/api/v1/health", s.corsMiddleware(s.healthHandler))
 
-	// API v1 routes
-	s.router.HandleFunc("/api/v1/rca/analyze", s.corsMiddleware(s.rcaAnalyzeHandler))
-	s.router.HandleFunc("/api/v1/rca", s.corsMiddleware(s.listRCAHandler))                    // GET /api/v1/rca - list all RCA reports
-	s.router.HandleFunc("/api/v1/rca/", s.corsMiddleware(s.getRCAHandler))                     // GET /api/v1/rca/{id} - get specific RCA report
-	s.router.HandleFunc("/api/v1/logs/query", s.corsMiddleware(s.logQueryHandler))
-	s.router.HandleFunc("/api/v1/metrics/query", s.corsMiddleware(s.metricsQueryHandler))
-	s.router.HandleFunc("/api/v1/traces/query", s.corsMiddleware(s.tracesQueryHandler))
-	s.router.HandleFunc("/api/v1/topology", s.corsMiddleware(s.topologyHandler))
+	// WatchAlert webhook — machine-to-machine alert ingestion from the
+	// platform's alert module. Not bearer-protected (watch-alert is not a
+	// user); nginx/shared-secret can gate it in production.
+	s.router.HandleFunc("/webhooks/watchalert", s.corsMiddleware(s.watchAlertWebhookHandler))
+
+	// API v1 routes (all bearer-protected via s.protected when a token is set)
+	s.router.HandleFunc("/api/v1/rca/analyze", s.protected(s.rcaAnalyzeHandler))
+	s.router.HandleFunc("/api/v1/rca", s.protected(s.listRCAHandler)) // GET /api/v1/rca - list all RCA reports
+	s.router.HandleFunc("/api/v1/rca/", s.protected(s.getRCAHandler)) // GET /api/v1/rca/{id} - get specific RCA report
+	s.router.HandleFunc("/api/v1/incidents", s.protected(s.incidentsListHandler))
+	s.router.HandleFunc("/api/v1/incidents/", s.protected(s.incidentDetailHandler))
+	s.router.HandleFunc("/api/v1/logs/query", s.protected(s.logQueryHandler))
+	s.router.HandleFunc("/api/v1/metrics/query", s.protected(s.metricsQueryHandler))
+	s.router.HandleFunc("/api/v1/traces/query", s.protected(s.tracesQueryHandler))
+	s.router.HandleFunc("/api/v1/topology", s.protected(s.topologyHandler))
 
 	// Conversational assistant
-	s.router.HandleFunc("/api/v1/chat", s.corsMiddleware(s.chatHandler))
+	s.router.HandleFunc("/api/v1/chat", s.protected(s.chatHandler))
+
+	// LLM provider catalog and configuration
+	s.router.HandleFunc("/api/v1/providers", s.protected(s.providersHandler))
+	s.router.HandleFunc("/api/v1/config/llm", s.protected(s.llmConfigHandler))
+	s.router.HandleFunc("/api/v1/config/llm/test", s.protected(s.testLLMHandler))
+	s.router.HandleFunc("/api/v1/config/llm/models", s.protected(s.llmModelsHandler))
+	s.router.HandleFunc("/api/v1/config/datasources", s.protected(s.dataSourcesHandler))
+	s.router.HandleFunc("/api/v1/config/notifications", s.protected(s.notificationConfigHandler))
+	s.router.HandleFunc("/api/v1/config/notifications/test", s.protected(s.testNotificationHandler))
+	s.router.HandleFunc("/api/v1/config/security", s.protected(s.securityConfigHandler))
 
 	// Agent management
-	s.router.HandleFunc("/api/v1/agents", s.corsMiddleware(s.listAgentsHandler))
-	s.router.HandleFunc("/api/v1/agents/", s.corsMiddleware(s.agentHandler))
+	s.router.HandleFunc("/api/v1/agents", s.protected(s.listAgentsHandler))
+	s.router.HandleFunc("/api/v1/agents/", s.protected(s.agentHandler))
 
 	// Inspection endpoints
-	s.router.HandleFunc("/api/v1/inspection/run", s.corsMiddleware(s.inspectionHandler))
+	s.router.HandleFunc("/api/v1/inspection/run", s.protected(s.inspectionHandler))
 
 	// Change tracking (CI/CD deployments, config changes)
-	s.router.HandleFunc("/api/v1/changes", s.corsMiddleware(s.changesHandler))
+	s.router.HandleFunc("/api/v1/changes", s.protected(s.changesHandler))
 
 	// Catch-all for /api/ routes - return JSON 404
 	s.router.HandleFunc("/api/", s.apiNotFoundHandler)
@@ -189,10 +306,20 @@ func (s *APIServer) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.settings.Server.Host, s.settings.Server.Port)
 
 	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      s.router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:    addr,
+		Handler: s.router,
+		// ReadHeaderTimeout caps slow-header (slowloris) attacks cheaply.
+		ReadHeaderTimeout: 15 * time.Second,
+		// ReadTimeout covers reading the (small JSON) request body.
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout MUST exceed the longest handler budget. LLM-backed
+		// endpoints (agent orchestration, chat, RCA) legitimately run for
+		// minutes — agentHandler alone budgets a 5-minute context — and the
+		// coordinator now adds an LLM routing call before the specialist's
+		// own LLM call. A 30s WriteTimeout cut those responses mid-flight;
+		// 6 minutes leaves headroom above the 5-minute handler deadline while
+		// still bounding a stuck connection.
+		WriteTimeout: 6 * time.Minute,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -231,7 +358,7 @@ func (s *APIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // responseWriter wraps http.ResponseWriter to capture status codes.
 type responseWriter struct {
 	http.ResponseWriter
-	status int
+	status  int
 	written bool
 }
 
@@ -270,6 +397,48 @@ func (s *APIServer) corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		next(w, r)
 	}
+}
+
+// authMiddleware enforces a shared bearer token on protected endpoints.
+// When s.apiAuthToken is empty, enforcement is disabled and requests pass
+// through unchanged (the startup warning already surfaced the gap). OPTIONS
+// preflight is always allowed so CORS keeps working. The token comparison is
+// constant-time to avoid leaking it via response timing.
+func (s *APIServer) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.apiAuthToken == "" || r.Method == http.MethodOptions {
+			next(w, r)
+			return
+		}
+
+		const prefix = "Bearer "
+		h := r.Header.Get("Authorization")
+		if !strings.HasPrefix(h, prefix) {
+			s.writeErrorResponse(w, http.StatusUnauthorized, "unauthorized", "Missing or malformed Authorization header", "")
+			return
+		}
+		got := strings.TrimSpace(h[len(prefix):])
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.apiAuthToken)) != 1 {
+			s.writeErrorResponse(w, http.StatusUnauthorized, "unauthorized", "Invalid API token", "")
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// protected composes CORS + auth for a handler. Use for every /api/v1/*
+// endpoint except health, which must stay reachable for liveness probes.
+//
+// Auth precedence: when the EIAM shared session key is configured, requests
+// are authenticated by verifying the EIAM-issued session JWT (and the tenant
+// is injected into the context). Otherwise it falls back to the static bearer
+// token check. Exactly one of the two runs, chosen once at wiring time.
+func (s *APIServer) protected(h http.HandlerFunc) http.HandlerFunc {
+	if s.eiamSessionKey != "" {
+		return s.corsMiddleware(s.eiamAuthMiddleware(h))
+	}
+	return s.corsMiddleware(s.authMiddleware(h))
 }
 
 // isAllowedOrigin checks if the origin is allowed.
@@ -316,7 +485,7 @@ func (s *APIServer) healthHandler(w http.ResponseWriter, r *http.Request) {
 		"timestamp": time.Now().Format(time.RFC3339),
 		"version":   "1.0.0",
 		"data": map[string]interface{}{
-			"agents_registered": len(s.agentMap),
+			"agents_registered": len(s.agents),
 		},
 	}
 
@@ -351,15 +520,15 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Create incident
 	incident := &models.Incident{
-		ID:              req.IncidentID,
-		StartTime:       startTime,
-		EndTime:         endTime,
-		Severity:        req.Severity,
+		ID:               req.IncidentID,
+		StartTime:        startTime,
+		EndTime:          endTime,
+		Severity:         req.Severity,
 		AffectedServices: req.AffectedServices,
-		Description:     req.Description,
-		Source:          "api",
-		Labels:          map[string]string{"status": "running"},
-		DetectedAt:      time.Now(),
+		Description:      req.Description,
+		Source:           "api",
+		Labels:           map[string]string{"status": "running"},
+		DetectedAt:       time.Now(),
 	}
 
 	// Validate incident
@@ -373,9 +542,15 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 		observability.String("severity", req.Severity),
 	)
 
+	// Capture the tenant from the request BEFORE spawning the goroutine: the
+	// request context is cancelled once this handler returns, so the analysis
+	// runs on a fresh background context. The tenant must survive that handoff
+	// or the report would be stored under the wrong (default) tenant.
+	tid := tenant.IDFrom(r.Context())
+
 	// Run RCA analysis in background
 	go func() {
-		ctx := context.Background()
+		ctx := tenant.WithID(context.Background(), tid)
 		report, err := s.rcaEngine.Analyze(ctx, incident)
 		if err != nil {
 			s.logger.Error("RCA analysis failed",
@@ -397,9 +572,15 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Flip status running -> completed so the console reflects the
+		// finished analysis. Without this the report is stored but the
+		// incident label stays "running" forever.
+		_ = s.rcaStore.UpdateStatus(ctx, req.IncidentID, "completed")
+
 		s.logger.Info("RCA analysis completed",
 			observability.String("incident_id", req.IncidentID),
 			observability.Float64("confidence", report.Confidence),
+			observability.Int("candidates", len(report.Candidates)),
 		)
 	}()
 
@@ -411,6 +592,67 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSONResponse(w, http.StatusAccepted, response)
+}
+
+// scoreBreakdownDTO is the flat, snake_case breakdown the console expects.
+type scoreBreakdownDTO struct {
+	TimeCorrelation float64 `json:"time_correlation"`
+	TopologyScore   float64 `json:"topology_score"`
+	ChangeProximity float64 `json:"change_proximity"`
+	MetricSeverity  float64 `json:"metric_severity"`
+	ErrorFrequency  float64 `json:"error_frequency"`
+	TraceEvidence   float64 `json:"trace_evidence"`
+}
+
+// hypothesisDTO flattens models.ScoredHypothesis (nested, Go-cased) into the
+// flat snake_case shape the frontend's ScoredHypothesis type consumes.
+// The domain model is intentionally left untouched; conversion lives at the
+// HTTP boundary so Go-side consumers (dingtalk, monitor) keep working.
+type hypothesisDTO struct {
+	Type        string            `json:"type"`
+	Service     string            `json:"service"`
+	Description string            `json:"description"`
+	Metric      string            `json:"metric,omitempty"`
+	ChangeID    string            `json:"change_id,omitempty"`
+	Evidence    []string          `json:"evidence"`
+	Confidence  float64           `json:"confidence"`
+	Score       float64           `json:"score"`
+	Breakdown   scoreBreakdownDTO `json:"breakdown"`
+}
+
+// toHypothesisDTO converts a scored hypothesis to its flat API representation.
+func toHypothesisDTO(sh models.ScoredHypothesis) hypothesisDTO {
+	evidence := sh.Hypothesis.Evidence
+	if evidence == nil {
+		evidence = []string{}
+	}
+	return hypothesisDTO{
+		Type:        string(sh.Hypothesis.Type),
+		Service:     sh.Hypothesis.Service,
+		Description: sh.Hypothesis.Description,
+		Metric:      sh.Hypothesis.Metric,
+		ChangeID:    sh.Hypothesis.ChangeID,
+		Evidence:    evidence,
+		Confidence:  sh.Confidence,
+		Score:       sh.Score,
+		Breakdown: scoreBreakdownDTO{
+			TimeCorrelation: sh.Breakdown.TimeCorrelation,
+			TopologyScore:   sh.Breakdown.TopologyScore,
+			ChangeProximity: sh.Breakdown.ChangeProximity,
+			MetricSeverity:  sh.Breakdown.MetricSeverity,
+			ErrorFrequency:  sh.Breakdown.ErrorFrequency,
+			TraceEvidence:   sh.Breakdown.TraceEvidence,
+		},
+	}
+}
+
+// toHypothesisDTOs converts a slice of scored hypotheses.
+func toHypothesisDTOs(list []models.ScoredHypothesis) []hypothesisDTO {
+	out := make([]hypothesisDTO, 0, len(list))
+	for _, sh := range list {
+		out = append(out, toHypothesisDTO(sh))
+	}
+	return out
 }
 
 // listRCAHandler handles listing all RCA reports.
@@ -427,20 +669,20 @@ func (s *APIServer) listRCAHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert to frontend format
+	// Convert to frontend format (flat, snake_case DTO).
 	type reportResponse struct {
-		IncidentID       string                       `json:"incident_id"`
-		Severity         string                       `json:"severity"`
-		Description      string                       `json:"description"`
-		StartTime        string                       `json:"start_time"`
-		EndTime          string                       `json:"end_time,omitempty"`
-		AffectedServices []string                     `json:"affected_services"`
-		Status           string                       `json:"status"`
-		Candidates       []models.ScoredHypothesis    `json:"candidates"`
-		TopCandidate     *models.ScoredHypothesis     `json:"top_candidate,omitempty"`
-		Confidence       float64                      `json:"confidence"`
-		DurationMS       int64                        `json:"duration_ms,omitempty"`
-		GeneratedAt      string                       `json:"generated_at,omitempty"`
+		IncidentID       string          `json:"incident_id"`
+		Severity         string          `json:"severity"`
+		Description      string          `json:"description"`
+		StartTime        string          `json:"start_time"`
+		EndTime          string          `json:"end_time,omitempty"`
+		AffectedServices []string        `json:"affected_services"`
+		Status           string          `json:"status"`
+		Candidates       []hypothesisDTO `json:"candidates"`
+		TopCandidate     *hypothesisDTO  `json:"top_candidate,omitempty"`
+		Confidence       float64         `json:"confidence"`
+		DurationMS       int64           `json:"duration_ms,omitempty"`
+		GeneratedAt      string          `json:"generated_at,omitempty"`
 	}
 
 	result := make([]reportResponse, 0, len(reports))
@@ -455,6 +697,12 @@ func (s *APIServer) listRCAHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		var top *hypothesisDTO
+		if report.TopCandidate != nil {
+			dto := toHypothesisDTO(*report.TopCandidate)
+			top = &dto
+		}
+
 		result = append(result, reportResponse{
 			IncidentID:       report.Incident.ID,
 			Severity:         report.Incident.Severity,
@@ -463,9 +711,9 @@ func (s *APIServer) listRCAHandler(w http.ResponseWriter, r *http.Request) {
 			EndTime:          formatTimePtr(report.Incident.EndTime),
 			AffectedServices: report.Incident.AffectedServices,
 			Status:           status,
-			Candidates:       report.Candidates,
-			TopCandidate:     report.TopCandidate,
-			Confidence:        report.Confidence,
+			Candidates:       toHypothesisDTOs(report.Candidates),
+			TopCandidate:     top,
+			Confidence:       report.Confidence,
 			DurationMS:       int64(report.Duration.Seconds() * 1000),
 			GeneratedAt:      formatTimePtr(report.GeneratedAt),
 		})
@@ -506,6 +754,12 @@ func (s *APIServer) getRCAHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var top *hypothesisDTO
+	if report.TopCandidate != nil {
+		dto := toHypothesisDTO(*report.TopCandidate)
+		top = &dto
+	}
+
 	result := map[string]interface{}{
 		"incident_id":       report.Incident.ID,
 		"severity":          report.Incident.Severity,
@@ -514,9 +768,9 @@ func (s *APIServer) getRCAHandler(w http.ResponseWriter, r *http.Request) {
 		"end_time":          formatTimePtr(report.Incident.EndTime),
 		"affected_services": report.Incident.AffectedServices,
 		"status":            status,
-		"candidates":        report.Candidates,
-		"top_candidate":     report.TopCandidate,
-		"confidence":         report.Confidence,
+		"candidates":        toHypothesisDTOs(report.Candidates),
+		"top_candidate":     top,
+		"confidence":        report.Confidence,
 		"duration_ms":       int64(report.Duration.Seconds() * 1000),
 		"generated_at":      formatTimePtr(report.GeneratedAt),
 	}
@@ -605,9 +859,34 @@ func (s *APIServer) tracesQueryHandler(w http.ResponseWriter, r *http.Request) {
 	s.writeJSONResponse(w, http.StatusAccepted, response)
 }
 
-// topologyHandler handles topology requests.
+// topologyNodeDTO / topologyEdgeDTO are the API-boundary shapes consumed by
+// the web console (web/frontend ServiceGraph). They are defined here, at the
+// boundary, so the shared rca/models.Topology stays free of transport tags.
+type topologyNodeDTO struct {
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Type       string  `json:"type"`
+	Health     string  `json:"health"`
+	ErrorRate  float64 `json:"error_rate"`
+	Latency    float64 `json:"latency"`
+	Throughput float64 `json:"throughput"`
+}
+
+type topologyEdgeDTO struct {
+	ID         string  `json:"id"`
+	FromNodeID string  `json:"from_node_id"`
+	ToNodeID   string  `json:"to_node_id"`
+	Type       string  `json:"type"`
+	ErrorRate  float64 `json:"error_rate"`
+	Latency    float64 `json:"latency"`
+	Throughput float64 `json:"throughput"`
+}
+
+// topologyHandler returns the service dependency graph from the SAME topology
+// source the RCA engine uses (real ARMS APM when configured, mock otherwise),
+// converted to the console's ServiceGraph shape.
 func (s *APIServer) topologyHandler(w http.ResponseWriter, r *http.Request) {
-	if s.topologyClient == nil {
+	if s.topologySource == nil {
 		s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 			"status":   "ok",
 			"topology": map[string]interface{}{"nodes": []interface{}{}, "edges": []interface{}{}},
@@ -615,21 +894,79 @@ func (s *APIServer) topologyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default to the last hour when no time range is supplied.
-	window := topology.TimeWindow{
-		StartTime: time.Now().Add(-1 * time.Hour),
-		EndTime:   time.Now(),
+	// Topology discovery and per-service RED metrics are independent, so run
+	// them concurrently instead of paying two sequential sets of round-trips.
+	// Health is DERIVED from the metrics below rather than fetched separately,
+	// which both removes two redundant queries and guarantees the health shown
+	// always agrees with the error_rate shown.
+	var (
+		topo    *models.Topology
+		topoErr error
+		metrics map[string]sources.ServiceMetrics
+		wg      sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		topo, topoErr = s.topologySource.GetTopology(r.Context())
+	}()
+	// Per-service RED metrics are an OPTIONAL capability: only sources that
+	// implement ServiceMetricsProvider (the real ARMS APM source) supply them.
+	// The mock source doesn't, so metrics stay zero there rather than faked.
+	if mp, ok := s.topologySource.(sources.ServiceMetricsProvider); ok {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			metrics, _ = mp.GetServiceMetrics(r.Context())
+		}()
+	}
+	wg.Wait()
+
+	if topoErr != nil {
+		s.writeErrorResponse(w, http.StatusBadGateway, "topology_error", "Failed to fetch service topology", topoErr.Error())
+		return
 	}
 
-	graph, err := s.topologyClient.GetServiceGraph(r.Context(), window)
-	if err != nil {
-		s.writeErrorResponse(w, http.StatusBadGateway, "topology_error", "Failed to fetch service topology", err.Error())
-		return
+	// deriveHealth turns RED metrics into a health label. A node with no live
+	// traffic (or an infra node, which has no metrics) is "unknown" rather than
+	// optimistically "healthy".
+	deriveHealth := func(m sources.ServiceMetrics, ok bool) string {
+		if !ok || m.Throughput <= 0 {
+			return "unknown"
+		}
+		if m.ErrorRate > 0 {
+			return "degraded"
+		}
+		return "healthy"
+	}
+
+	nodes := make([]topologyNodeDTO, 0, len(topo.Nodes))
+	for _, n := range topo.Nodes {
+		m, ok := metrics[n.Name]
+		nodes = append(nodes, topologyNodeDTO{
+			ID:         n.Name,
+			Name:       n.Name,
+			Type:       n.Type,
+			Health:     deriveHealth(m, ok),
+			ErrorRate:  m.ErrorRate,
+			Latency:    m.LatencyMs,
+			Throughput: m.Throughput,
+		})
+	}
+
+	edges := make([]topologyEdgeDTO, 0, len(topo.Edges))
+	for i, e := range topo.Edges {
+		edges = append(edges, topologyEdgeDTO{
+			ID:         fmt.Sprintf("e%d", i),
+			FromNodeID: e.From,
+			ToNodeID:   e.To,
+			Type:       e.Type,
+		})
 	}
 
 	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 		"status":   "ok",
-		"topology": graph,
+		"topology": map[string]interface{}{"nodes": nodes, "edges": edges},
 	})
 }
 
@@ -656,22 +993,28 @@ func (s *APIServer) changesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// listAgentsHandler handles agent listing requests.
+// listAgentsHandler handles agent listing requests. It returns both a plain
+// id list (for backward compatibility) and rich metadata for each agent.
 func (s *APIServer) listAgentsHandler(w http.ResponseWriter, r *http.Request) {
-	agents := make([]string, 0, len(s.agentMap))
-	for name := range s.agentMap {
-		agents = append(agents, name)
+	ids := make([]string, 0, len(s.agents))
+	details := make([]*agentEntry, 0, len(s.agents))
+	for id := range s.agents {
+		ids = append(ids, id)
+		if meta, ok := s.agentMeta[id]; ok {
+			details = append(details, meta)
+		}
 	}
 
 	response := map[string]interface{}{
-		"agents": agents,
-		"count":  len(agents),
+		"agents":  ids,
+		"count":   len(ids),
+		"details": details,
 	}
 
 	s.writeJSONResponse(w, http.StatusOK, response)
 }
 
-// agentHandler handles individual agent requests.
+// agentHandler handles individual agent requests (GET info, POST execute).
 func (s *APIServer) agentHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := strings.TrimPrefix(r.URL.Path, "/api/v1/agents/")
 
@@ -681,33 +1024,13 @@ func (s *APIServer) agentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch r.Method {
-	case "GET":
+	case http.MethodGet:
 		s.getAgentInfo(w, agentID)
-	case "POST":
-		s.executeAgentTask(w, agentID)
+	case http.MethodPost:
+		s.executeAgentTask(w, r, agentID)
 	default:
 		s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 	}
-}
-
-// getAgentInfo returns information about an agent.
-func (s *APIServer) getAgentInfo(w http.ResponseWriter, agentID string) {
-	response := map[string]interface{}{
-		"agent_id": agentID,
-		"status":   "not_found",
-	}
-
-	s.writeJSONResponse(w, http.StatusNotFound, response)
-}
-
-// executeAgentTask executes a task on an agent.
-func (s *APIServer) executeAgentTask(w http.ResponseWriter, agentID string) {
-	response := map[string]interface{}{
-		"agent_id": agentID,
-		"status":   "not_implemented",
-	}
-
-	s.writeJSONResponse(w, http.StatusNotImplemented, response)
 }
 
 // inspectionHandler handles inspection requests.
@@ -736,7 +1059,7 @@ func (s *APIServer) apiNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 
 // writeJSONResponse writes a JSON response.
 func (s *APIServer) writeJSONResponse(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 
 	if err := json.NewEncoder(w).Encode(data); err != nil {
@@ -781,17 +1104,17 @@ type LogQueryRequest struct {
 }
 
 type MetricsQueryRequest struct {
-	Query     string `json:"query"`
-	StartTime string `json:"start_time"`
-	EndTime   string `json:"end_time"`
-	Step      string `json:"step,omitempty"`
+	Query     string            `json:"query"`
+	StartTime string            `json:"start_time"`
+	EndTime   string            `json:"end_time"`
+	Step      string            `json:"step,omitempty"`
 	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 type InspectionRequest struct {
-	Type            string   `json:"type"`
-	Providers       []string `json:"providers,omitempty"`
-	Services        []string `json:"services,omitempty"`
-	ClusterURL      string   `json:"cluster_url,omitempty"`
-	ComplianceID    string   `json:"compliance_id,omitempty"`
+	Type         string   `json:"type"`
+	Providers    []string `json:"providers,omitempty"`
+	Services     []string `json:"services,omitempty"`
+	ClusterURL   string   `json:"cluster_url,omitempty"`
+	ComplianceID string   `json:"compliance_id,omitempty"`
 }

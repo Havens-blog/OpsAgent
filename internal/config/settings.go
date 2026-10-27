@@ -51,6 +51,19 @@ type Settings struct {
 	// DingTalk configuration
 	DingTalk DingTalkConfig `yaml:"dingtalk"`
 
+	// IM notification configuration (settings UI; supersedes dingtalk for the
+	// multi-platform alert notifier)
+	Notifications NotificationConfig `yaml:"notifications"`
+
+	// WatchAlert integration (platform alert module webhook)
+	WatchAlert WatchAlertConfig `yaml:"watchalert"`
+
+	// EIAM identity-platform integration
+	EIAM EIAMConfig `yaml:"eiam"`
+
+	// MCP clients configuration
+	MCP MCPConfig `yaml:"mcp"`
+
 	// Paths
 	paths ConfigPaths
 }
@@ -121,6 +134,12 @@ type SecurityConfig struct {
 	EnableAuditLog bool `yaml:"enable_audit_log" env:"OPSAGENT_ENABLE_AUDIT_LOG"`
 	// AuditLogPath is the path to the audit log file
 	AuditLogPath string `yaml:"audit_log_path" env:"OPSAGENT_AUDIT_LOG_PATH"`
+	// AuditRetentionDays is how many days of audit logs to retain.
+	AuditRetentionDays int `yaml:"audit_retention_days"`
+	// IPWhitelist restricts API access to the listed CIDR ranges (one per line).
+	IPWhitelist string `yaml:"ip_whitelist"`
+	// RateLimit is the max requests per second per user.
+	RateLimit int `yaml:"rate_limit"`
 	// VaultAddr is the Vault address
 	VaultAddr string `yaml:"vault_addr" env:"VAULT_ADDR"`
 	// VaultToken is the Vault token
@@ -129,12 +148,80 @@ type SecurityConfig struct {
 	VaultPath string `yaml:"vault_path" env:"OPSAGENT_VAULT_PATH"`
 }
 
+// NotificationConfig holds IM (DingTalk/WeCom/Feishu) alert notification
+// configuration. Persisted from the settings UI; the actual delivery path is
+// a progressive enhancement wired separately.
+type NotificationConfig struct {
+	// Platform is dingtalk | wecom | feishu
+	Platform string `yaml:"platform"`
+	// WebhookURL is the IM webhook endpoint
+	WebhookURL string `yaml:"webhook_url"`
+	// Secret is the signing secret (DingTalk/Feishu)
+	Secret string `yaml:"secret"`
+	// Severities filters which incident severities trigger a notification (P0-P4)
+	Severities []string `yaml:"severities"`
+	// StartTime is the daily notification window start (HH:mm)
+	StartTime string `yaml:"start_time"`
+	// EndTime is the daily notification window end (HH:mm)
+	EndTime string `yaml:"end_time"`
+}
+
+// WatchAlertConfig holds the platform alert-module (watch-alert) webhook
+// integration settings. Incoming alerts are stored under this platform tenant
+// so the console can see them; watch-alert's own multi-tenant ID is a
+// different namespace and is kept only as a label for traceability.
+type WatchAlertConfig struct {
+	// TenantID is the OpsAgent tenant bucket that incoming watch-alert
+	// incidents are stored under. Defaults to 1 (the platform/console tenant)
+	// when unset.
+	TenantID int64 `yaml:"tenant_id"`
+}
+
 // DingTalkConfig holds DingTalk notification configuration.
 type DingTalkConfig struct {
 	// WebhookURL is the DingTalk webhook URL
 	WebhookURL string `yaml:"webhook_url" env:"DINGTALK_WEBHOOK_URL"`
 	// Secret is the DingTalk webhook secret
 	Secret string `yaml:"secret" env:"DINGTALK_SECRET"`
+}
+
+// EIAMConfig holds integration with the self-hosted EIAM identity platform.
+//
+// OpsAgent does NOT run an OIDC authorization-code flow against EIAM. The
+// legacy ops Agent integrates by validating the session token EIAM issues:
+// that token is a standard HS256-signed JWT (golang-jwt/v5) whose payload
+// carries uid / tenant_id / username / is_admin. The read path is pure JWT
+// verification — it does not touch Redis. SessionKey MUST be byte-identical
+// to EIAM's session.encrypted_key or every token fails verification.
+//
+// When SessionKey is empty, EIAM enforcement is disabled (progressive
+// enhancement, consistent with the rest of the config).
+type EIAMConfig struct {
+	// SessionKey is the shared HS256 secret EIAM signs session JWTs with.
+	// Reuses the legacy ops Agent env name so the key is a single source of
+	// truth across services.
+	SessionKey string `yaml:"session_key" env:"OPSAGENT_SESSION_ENCRYPTED_KEY"`
+	// CookieName is the browser cookie EIAM stores the session token in
+	// (e.g. "ecmdb-token-key"); used as a fallback token carrier after the
+	// Authorization: Bearer header.
+	CookieName string `yaml:"cookie_name" env:"OPSAGENT_SESSION_COOKIE_NAME"`
+	// LoginURL is where the console redirects an unauthenticated browser to
+	// start EIAM login (e.g. "/console/login").
+	LoginURL string `yaml:"login_url" env:"OPSAGENT_EIAM_LOGIN_URL"`
+}
+
+// MCPConfig holds MCP client configuration.
+type MCPConfig struct {
+	// Clients is a map of MCP server name to client configuration
+	Clients map[string]MCPServerConfig `yaml:"clients"`
+}
+
+// MCPServerConfig holds configuration for a single MCP server.
+type MCPServerConfig struct {
+	// BaseURL is the base URL of the MCP server
+	BaseURL string `yaml:"base_url" env:"MCP_BASE_URL"`
+	// Timeout is the request timeout in seconds
+	Timeout int `yaml:"timeout" env:"MCP_TIMEOUT"`
 }
 
 // ConfigPaths holds configuration file paths.
@@ -152,7 +239,7 @@ type ConfigPaths struct {
 // Global settings instance
 var (
 	globalSettings *Settings
-	once          sync.Once
+	once           sync.Once
 )
 
 // Load loads the configuration from file and environment variables.
@@ -161,10 +248,10 @@ func Load(configDir string) (*Settings, error) {
 		globalSettings = &Settings{
 			Environment: EnvDevelopment,
 			paths: ConfigPaths{
-				ConfigDir:        configDir,
-				SettingsFile:     filepath.Join(configDir, "settings.yaml"),
-				AgentsFile:       filepath.Join(configDir, "agents.yaml"),
-				DataSourcesFile:  filepath.Join(configDir, "datasources.yaml"),
+				ConfigDir:       configDir,
+				SettingsFile:    filepath.Join(configDir, "settings.yaml"),
+				AgentsFile:      filepath.Join(configDir, "agents.yaml"),
+				DataSourcesFile: filepath.Join(configDir, "datasources.yaml"),
 			},
 		}
 	})
@@ -175,6 +262,12 @@ func Load(configDir string) (*Settings, error) {
 			return nil, fmt.Errorf("failed to load settings from file: %w", err)
 		}
 	}
+
+	// Load .env (if present) into the process environment BEFORE reading env
+	// vars, so .env is a reliable single source of truth no matter how the
+	// binary is launched. Existing env vars are not overwritten, so an explicit
+	// launcher export still wins. The file lives at the working-directory root.
+	loadDotEnv(".env")
 
 	// Load from environment variables
 	globalSettings.loadFromEnv()
@@ -292,6 +385,18 @@ func (s *Settings) loadFromEnv() {
 	if secret := os.Getenv("DINGTALK_SECRET"); secret != "" {
 		s.DingTalk.Secret = secret
 	}
+
+	// EIAM identity platform. SessionKey reuses the legacy ops Agent env name
+	// so the shared HS256 secret stays a single source of truth.
+	if key := os.Getenv("OPSAGENT_SESSION_ENCRYPTED_KEY"); key != "" {
+		s.EIAM.SessionKey = key
+	}
+	if name := os.Getenv("OPSAGENT_SESSION_COOKIE_NAME"); name != "" {
+		s.EIAM.CookieName = name
+	}
+	if loginURL := os.Getenv("OPSAGENT_EIAM_LOGIN_URL"); loginURL != "" {
+		s.EIAM.LoginURL = loginURL
+	}
 }
 
 // setDefaults sets default values for configuration.
@@ -354,6 +459,15 @@ func (s *Settings) setDefaults() {
 	}
 	if s.Observability.MetricsPort == 0 {
 		s.Observability.MetricsPort = 9090
+	}
+
+	// EIAM carrier defaults mirror the legacy ops Agent deployment so an
+	// operator only has to supply the shared SessionKey to go live.
+	if s.EIAM.CookieName == "" {
+		s.EIAM.CookieName = "ecmdb-token-key"
+	}
+	if s.EIAM.LoginURL == "" {
+		s.EIAM.LoginURL = "/console/login"
 	}
 }
 
@@ -442,4 +556,56 @@ func (s *Settings) ToLLMConfig() LLMConfig {
 	defer s.mu.RUnlock()
 
 	return s.LLM
+}
+
+// SetLLM atomically replaces the LLM configuration.
+func (s *Settings) SetLLM(cfg LLMConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LLM = cfg
+}
+
+// ToNotificationConfig returns the IM notification configuration.
+func (s *Settings) ToNotificationConfig() NotificationConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Notifications
+}
+
+// SetNotifications atomically replaces the notification configuration.
+func (s *Settings) SetNotifications(cfg NotificationConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Notifications = cfg
+}
+
+// ToSecurityConfig returns the security configuration.
+func (s *Settings) ToSecurityConfig() SecurityConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Security
+}
+
+// SetSecurity atomically replaces the security configuration.
+func (s *Settings) SetSecurity(cfg SecurityConfig) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Security = cfg
+}
+
+// SettingsFilePath returns the resolved path of the main settings file,
+// falling back to ./config/settings.yaml when paths were not initialized
+// (e.g. the settings were created via Get() rather than Load()).
+func (s *Settings) SettingsFilePath() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.paths.SettingsFile != "" {
+		return s.paths.SettingsFile
+	}
+	return filepath.Join("config", "settings.yaml")
+}
+
+// SaveConfig persists the current settings to the resolved settings file.
+func (s *Settings) SaveConfig() error {
+	return s.Save(s.SettingsFilePath())
 }

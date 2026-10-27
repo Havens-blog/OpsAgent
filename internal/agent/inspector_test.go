@@ -187,6 +187,7 @@ func TestInspectorAgentExecute(t *testing.T) {
 			t.Fatalf("Failed to create InspectorAgent: %v", err)
 		}
 		defer agent.Shutdown(context.Background())
+		useStubLLM(agent.BaseAgent) // default branch routes to LLM; keep it hermetic
 
 		task := &Task{
 			ID:          "generic-task",

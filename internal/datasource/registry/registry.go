@@ -239,6 +239,19 @@ func (r *Registry) SetupFromConfig(ctx context.Context, configs map[string]inter
 				return fmt.Errorf("failed to connect SLS %s: %w", name, err)
 			}
 
+		case core.DataSourceTypeTLS:
+			tlsConfig := r.parseTLSConfig(name, cfgMap)
+			client, err := log.NewVolcengineTLSClient(tlsConfig)
+			if err != nil {
+				return fmt.Errorf("failed to create TLS client %s: %w", name, err)
+			}
+			if err := r.Register(name, client, &tlsConfig.Config); err != nil {
+				return err
+			}
+			if err := client.Connect(ctx); err != nil {
+				return fmt.Errorf("failed to connect TLS %s: %w", name, err)
+			}
+
 		case core.DataSourceTypeARMS:
 			armsConfig := r.parseARMSConfig(name, cfgMap)
 			client, err := apm.NewAliyunARMSClient(armsConfig)
@@ -291,6 +304,62 @@ func (r *Registry) parseSLSConfig(name string, cfg map[string]interface{}) *core
 	}
 	if v, ok := cfg["logstore"].(string); ok {
 		config.LogStore = v
+	}
+	if v, ok := cfg["service_field"].(string); ok {
+		config.ServiceField = v
+	}
+	if v, ok := cfg["level_field"].(string); ok {
+		config.LevelField = v
+	}
+
+	// Credentials from provider
+	if r.credProvider != nil {
+		creds, err := r.credProvider.Get(context.Background(), name)
+		if err == nil && creds != nil {
+			config.AccessKeyID = creds.AccessKeyID
+			config.AccessKeySecret = creds.AccessKeySecret
+			config.SecurityToken = creds.SecurityToken
+		}
+	}
+
+	// Direct config overrides (for testing/dev)
+	if v, ok := cfg["access_key_id"].(string); ok {
+		config.AccessKeyID = v
+	}
+	if v, ok := cfg["access_key_secret"].(string); ok {
+		config.AccessKeySecret = v
+	}
+	if v, ok := cfg["security_token"].(string); ok {
+		config.SecurityToken = v
+	}
+
+	return config
+}
+
+// parseTLSConfig parses Volcengine TLS configuration from a map.
+func (r *Registry) parseTLSConfig(name string, cfg map[string]interface{}) *core.VolcengineTLSConfig {
+	config := &core.VolcengineTLSConfig{
+		Config: core.Config{
+			Name:    name,
+			Type:    core.DataSourceTypeTLS,
+			Enabled: true,
+		},
+	}
+
+	if v, ok := cfg["endpoint"].(string); ok {
+		config.Endpoint = v
+	}
+	if v, ok := cfg["region"].(string); ok {
+		config.Region = v
+	}
+	if v, ok := cfg["topic_id"].(string); ok {
+		config.TopicID = v
+	}
+	if v, ok := cfg["service_field"].(string); ok {
+		config.ServiceField = v
+	}
+	if v, ok := cfg["level_field"].(string); ok {
+		config.LevelField = v
 	}
 
 	// Credentials from provider

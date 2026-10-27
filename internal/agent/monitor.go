@@ -25,12 +25,12 @@ type MonitorAgent struct {
 // NewMonitorAgent creates a new MonitorAgent.
 func NewMonitorAgent(settings *config.Settings, rcaSources *RCASources) (*MonitorAgent, error) {
 	cfg := &AgentConfig{
-		Name:         "monitor-agent",
-		Type:         AgentTypeMonitor,
-		Description:  "Monitor and analyze APM data, perform Root Cause Analysis",
-		Model:        "claude-sonnet-4-20250514",
-		MaxTurns:     10,
-		Timeout:      5 * time.Minute,
+		Name:        "monitor-agent",
+		Type:        AgentTypeMonitor,
+		Description: "Monitor and analyze APM data, perform Root Cause Analysis",
+		Model:       "claude-sonnet-4-20250514",
+		MaxTurns:    10,
+		Timeout:     5 * time.Minute,
 		SystemPrompt: `You are a MonitorAgent specialized in observability and root cause analysis.
 
 Your capabilities include:
@@ -204,19 +204,19 @@ func (m *MonitorAgent) executeRCATask(ctx context.Context, task *Task) (*Executi
 	}
 
 	incident := &models.Incident{
-		ID:              getString(incidentData, "id"),
-		StartTime:       getTime(incidentData, "start_time"),
-		EndTime:         getTime(incidentData, "end_time"),
-		Severity:        getString(incidentData, "severity"),
-		Description:     getString(incidentData, "description"),
+		ID:               getString(incidentData, "id"),
+		StartTime:        getTime(incidentData, "start_time"),
+		EndTime:          getTime(incidentData, "end_time"),
+		Severity:         getString(incidentData, "severity"),
+		Description:      getString(incidentData, "description"),
 		AffectedServices: getStringSlice(incidentData, "affected_services"),
 	}
 
 	report, err := m.AnalyzeIncident(ctx, incident)
 	if err != nil {
 		return &ExecutionResult{
-			Success: false,
-			Error:   err,
+			Success:  false,
+			Error:    err,
 			Response: fmt.Sprintf("RCA analysis failed: %v", err),
 		}, nil
 	}
@@ -228,7 +228,7 @@ func (m *MonitorAgent) executeRCATask(ctx context.Context, task *Task) (*Executi
 		Success:  true,
 		Response: response,
 		Data: map[string]interface{}{
-			"incident_id":  report.Incident.ID,
+			"incident_id":   report.Incident.ID,
 			"confidence":    report.Confidence,
 			"top_candidate": report.TopCandidate,
 			"candidates":    report.Candidates,
@@ -281,14 +281,17 @@ func (m *MonitorAgent) formatRCAReport(report *models.RCAReport) string {
 
 // executeTask implements the default task execution.
 func (m *MonitorAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResult, error) {
-	return &ExecutionResult{
-		Success:  true,
-		Response: fmt.Sprintf("MonitorAgent processed task: %s\n\nUse type='rca' parameter to perform root cause analysis.", task.Description),
-		Data: map[string]interface{}{
-			"rca_available": m.rcaEngine != nil,
-			"capabilities":  m.GetConfig().Capabilities,
-		},
-	}, nil
+	// Delegate to the base agent's real LLM-backed execution (Go uses static
+	// dispatch, so forward explicitly rather than relying on virtual dispatch).
+	result, err := m.BaseAgent.executeTask(ctx, task)
+	if result != nil {
+		if result.Data == nil {
+			result.Data = map[string]interface{}{}
+		}
+		result.Data["rca_available"] = m.rcaEngine != nil
+		result.Data["capabilities"] = m.GetConfig().Capabilities
+	}
+	return result, err
 }
 
 // Helper functions for type extraction

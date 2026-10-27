@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,33 +18,148 @@ import (
 
 // PrometheusMetricSource implements MetricSource using Prometheus.
 type PrometheusMetricSource struct {
-	client       *http.Client
-	endpoint     string
-	queryAPI     string
+	client        *http.Client
+	endpoint      string
+	queryAPI      string
 	queryRangeAPI string
+	token         string // optional bearer token (e.g. ARMS Prometheus)
 }
 
 // NewPrometheusMetricSource creates a new Prometheus metric source.
 func NewPrometheusMetricSource(endpoint string) (*PrometheusMetricSource, error) {
+	return NewPrometheusMetricSourceWithToken(endpoint, "")
+}
+
+// NewPrometheusMetricSourceWithToken creates a Prometheus metric source that
+// authenticates with a bearer token. Managed services such as Alibaba Cloud
+// ARMS Prometheus require this token on every request.
+func NewPrometheusMetricSourceWithToken(endpoint, token string) (*PrometheusMetricSource, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("prometheus endpoint is required")
 	}
 
 	baseURL := fmt.Sprintf("%s/api/v1", endpoint)
 	return &PrometheusMetricSource{
-		client:       &http.Client{Timeout: 30 * time.Second},
-		endpoint:     endpoint,
-		queryAPI:     baseURL + "/query",
+		client:        &http.Client{Timeout: 30 * time.Second},
+		endpoint:      endpoint,
+		queryAPI:      baseURL + "/query",
 		queryRangeAPI: baseURL + "/query_range",
+		token:         token,
 	}, nil
 }
 
-// QueryAnomalies retrieves metrics with anomalies.
+// Ping verifies the Prometheus/ARMS endpoint is reachable and the token (if
+// any) is accepted, by issuing a trivial instant query. It returns nil only on
+// a real HTTP 200, so callers can treat a successful Ping as "this source is
+// genuinely usable" rather than merely "constructed". vector(1) always yields
+// a result on a healthy Prometheus-compatible backend, so an empty dataset is
+// not mistaken for failure.
+func (p *PrometheusMetricSource) Ping(ctx context.Context) error {
+	u, err := url.Parse(p.queryAPI)
+	if err != nil {
+		return err
+	}
+	q := u.Query()
+	q.Set("query", "vector(1)")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return err
+	}
+	p.setAuth(req)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("prometheus ping failed (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// setAuth attaches the bearer token to a request when one is configured.
+func (p *PrometheusMetricSource) setAuth(req *http.Request) {
+	if p.token != "" {
+		req.Header.Set("Authorization", "Bearer "+p.token)
+	}
+}
+
+// QueryAnomalies retrieves metrics that commonly signal anomalies.
+//
+// It issues two families of queries and returns whatever the backend has data
+// for, so it works against both self-hosted application Prometheus and managed
+// Alibaba Cloud ARMS/CloudMonitor:
+//
+//   - Application metrics (self-hosted Prometheus): http_requests_total etc.,
+//     which are counters, hence wrapped in rate().
+//   - CloudMonitor metrics (ARMS managed Prometheus): AliyunAlb_*/AliyunSlb_*
+//     error-code and latency series. These are already per-second gauges
+//     (measure unit "Count/s"), so they must NOT be wrapped in rate().
+//
+// Queries with no data simply return no series and are skipped.
 func (p *PrometheusMetricSource) QueryAnomalies(ctx context.Context, start, end time.Time) ([]models.MetricSeries, error) {
 	queries := []string{
+		// --- Self-hosted application Prometheus (counters -> rate) ---
 		`rate(http_requests_total{status=~"5.."}[5m])`,
 		`rate(http_requests_total{status=~"4.."}[5m])`,
 		`rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m])`,
+
+		// --- Alibaba Cloud CloudMonitor / ARMS (gauges -> raw) ---
+		// 5xx error rates at load-balancer and listener scope.
+		`AliyunAlb_LoadBalancerHTTPCode5XX`,
+		`AliyunAlb_ListenerHTTPCode5XX`,
+		`AliyunSlb_InstanceStatusCode5xx`,
+		// Upstream latency / response time.
+		`AliyunAlb_LoadBalancerUpstreamResponseTime`,
+		`AliyunAlb_ListenerUpstreamResponseTime`,
+		// Connection-level errors.
+		`AliyunAlb_LoadBalancerUpstreamConnectionError`,
+
+		// --- Resource saturation signals (topk of RAW gauges) ---
+		//
+		// Important: the RCA engine detects anomalies by TREND (window-over-
+		// window change), not by absolute threshold. So we must feed it
+		// CONTINUOUS series and let it decide — a threshold filter like
+		// `metric > 85` returns discontinuous points that break trend
+		// detection. This also matches RCA semantics: the engine should surface
+		// resources that RAMPED during the incident window (a trend), not those
+		// merely sitting flat-high (a standing condition, rarely the cause of a
+		// new incident).
+		//
+		// topk bounds each family to the N busiest resources so thousands of
+		// per-instance series (e.g. ECS CPU has ~680) cannot flood RCA.
+		`topk(10, AliyunEcs_CPUUtilization)`,
+		`topk(10, AliyunEcs_memory_usedutilization)`,
+		`topk(10, AliyunRds_CpuUsage)`,
+		`topk(10, AliyunRds_ConnectionUsage)`,
+		`topk(10, AliyunRds_MemoryUsage)`,
+		`topk(10, AliyunRds_IOPSUsage)`,
+		`topk(10, kafka_consumergroup_lag)`,
+
+		// --- Alibaba Cloud ARMS APM (per-service RED trends) ---
+		//
+		// ARMS APM stores expose only application RED counters (arms_app_*),
+		// none of the families above, so without these an APM-integrated
+		// workspace yields no metric anomalies at all. These are the three
+		// confirmed-populated raw counters (the same ones the topology source's
+		// RED view uses), aggregated by service and wrapped in rate() because
+		// they are counters.
+		//
+		// Two deliberate choices:
+		//   - topk(20, ...) bounds cardinality: a busy workspace has hundreds
+		//     of services, and feeding every one would flood RCA. We surface
+		//     the busiest/worst by each signal and let trend detection decide.
+		//   - label_replace injects __name__, because `sum by (service)` drops
+		//     the metric name; without it getMetricName would mislabel these
+		//     APM series as http_requests_total. Pure PromQL, no Go-side change.
+		`label_replace(topk(20, sum by (service) (rate(arms_app_requests_error_count_raw[5m]))), "__name__", "arms_app_errors_per_sec", "", "")`,
+		`label_replace(topk(20, 1000 * sum by (service) (rate(arms_app_requests_seconds_raw[5m])) / sum by (service) (rate(arms_app_requests_count_raw[5m]))), "__name__", "arms_app_latency_ms", "", "")`,
+		`label_replace(topk(20, sum by (service) (rate(arms_app_requests_count_raw[5m]))), "__name__", "arms_app_throughput_per_sec", "", "")`,
 	}
 
 	var allSeries []models.MetricSeries
@@ -99,6 +215,7 @@ func (p *PrometheusMetricSource) GetAlerts(ctx context.Context) ([]sources.Alert
 	if err != nil {
 		return nil, err
 	}
+	p.setAuth(req)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -161,6 +278,7 @@ func (p *PrometheusMetricSource) executeQuery(ctx context.Context, query string,
 	if err != nil {
 		return nil, err
 	}
+	p.setAuth(req)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -205,6 +323,14 @@ func (p *PrometheusMetricSource) executeQuery(ctx context.Context, query string,
 			}
 			fval, err := strconv.ParseFloat(val, 64)
 			if err != nil {
+				continue
+			}
+			// Drop non-finite values (+Inf/NaN). They arise from divide-by-
+			// near-zero in ratio queries (e.g. latency = time/count for a
+			// low-traffic service) and are JSON-unsafe: a single one makes
+			// json.Marshal fail and takes down the whole RCA response. The
+			// topology source's queryServiceValues guards the same way.
+			if math.IsInf(fval, 0) || math.IsNaN(fval) {
 				continue
 			}
 			dataPoints = append(dataPoints, models.DataPoint{

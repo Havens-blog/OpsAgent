@@ -3,16 +3,18 @@ package apm
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
-	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
+	dscredentials "github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
+
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/arms"
 )
 
 // AliyunARMSConfig represents the ARMS-specific configuration.
@@ -20,44 +22,72 @@ type AliyunARMSConfig struct {
 	*core.AliyunARMSConfig
 }
 
-// AliyunARMSClient is the client for Alibaba Cloud ARMS.
+// AliyunARMSClient is the client for Alibaba Cloud ARMS using the official SDK.
 type AliyunARMSClient struct {
 	*BaseAPMDataSource
-	config *AliyunARMSConfig
-	client *http.Client
-	mu     sync.RWMutex
+	config     *AliyunARMSConfig
+	armsClient *arms.Client
+	mu         sync.RWMutex
 }
 
-// NewAliyunARMSClient creates a new Alibaba Cloud ARMS client.
+// NewAliyunARMSClient creates a new Alibaba Cloud ARMS client using the official SDK.
 func NewAliyunARMSClient(config *core.AliyunARMSConfig) (*AliyunARMSClient, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid ARMS config: %w", err)
 	}
 
-	creds := &credentials.Credentials{
-		Type:            credentials.CredentialTypeAccessKey,
+	// Prepare credential for SDK
+	var credential auth.Credential
+	if config.SecurityToken != "" {
+		// Use STS token
+		credential = credentials.NewStsTokenCredential(
+			config.AccessKeyID,
+			config.AccessKeySecret,
+			config.SecurityToken,
+		)
+	} else {
+		// Use access key
+		credential = credentials.NewAccessKeyCredential(
+			config.AccessKeyID,
+			config.AccessKeySecret,
+		)
+	}
+
+	// Create SDK config with timeout
+	sdkConfig := sdk.NewConfig()
+	if config.Timeout > 0 {
+		sdkConfig.Timeout = time.Duration(config.Timeout) * time.Second
+	}
+	sdkConfig.Scheme = "https"
+
+	// Create ARMS client using NewClientWithOptions
+	armsClient, err := arms.NewClientWithOptions(
+		config.Region,
+		sdkConfig,
+		credential,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ARMS client: %w", err)
+	}
+
+	// Create credentials for base datasource
+	creds := &dscredentials.Credentials{
+		Type:            dscredentials.CredentialTypeAccessKey,
 		AccessKeyID:     config.AccessKeyID,
 		AccessKeySecret: config.AccessKeySecret,
 	}
 	if config.SecurityToken != "" {
-		creds.Type = credentials.CredentialTypeSTSToken
+		creds.Type = dscredentials.CredentialTypeSTSToken
 		creds.SecurityToken = config.SecurityToken
 	}
 
 	base := NewBaseAPMDataSource(&config.Config)
 	base.SetCredentials(creds)
 
-	endpoint := config.Endpoint
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://arms.%s.aliyuncs.com", config.Region)
-	}
-
 	return &AliyunARMSClient{
 		BaseAPMDataSource: base,
-		config:           &AliyunARMSConfig{AliyunARMSConfig: config},
-		client: &http.Client{
-			Timeout: config.Timeout,
-		},
+		config:            &AliyunARMSConfig{AliyunARMSConfig: config},
+		armsClient:        armsClient,
 	}, nil
 }
 
@@ -66,21 +96,15 @@ func (c *AliyunARMSClient) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Test connection via ListApps API
-	req, err := c.buildAPIRequest(ctx, "2019-08-08", "ListApps", map[string]string{})
-	if err != nil {
-		return core.NewNetworkError(string(c.Type()), "connect", err)
-	}
+	// Test connection by searching traces with minimal params
+	req := arms.CreateSearchTracesRequest()
+	req.Pid = c.config.Pid
+	req.StartTime = requests.NewInteger64(time.Now().Add(-5 * time.Minute).UnixMilli())
+	req.EndTime = requests.NewInteger64(time.Now().UnixMilli())
 
-	resp, err := c.client.Do(req)
+	_, err := c.armsClient.SearchTraces(req)
 	if err != nil {
-		return core.NewNetworkError(string(c.Type()), "connect", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("connection failed: %s", string(body)), nil)
+		return core.NewAuthError(string(c.Type()), "connect", fmt.Sprintf("failed to connect: %v", err), nil)
 	}
 
 	c.connected = true
@@ -92,24 +116,16 @@ func (c *AliyunARMSClient) Connect(ctx context.Context) error {
 
 // ping checks if ARMS is reachable.
 func (c *AliyunARMSClient) ping(ctx context.Context) error {
-	req, err := c.buildAPIRequest(ctx, "2019-08-08", "ListApps", map[string]string{})
-	if err != nil {
-		return err
-	}
+	req := arms.CreateSearchTracesRequest()
+	req.Pid = c.config.Pid
+	req.StartTime = requests.NewInteger64(time.Now().Add(-5 * time.Minute).UnixMilli())
+	req.EndTime = requests.NewInteger64(time.Now().UnixMilli())
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ping failed with status %d", resp.StatusCode)
-	}
-	return nil
+	_, err := c.armsClient.SearchTraces(req)
+	return err
 }
 
-// QueryTraces queries traces from ARMS.
+// QueryTraces queries traces from ARMS using the official SDK.
 func (c *AliyunARMSClient) QueryTraces(ctx context.Context, req *core.TraceQueryRequest) (*core.TraceQueryResponse, error) {
 	if err := c.ValidateTraceQueryRequest(req); err != nil {
 		return nil, core.NewValidationError(string(c.Type()), "query_traces", err.Error())
@@ -124,10 +140,8 @@ func (c *AliyunARMSClient) QueryTraces(ctx context.Context, req *core.TraceQuery
 		return nil, core.NewInternalError(string(c.Type()), "query_traces", fmt.Errorf("not connected"))
 	}
 
-	params := c.buildTraceQueryParams(req)
-
 	result, err := c.ExecuteWithRetry(ctx, func() (interface{}, error) {
-		return c.executeTraceQuery(ctx, params)
+		return c.executeTraceQuery(req)
 	})
 
 	if err != nil {
@@ -137,7 +151,7 @@ func (c *AliyunARMSClient) QueryTraces(ctx context.Context, req *core.TraceQuery
 	return result.(*core.TraceQueryResponse), nil
 }
 
-// QueryMetrics queries APM metrics from ARMS.
+// QueryMetrics queries APM metrics from ARMS using the official SDK.
 func (c *AliyunARMSClient) QueryMetrics(ctx context.Context, req *core.APMMetricsRequest) (*core.APMMetricsResponse, error) {
 	if err := c.ValidateAPMMetricsRequest(req); err != nil {
 		return nil, core.NewValidationError(string(c.Type()), "query_metrics", err.Error())
@@ -152,10 +166,8 @@ func (c *AliyunARMSClient) QueryMetrics(ctx context.Context, req *core.APMMetric
 		return nil, core.NewInternalError(string(c.Type()), "query_metrics", fmt.Errorf("not connected"))
 	}
 
-	params := c.buildMetricsQueryParams(req)
-
 	result, err := c.ExecuteWithRetry(ctx, func() (interface{}, error) {
-		return c.executeMetricsQuery(ctx, params)
+		return c.executeMetricsQuery(req)
 	})
 
 	if err != nil {
@@ -174,12 +186,8 @@ func (c *AliyunARMSClient) GetTraceDetails(ctx context.Context, traceID string) 
 		return nil, core.NewInternalError(string(c.Type()), "get_trace_details", fmt.Errorf("not connected"))
 	}
 
-	params := map[string]string{
-		"TraceId": traceID,
-	}
-
 	result, err := c.ExecuteWithRetry(ctx, func() (interface{}, error) {
-		return c.executeGetTraceDetails(ctx, params)
+		return c.executeGetTraceDetails(traceID)
 	})
 
 	if err != nil {
@@ -194,249 +202,119 @@ func (c *AliyunARMSClient) Type() core.DataSourceType {
 	return core.DataSourceTypeARMS
 }
 
-// buildAPIRequest builds an HTTP request for ARMS API.
-func (c *AliyunARMSClient) buildAPIRequest(ctx context.Context, version string, action string, params map[string]string) (*http.Request, error) {
-	endpoint := c.config.Endpoint
-	if endpoint == "" {
-		endpoint = fmt.Sprintf("https://arms.%s.aliyuncs.com", c.config.Region)
-	}
+// executeTraceQuery executes a trace query using the official SDK.
+func (c *AliyunARMSClient) executeTraceQuery(req *core.TraceQueryRequest) (*core.TraceQueryResponse, error) {
+	// Build SearchTraces request
+	searchReq := arms.CreateSearchTracesRequest()
+	searchReq.Pid = c.config.Pid
+	searchReq.StartTime = requests.NewInteger64(req.StartTime.UnixMilli())
+	searchReq.EndTime = requests.NewInteger64(req.EndTime.UnixMilli())
 
-	// Add common parameters
-	allParams := map[string]string{
-		"Version":        version,
-		"Action":         action,
-		"AccessKeyId":    c.config.AccessKeyID,
-		"SignatureMethod": "HMAC-SHA1",
-		"SignatureVersion": "1.0",
-		"SignatureNonce":  fmt.Sprintf("%d", time.Now().UnixNano()),
-		"Timestamp":       time.Now().UTC().Format("2006-01-02T15:04:05Z"),
-		"Format":         "JSON",
-		"RegionId":       c.config.Region,
-	}
-
-	for k, v := range params {
-		allParams[k] = v
-	}
-
-	if c.config.Pid != "" {
-		allParams["Pid"] = c.config.Pid
-	}
-
-	// Build URL with query parameters
-	var queryParts []string
-	for k, v := range allParams {
-		queryParts = append(queryParts, fmt.Sprintf("%s=%s", k, v))
-	}
-	fullURL := fmt.Sprintf("%s/?%s", endpoint, strings.Join(queryParts, "&"))
-
-	req, err := http.NewRequestWithContext(ctx, "GET", fullURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	return req, nil
-}
-
-// buildTraceQueryParams builds trace query parameters for ARMS API.
-func (c *AliyunARMSClient) buildTraceQueryParams(req *core.TraceQueryRequest) map[string]string {
-	params := map[string]string{
-		"StartTime": fmt.Sprintf("%d", req.StartTime.Unix()*1000),
-		"EndTime":   fmt.Sprintf("%d", req.EndTime.Unix()*1000),
-	}
-
-	if req.TraceID != "" {
-		params["TraceId"] = req.TraceID
-	}
 	if req.ServiceName != "" {
-		params["ServiceName"] = req.ServiceName
+		searchReq.ServiceName = req.ServiceName
 	}
 	if req.MinDuration > 0 {
-		params["MinDuration"] = fmt.Sprintf("%d", req.MinDuration.Milliseconds())
-	}
-	if req.Limit > 0 {
-		params["Limit"] = fmt.Sprintf("%d", req.Limit)
+		searchReq.MinDuration = requests.NewInteger64(int64(req.MinDuration.Milliseconds()))
 	}
 
-	return params
+	// Execute search
+	resp, err := c.armsClient.SearchTraces(searchReq)
+	if err != nil {
+		return nil, core.NewInternalError(string(c.Type()), "execute_trace_query", fmt.Errorf("search failed: %w", err))
+	}
+
+	// Convert to our format
+	return c.convertSearchTracesResponse(resp, req.Limit)
 }
 
-// buildMetricsQueryParams builds metrics query parameters for ARMS API.
-func (c *AliyunARMSClient) buildMetricsQueryParams(req *core.APMMetricsRequest) map[string]string {
-	params := map[string]string{
-		"StartTime":  fmt.Sprintf("%d", req.StartTime.Unix()*1000),
-		"EndTime":    fmt.Sprintf("%d", req.EndTime.Unix()*1000),
-		"MetricType": req.MetricType,
+// convertSearchTracesResponse converts SDK response to our format.
+func (c *AliyunARMSClient) convertSearchTracesResponse(resp *arms.SearchTracesResponse, limit int) (*core.TraceQueryResponse, error) {
+	response := &core.TraceQueryResponse{
+		Traces: make([]core.TraceSummary, 0),
 	}
+
+	for _, traceInfo := range resp.TraceInfos {
+		// Use Timestamp instead of StartTime
+		summary, err := c.ParseTraceSummary(map[string]interface{}{
+			"traceID":       traceInfo.TraceID,
+			"duration":      traceInfo.Duration,
+			"serviceName":   traceInfo.ServiceName,
+			"operationName": traceInfo.OperationName,
+			"startTime":     traceInfo.Timestamp,
+		})
+		if err != nil {
+			continue
+		}
+
+		response.Traces = append(response.Traces, *summary)
+
+		// Apply limit if specified
+		if limit > 0 && len(response.Traces) >= limit {
+			break
+		}
+	}
+
+	response.TotalCount = int64(len(response.Traces))
+
+	return response, nil
+}
+
+// executeMetricsQuery executes a metrics query using the official SDK.
+func (c *AliyunARMSClient) executeMetricsQuery(req *core.APMMetricsRequest) (*core.APMMetricsResponse, error) {
+	// Build QueryMetricByPage request
+	queryReq := arms.CreateQueryMetricByPageRequest()
+	queryReq.StartTime = requests.NewInteger64(req.StartTime.UnixMilli())
+	queryReq.EndTime = requests.NewInteger64(req.EndTime.UnixMilli())
+	queryReq.Metric = req.MetricType
 
 	if req.ServiceName != "" {
-		params["ServiceName"] = req.ServiceName
+		// Add service filter
+		filters := &[]arms.QueryMetricByPageFilters{
+			{Key: "serviceName", Value: req.ServiceName},
+		}
+		queryReq.Filters = filters
 	}
+
 	if req.Interval > 0 {
-		params["Interval"] = fmt.Sprintf("%d", req.Interval.Milliseconds())
+		queryReq.IntervalInSec = requests.NewInteger64(int64(req.Interval.Seconds()))
 	}
 
-	return params
+	// Pagination
+	queryReq.CurrentPage = requests.NewInteger64(1)
+	queryReq.PageSize = requests.NewInteger64(1000)
+
+	// Execute query
+	resp, err := c.armsClient.QueryMetricByPage(queryReq)
+	if err != nil {
+		return nil, core.NewInternalError(string(c.Type()), "execute_metrics_query", fmt.Errorf("query failed: %w", err))
+	}
+
+	if !resp.Success {
+		return nil, core.NewInternalError(string(c.Type()), "execute_metrics_query", fmt.Errorf("API error: %s", resp.Message))
+	}
+
+	// Convert to our format
+	return c.convertMetricsResponse(resp, req)
 }
 
-// executeTraceQuery executes a trace query against ARMS.
-func (c *AliyunARMSClient) executeTraceQuery(ctx context.Context, params map[string]string) (*core.TraceQueryResponse, error) {
-	req, err := c.buildAPIRequest(ctx, "2019-08-08", "SearchTraces", params)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_trace_query", err)
+// convertMetricsResponse converts SDK response to our format.
+func (c *AliyunARMSClient) convertMetricsResponse(resp *arms.QueryMetricByPageResponse, req *core.APMMetricsRequest) (*core.APMMetricsResponse, error) {
+	response := &core.APMMetricsResponse{
+		ServiceName: req.ServiceName,
+		MetricType:  req.MetricType,
+		DataPoints:  make([]core.APMDataPoint, 0),
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_trace_query", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, core.NewInternalError(string(c.Type()), "execute_trace_query", fmt.Errorf("query failed: %s", string(body)))
-	}
-
-	var result struct {
-		Data   []map[string]interface{} `json:"Data"`
-		Total  int64                    `json:"Total"`
-		Code   int                      `json:"Code"`
-		Message string                  `json:"Message"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "execute_trace_query", "failed to parse response", err)
-	}
-
-	if result.Code != 200 {
-		return nil, core.NewInternalError(string(c.Type()), "execute_trace_query", fmt.Errorf("API error: %s", result.Message))
-	}
-
-	// Convert traces
-	traces := make([]core.TraceSummary, 0, len(result.Data))
-	for _, raw := range result.Data {
-		summary, err := c.ParseTraceSummary(raw)
+	// Parse data from response - Items is []map[string]interface{}
+	for _, item := range resp.Data.Items {
+		dp, err := c.parseAPMDataPoint(item)
 		if err != nil {
 			continue
 		}
-		traces = append(traces, *summary)
+		response.DataPoints = append(response.DataPoints, *dp)
 	}
 
-	return &core.TraceQueryResponse{
-		Traces:     traces,
-		TotalCount: result.Total,
-	}, nil
-}
-
-// executeMetricsQuery executes a metrics query against ARMS.
-func (c *AliyunARMSClient) executeMetricsQuery(ctx context.Context, params map[string]string) (*core.APMMetricsResponse, error) {
-	req, err := c.buildAPIRequest(ctx, "2019-08-08", "QueryMetricByPage", params)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_metrics_query", err)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_metrics_query", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, core.NewInternalError(string(c.Type()), "execute_metrics_query", fmt.Errorf("query failed: %s", string(body)))
-	}
-
-	var result struct {
-		Data   []map[string]interface{} `json:"Data"`
-		Code   int                      `json:"Code"`
-		Message string                  `json:"Message"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "execute_metrics_query", "failed to parse response", err)
-	}
-
-	if result.Code != 200 {
-		return nil, core.NewInternalError(string(c.Type()), "execute_metrics_query", fmt.Errorf("API error: %s", result.Message))
-	}
-
-	serviceName := params["ServiceName"]
-	metricType := params["MetricType"]
-
-	dataPoints := make([]core.APMDataPoint, 0, len(result.Data))
-	for _, raw := range result.Data {
-		dp, err := c.parseAPMDataPoint(raw)
-		if err != nil {
-			continue
-		}
-		dataPoints = append(dataPoints, *dp)
-	}
-
-	return &core.APMMetricsResponse{
-		ServiceName: serviceName,
-		MetricType:  metricType,
-		DataPoints:  dataPoints,
-	}, nil
-}
-
-// executeGetTraceDetails executes a trace details query against ARMS.
-func (c *AliyunARMSClient) executeGetTraceDetails(ctx context.Context, params map[string]string) (*core.TraceDetails, error) {
-	req, err := c.buildAPIRequest(ctx, "2019-08-08", "GetTrace", params)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_get_trace_details", err)
-	}
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "execute_get_trace_details", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, core.NewInternalError(string(c.Type()), "execute_get_trace_details", fmt.Errorf("query failed: %s", string(body)))
-	}
-
-	var result struct {
-		Data   map[string]interface{} `json:"Data"`
-		Code   int                    `json:"Code"`
-		Message string                `json:"Message"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "execute_get_trace_details", "failed to parse response", err)
-	}
-
-	if result.Code != 200 {
-		return nil, core.NewInternalError(string(c.Type()), "execute_get_trace_details", fmt.Errorf("API error: %s", result.Message))
-	}
-
-	// Parse trace details
-	data := result.Data
-
-	// Extract trace summary
-	summary, err := c.ParseTraceSummary(data)
-	if err != nil {
-		return nil, err
-	}
-
-	// Extract spans
-	var spans []core.Span
-	if rawSpans, ok := data["spans"].([]interface{}); ok {
-		for _, rawSpan := range rawSpans {
-			if spanMap, ok := rawSpan.(map[string]interface{}); ok {
-				span, err := c.ParseSpan(spanMap)
-				if err != nil {
-					continue
-				}
-				spans = append(spans, *span)
-			}
-		}
-	}
-
-	return &core.TraceDetails{
-		TraceSummary: *summary,
-		Spans:       spans,
-	}, nil
+	return response, nil
 }
 
 // parseAPMDataPoint parses a raw APM data point.
@@ -470,6 +348,85 @@ func (c *AliyunARMSClient) parseAPMDataPoint(raw map[string]interface{}) (*core.
 	return dp, nil
 }
 
+// executeGetTraceDetails executes a trace details query using the official SDK.
+func (c *AliyunARMSClient) executeGetTraceDetails(traceID string) (*core.TraceDetails, error) {
+	// Build GetTrace request
+	getReq := arms.CreateGetTraceRequest()
+	getReq.TraceID = traceID
+	getReq.StartTime = requests.NewInteger64(time.Now().Add(-24 * time.Hour).UnixMilli())
+	getReq.EndTime = requests.NewInteger64(time.Now().UnixMilli())
+
+	// Execute query
+	resp, err := c.armsClient.GetTrace(getReq)
+	if err != nil {
+		return nil, core.NewInternalError(string(c.Type()), "execute_get_trace_details", fmt.Errorf("query failed: %w", err))
+	}
+
+	// Convert to our format
+	return c.convertGetTraceResponse(resp, traceID)
+}
+
+// convertGetTraceResponse converts SDK GetTrace response to our format.
+func (c *AliyunARMSClient) convertGetTraceResponse(resp *arms.GetTraceResponse, traceID string) (*core.TraceDetails, error) {
+	// Build trace summary from spans
+	var traceSummary *core.TraceSummary
+	spans := make([]core.Span, 0, len(resp.Spans))
+
+	for _, spanInfo := range resp.Spans {
+		// Parse span
+		span, err := c.ParseSpan(map[string]interface{}{
+			"spanID":        spanInfo.SpanId,
+			"parentSpanID":  spanInfo.ParentSpanId,
+			"operationName": spanInfo.OperationName,
+			"startTime":     spanInfo.Timestamp,
+			"duration":      spanInfo.Duration,
+			"serviceName":   spanInfo.ServiceName,
+		})
+		if err != nil {
+			continue
+		}
+		spans = append(spans, *span)
+
+		// Use the root span (no parent) for trace summary
+		if traceSummary == nil && spanInfo.ParentSpanId == "" {
+			summary, err := c.ParseTraceSummary(map[string]interface{}{
+				"traceID":       traceID,
+				"duration":      spanInfo.Duration,
+				"serviceName":   spanInfo.ServiceName,
+				"operationName": spanInfo.OperationName,
+				"startTime":     spanInfo.Timestamp,
+			})
+			if err == nil {
+				traceSummary = summary
+			}
+		}
+	}
+
+	// If no root span found, use first span
+	if traceSummary == nil && len(resp.Spans) > 0 {
+		firstSpan := resp.Spans[0]
+		summary, err := c.ParseTraceSummary(map[string]interface{}{
+			"traceID":       traceID,
+			"duration":      firstSpan.Duration,
+			"serviceName":   firstSpan.ServiceName,
+			"operationName": firstSpan.OperationName,
+			"startTime":     firstSpan.Timestamp,
+		})
+		if err == nil {
+			traceSummary = summary
+		}
+	}
+
+	if traceSummary == nil {
+		return nil, fmt.Errorf("unable to extract trace summary from response")
+	}
+
+	return &core.TraceDetails{
+		TraceSummary: *traceSummary,
+		Spans:       spans,
+	}, nil
+}
+
 // ListApps lists ARMS-monitored applications.
 func (c *AliyunARMSClient) ListApps(ctx context.Context) ([]map[string]interface{}, error) {
 	c.mu.RLock()
@@ -479,31 +436,32 @@ func (c *AliyunARMSClient) ListApps(ctx context.Context) ([]map[string]interface
 		return nil, core.NewInternalError(string(c.Type()), "list_apps", fmt.Errorf("not connected"))
 	}
 
-	req, err := c.buildAPIRequest(ctx, "2019-08-08", "ListApps", map[string]string{})
+	// Use SearchTraces with empty filter to list apps
+	req := arms.CreateSearchTracesRequest()
+	req.Pid = c.config.Pid
+	req.StartTime = requests.NewInteger64(time.Now().Add(-5 * time.Minute).UnixMilli())
+	req.EndTime = requests.NewInteger64(time.Now().UnixMilli())
+
+	resp, err := c.armsClient.SearchTraces(req)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, core.NewNetworkError(string(c.Type()), "list_apps", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, core.NewInternalError(string(c.Type()), "list_apps", fmt.Errorf("failed with status %d", resp.StatusCode))
+	// Extract unique service names from trace results
+	serviceMap := make(map[string]bool)
+	for _, trace := range resp.TraceInfos {
+		serviceMap[trace.ServiceName] = true
 	}
 
-	var result struct {
-		Data   []map[string]interface{} `json:"Data"`
-		Code   int                      `json:"Code"`
+	// Convert to array
+	result := make([]map[string]interface{}, 0, len(serviceMap))
+	for service := range serviceMap {
+		result = append(result, map[string]interface{}{
+			"serviceName": service,
+		})
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, core.NewParsingError(string(c.Type()), "list_apps", "failed to parse response", err)
-	}
-
-	return result.Data, nil
+	return result, nil
 }
 
 // Close closes the ARMS client.
@@ -513,7 +471,6 @@ func (c *AliyunARMSClient) Close() error {
 
 	c.connected = false
 	c.healthStatus = core.StatusUnknown
-	c.client.CloseIdleConnections()
 
 	return nil
 }

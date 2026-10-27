@@ -25,12 +25,12 @@ type LogAnalystAgent struct {
 // NewLogAnalystAgent creates a new LogAnalystAgent.
 func NewLogAnalystAgent(settings *config.Settings) (*LogAnalystAgent, error) {
 	cfg := &AgentConfig{
-		Name:         "log-analyst-agent",
-		Type:         AgentTypeLogAnalyst,
-		Description:  "Analyze logs and detect error patterns",
-		Model:        "claude-sonnet-4-20250514",
-		MaxTurns:     10,
-		Timeout:      5 * time.Minute,
+		Name:        "log-analyst-agent",
+		Type:        AgentTypeLogAnalyst,
+		Description: "Analyze logs and detect error patterns",
+		Model:       "claude-sonnet-4-20250514",
+		MaxTurns:    10,
+		Timeout:     5 * time.Minute,
 		SystemPrompt: `You are a LogAnalystAgent specialized in log analysis.
 
 Your capabilities include:
@@ -64,24 +64,24 @@ func (l *LogAnalystAgent) SetLogSource(source sources.LogSource) {
 
 // LogAnalysisResult represents the result of log analysis.
 type LogAnalysisResult struct {
-	Service       string             `json:"service"`
-	StartTime     time.Time          `json:"start_time"`
-	EndTime       time.Time          `json:"end_time"`
-	TotalErrors   int64              `json:"total_errors"`
-	ErrorPatterns []ErrorPattern     `json:"error_patterns"`
-	Timeline      []LogTimeSlot      `json:"timeline"`
-	Sources       []string           `json:"sources"`
+	Service       string         `json:"service"`
+	StartTime     time.Time      `json:"start_time"`
+	EndTime       time.Time      `json:"end_time"`
+	TotalErrors   int64          `json:"total_errors"`
+	ErrorPatterns []ErrorPattern `json:"error_patterns"`
+	Timeline      []LogTimeSlot  `json:"timeline"`
+	Sources       []string       `json:"sources"`
 }
 
 // ErrorPattern represents a detected error pattern.
 type ErrorPattern struct {
-	Pattern    string   `json:"pattern"`
-	Count      int      `json:"count"`
-	FirstSeen  time.Time `json:"first_seen"`
-	LastSeen   time.Time `json:"last_seen"`
-	Services   []string `json:"services"`
-	Example    string   `json:"example"`
-	Severity   string   `json:"severity"`
+	Pattern   string    `json:"pattern"`
+	Count     int       `json:"count"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Services  []string  `json:"services"`
+	Example   string    `json:"example"`
+	Severity  string    `json:"severity"`
 }
 
 // LogTimeSlot represents logs aggregated in a time slot.
@@ -94,12 +94,12 @@ type LogTimeSlot struct {
 
 // IncidentCorrelation represents the correlation between logs and an incident.
 type IncidentCorrelation struct {
-	Service         string       `json:"service"`
-	IncidentTime    time.Time    `json:"incident_time"`
-	CorrelatedLogs  int          `json:"correlated_logs"`
-	ErrorSpike      bool         `json:"error_spike"`
-	RelatedErrors   []string     `json:"related_errors"`
-	Confidence      float64      `json:"confidence"`
+	Service        string    `json:"service"`
+	IncidentTime   time.Time `json:"incident_time"`
+	CorrelatedLogs int       `json:"correlated_logs"`
+	ErrorSpike     bool      `json:"error_spike"`
+	RelatedErrors  []string  `json:"related_errors"`
+	Confidence     float64   `json:"confidence"`
 }
 
 // AnalyzeLogs performs log analysis for the given service and time range.
@@ -426,8 +426,8 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 	analysis, err := l.AnalyzeLogs(ctx, service, start, end)
 	if err != nil {
 		return &ExecutionResult{
-			Success: false,
-			Error:   err,
+			Success:  false,
+			Error:    err,
 			Response: fmt.Sprintf("Log analysis failed: %v", err),
 		}, nil
 	}
@@ -485,13 +485,17 @@ func (l *LogAnalystAgent) formatAnalysisResult(analysis *LogAnalysisResult) stri
 
 // executeTask implements the default task execution.
 func (l *LogAnalystAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResult, error) {
-	return &ExecutionResult{
-		Success:  true,
-		Response: fmt.Sprintf("LogAnalystAgent processed task: %s\n\nUse type='log_analysis' parameter to perform log analysis.", task.Description),
-		Data: map[string]interface{}{
-			"capabilities": l.GetConfig().Capabilities,
-		},
-	}, nil
+	// Delegate to the base agent's real LLM-backed execution. Go uses static
+	// method dispatch, so this specialist method must explicitly forward to
+	// BaseAgent.executeTask instead of relying on virtual dispatch.
+	result, err := l.BaseAgent.executeTask(ctx, task)
+	if result != nil {
+		if result.Data == nil {
+			result.Data = map[string]interface{}{}
+		}
+		result.Data["capabilities"] = l.GetConfig().Capabilities
+	}
+	return result, err
 }
 
 // CreateLogAnalystTools creates the standard set of tools for LogAnalystAgent.

@@ -4,6 +4,7 @@ package integrations
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -628,6 +629,65 @@ func TestK8sGetLastChange(t *testing.T) {
 		if change == nil {
 			t.Errorf("GetLastChange() returned nil change without error")
 		}
+	}
+}
+
+// TestExecuteQueryDropsNonFinite locks in that executeQuery discards +Inf/NaN/
+// -Inf datapoints. These arise from divide-by-near-zero ratio queries (e.g. the
+// ARMS APM latency = time/count for a low-traffic service) and are JSON-unsafe:
+// a single one makes json.Marshal fail and takes down the whole RCA response.
+func TestExecuteQueryDropsNonFinite(t *testing.T) {
+	now := time.Now()
+	promResponse := map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "matrix",
+			"result": []map[string]interface{}{
+				{
+					"metric": map[string]string{"__name__": "arms_app_latency_ms", "service": "low-traffic-svc"},
+					"values": [][]interface{}{
+						{float64(now.Add(-4 * time.Minute).Unix()), "12.5"},    // finite, keep
+						{float64(now.Add(-3 * time.Minute).Unix()), "+Inf"},    // drop
+						{float64(now.Add(-2 * time.Minute).Unix()), "NaN"},     // drop
+						{float64(now.Add(-1 * time.Minute).Unix()), "-Inf"},    // drop
+						{float64(now.Unix()), "33.0"},                          // finite, keep
+					},
+				},
+			},
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(promResponse)
+	}))
+	defer server.Close()
+
+	src, err := NewPrometheusMetricSource(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to create source: %v", err)
+	}
+
+	series, err := src.QueryMetric(context.Background(), "arms_app_latency_ms", time.Now().Add(-15*time.Minute), time.Now(), nil)
+	if err != nil {
+		t.Fatalf("QueryMetric() error: %v", err)
+	}
+	if len(series.DataPoints) != 2 {
+		t.Fatalf("expected 2 finite datapoints, got %d", len(series.DataPoints))
+	}
+	for _, dp := range series.DataPoints {
+		if math.IsInf(dp.Value, 0) || math.IsNaN(dp.Value) {
+			t.Errorf("non-finite value leaked through: %v", dp.Value)
+		}
+	}
+	// The surviving values must be the two finite ones.
+	if series.DataPoints[0].Value != 12.5 || series.DataPoints[1].Value != 33.0 {
+		t.Errorf("unexpected surviving values: %v", series.DataPoints)
+	}
+
+	// And the whole series must be JSON-marshalable (the real failure mode).
+	if _, err := json.Marshal(series); err != nil {
+		t.Errorf("series not JSON-safe after filtering: %v", err)
 	}
 }
 

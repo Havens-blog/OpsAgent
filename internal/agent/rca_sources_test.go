@@ -3,6 +3,8 @@ package agent
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -258,6 +260,60 @@ func TestCreateRCASources(t *testing.T) {
 		}
 		if sources.ChangeSource != nil {
 			t.Error("Expected nil ChangeSource when no endpoint configured")
+		}
+	})
+}
+
+// TestCreateRCASourcesPingGate verifies the reachability probe added to
+// CreateRCASources: a metric source whose endpoint answers is kept, while one
+// whose endpoint fails is dropped to nil (so the fallback supplies a mock).
+// This is what makes active["metrics"]=true mean "verified reachable" rather
+// than merely "constructed".
+func TestCreateRCASourcesPingGate(t *testing.T) {
+	t.Run("KeptWhenReachable", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Ping issues GET /api/v1/query?query=vector(1); a 200 suffices.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		}))
+		defer srv.Close()
+
+		sources, err := CreateRCASources(&DataSourceConfig{PrometheusEndpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("CreateRCASources failed: %v", err)
+		}
+		if sources.MetricSource == nil {
+			t.Error("expected MetricSource kept when endpoint is reachable")
+		}
+	})
+
+	t.Run("DroppedWhenUnreachable", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		sources, err := CreateRCASources(&DataSourceConfig{PrometheusEndpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("CreateRCASources failed: %v", err)
+		}
+		if sources.MetricSource != nil {
+			t.Error("expected MetricSource dropped to nil when endpoint ping fails")
+		}
+	})
+
+	t.Run("FallbackSuppliesMockForDroppedSource", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer srv.Close()
+
+		result, active := CreateRCASourcesWithFallback(&DataSourceConfig{PrometheusEndpoint: srv.URL})
+		if active["metrics"] {
+			t.Error("expected active[metrics]=false when ping fails")
+		}
+		if result.MetricSource == nil {
+			t.Error("expected fallback mock MetricSource to be present")
 		}
 	})
 }

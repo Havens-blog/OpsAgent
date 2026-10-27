@@ -649,6 +649,73 @@ func TestGenerateHypotheses(t *testing.T) {
 	}
 }
 
+// TestErrorSpikeIsPerService locks in that error-spike detection uses each
+// service's OWN logs, not the combined global log stream. Previously
+// hasSignificantErrorSpike ignored its per-service argument and summed
+// normalized.LogByWindow (every service together), so a single noisy service
+// raised a false spike for every other service and attribution was
+// meaningless. Here one noisy service has a real spike and a quiet service has
+// one lone error: exactly one error_spike must be generated, attributed to the
+// noisy service only.
+func TestErrorSpikeIsPerService(t *testing.T) {
+	incident := &models.Incident{
+		ID:        "test-perservice",
+		StartTime: time.Now().Add(-1 * time.Hour),
+		EndTime:   time.Now(),
+		Severity:  "P1",
+	}
+	baseTime := incident.StartTime.Add(-15 * time.Minute)
+	subWindow := 3 * time.Minute
+
+	errAt := func(ts time.Time, svc string) models.LogEntry {
+		return models.LogEntry{Timestamp: ts, Service: svc, IsError: true, Level: "error", Message: "boom"}
+	}
+
+	// Noisy service: 12 errors inside the two incident windows, 0 baseline.
+	noisy := []models.LogEntry{}
+	for i := 0; i < 12; i++ {
+		noisy = append(noisy, errAt(incident.StartTime.Add(time.Duration(i*5)*time.Second), "noisy-svc"))
+	}
+	// Quiet service: a single error in an incident window (never a spike).
+	quiet := []models.LogEntry{errAt(incident.StartTime.Add(10*time.Second), "quiet-svc")}
+
+	normalized := &models.NormalizedSignals{
+		TimeWindows: []models.TimeWindow{
+			{Start: baseTime, End: baseTime.Add(subWindow)},
+			{Start: baseTime.Add(subWindow), End: baseTime.Add(2 * subWindow)},
+			{Start: baseTime.Add(2 * subWindow), End: baseTime.Add(3 * subWindow)},
+			{Start: incident.StartTime, End: incident.StartTime.Add(subWindow)},
+			{Start: incident.StartTime.Add(subWindow), End: incident.StartTime.Add(2 * subWindow)},
+		},
+		// Both services' logs share the incident windows, as in production.
+		LogByWindow: map[int][]models.LogEntry{
+			0: {}, 1: {}, 2: {},
+			3: append(append([]models.LogEntry{}, noisy[:6]...), quiet...),
+			4: noisy[6:],
+		},
+	}
+
+	engine, _ := NewEngine(WithLogSource(&mockLogSource{}), WithMetricSource(&mockMetricSource{}))
+	candidates := engine.generateHypotheses(context.Background(), normalized, incident)
+
+	spikes := map[string]int{}
+	for _, c := range candidates {
+		if c.Type == models.HypothesisTypeErrorSpike {
+			spikes[c.Service]++
+		}
+	}
+
+	if spikes["quiet-svc"] != 0 {
+		t.Errorf("quiet-svc must NOT get an error spike (it had 1 error), got %d", spikes["quiet-svc"])
+	}
+	if spikes["noisy-svc"] != 1 {
+		t.Errorf("noisy-svc must get exactly 1 error spike, got %d", spikes["noisy-svc"])
+	}
+	if len(spikes) != 1 {
+		t.Errorf("expected error spikes for exactly 1 service, got %d: %v", len(spikes), spikes)
+	}
+}
+
 func TestRankAndFilter(t *testing.T) {
 	scored := []models.ScoredHypothesis{
 		{

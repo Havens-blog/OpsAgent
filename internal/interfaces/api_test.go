@@ -274,6 +274,82 @@ func TestCORSMiddleware(t *testing.T) {
 	})
 }
 
+// TestAPIAuth verifies bearer-token enforcement on protected endpoints.
+func TestAPIAuth(t *testing.T) {
+	settings := &config.Settings{
+		Environment: config.EnvDevelopment,
+		Server:      config.ServerConfig{Host: "localhost", Port: 8080},
+	}
+	server, err := NewAPIServer(settings)
+	if err != nil {
+		t.Fatalf("Failed to create API server: %v", err)
+	}
+	defer server.Shutdown(context.Background())
+
+	const token = "secret-test-token"
+
+	t.Run("disabled_when_no_token_configured", func(t *testing.T) {
+		server.apiAuthToken = ""
+		req := httptest.NewRequest("GET", "/api/v1/rca", nil)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code == http.StatusUnauthorized {
+			t.Errorf("Expected passthrough when auth disabled, got 401")
+		}
+	})
+
+	// Enable enforcement for the remaining cases.
+	server.apiAuthToken = token
+
+	t.Run("missing_header_returns_401", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/rca", nil)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected 401 without token, got %d", w.Code)
+		}
+	})
+
+	t.Run("wrong_token_returns_401", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/rca", nil)
+		req.Header.Set("Authorization", "Bearer wrong-token")
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("Expected 401 with wrong token, got %d", w.Code)
+		}
+	})
+
+	t.Run("correct_token_passes_auth", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/rca", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code == http.StatusUnauthorized {
+			t.Errorf("Expected auth to pass with correct token, got 401")
+		}
+	})
+
+	t.Run("health_exempt_even_when_enabled", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/v1/health", nil)
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected health 200 without token, got %d", w.Code)
+		}
+	})
+
+	t.Run("options_preflight_allowed_without_token", func(t *testing.T) {
+		req := httptest.NewRequest("OPTIONS", "/api/v1/rca", nil)
+		req.Header.Set("Origin", "http://localhost:3000")
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code == http.StatusUnauthorized {
+			t.Errorf("Expected OPTIONS preflight to bypass auth, got 401")
+		}
+	})
+}
+
 // Request/Response types are defined in api.go
 // Local test-specific types:
 

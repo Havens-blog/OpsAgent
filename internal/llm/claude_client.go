@@ -72,8 +72,8 @@ func (c *ClaudeClient) Chat(ctx context.Context, messages []ClaudeMessage) (stri
 
 // ChatWithTools sends a chat completion request with tools to Claude.
 func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, error) {
-	// Convert messages to Anthropic format
-	anthropicMessages, err := c.convertMessages(messages)
+	// Convert messages to Anthropic format, extracting system prompts
+	anthropicMessages, systemPrompt, err := c.convertMessages(messages)
 	if err != nil {
 		return "", fmt.Errorf("failed to convert messages: %w", err)
 	}
@@ -112,6 +112,11 @@ func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessa
 			Model:     c.getModelParam(),
 			MaxTokens: int64(c.getMaxTokens()),
 			Messages:  currentMessages,
+		}
+
+		// Add system prompt if provided
+		if len(systemPrompt) > 0 {
+			params.System = systemPrompt
 		}
 
 		// Add tools if provided
@@ -220,8 +225,10 @@ func (c *ClaudeClient) GetModels(ctx context.Context) ([]string, error) {
 }
 
 // convertMessages converts our message format to Anthropic format.
-func (c *ClaudeClient) convertMessages(messages []ClaudeMessage) ([]anthropic.MessageParam, error) {
+// Returns (messages, systemPrompt). System messages are extracted separately.
+func (c *ClaudeClient) convertMessages(messages []ClaudeMessage) ([]anthropic.MessageParam, []anthropic.TextBlockParam, error) {
 	result := make([]anthropic.MessageParam, 0, len(messages))
+	var system []anthropic.TextBlockParam
 
 	for _, msg := range messages {
 		switch msg.Role {
@@ -230,14 +237,14 @@ func (c *ClaudeClient) convertMessages(messages []ClaudeMessage) ([]anthropic.Me
 		case "assistant":
 			result = append(result, anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content)))
 		case "system":
-			// System messages are handled separately, skip for now
-			continue
+			// System messages are extracted as TextBlockParam
+			system = append(system, anthropic.TextBlockParam{Text: msg.Content})
 		default:
-			return nil, fmt.Errorf("unknown role: %s", msg.Role)
+			return nil, nil, fmt.Errorf("unknown role: %s", msg.Role)
 		}
 	}
 
-	return result, nil
+	return result, system, nil
 }
 
 // getProperties extracts properties from input schema.
