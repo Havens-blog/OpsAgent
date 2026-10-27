@@ -4,13 +4,17 @@ import { useEffect, useRef, useState } from "react"
 import {
   AlertCircle,
   Bot,
+  Check,
   Loader2,
   MessageSquare,
   Plus,
   Send,
+  ShieldAlert,
   Square,
   Trash2,
   User,
+  Wrench,
+  X,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
@@ -19,12 +23,32 @@ import {
   type ConversationMessage,
 } from "@/lib/api"
 
+interface ToolCall {
+  callId: string
+  name: string
+  params: Record<string, unknown>
+  status: "running" | "success" | "failed"
+  result?: string
+  error?: string
+}
+
+interface ApprovalState {
+  id: string
+  toolName: string
+  params: Record<string, unknown>
+  reason: string
+  content: string
+  decision?: "approved" | "rejected"
+}
+
 interface UiMessage {
   id: string
   role: "user" | "assistant"
   content: string
   streaming?: boolean
   error?: string
+  toolCalls?: ToolCall[]
+  approval?: ApprovalState
 }
 
 const SUGGESTED_PROMPTS = [
@@ -150,10 +174,7 @@ export default function ChatPage() {
     }
   }
 
-  async function send() {
-    const content = input.trim()
-    if (!content || sending) return
-
+  async function runStream(content: string, opts: { skipUserEcho?: boolean } = {}) {
     let conversationId = activeId
     if (!conversationId) {
       try {
@@ -168,12 +189,7 @@ export default function ChatPage() {
     }
 
     setError(null)
-    const streamId = `assistant-${Date.now()}`
-    const userMsg: UiMessage = {
-      id: `user-${Date.now()}`,
-      role: "user",
-      content,
-    }
+    const streamId = `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`
     const assistantMsg: UiMessage = {
       id: streamId,
       role: "assistant",
@@ -181,13 +197,21 @@ export default function ChatPage() {
       streaming: true,
     }
 
-    setMessages((prev) => [...prev, userMsg, assistantMsg])
-    setInput("")
+    if (opts.skipUserEcho) {
+      setMessages((prev) => [...prev, assistantMsg])
+    } else {
+      const userMsg: UiMessage = { id: `user-${Date.now()}`, role: "user", content }
+      setMessages((prev) => [...prev, userMsg, assistantMsg])
+      setInput("")
+    }
+
     setSending(true)
     streamIdRef.current = streamId
 
     const controller = new AbortController()
     abortRef.current = controller
+
+    let approvalRequired = false
 
     try {
       await api.sendMessageStream(conversationId, content, {
@@ -205,12 +229,66 @@ export default function ChatPage() {
           )
         },
         onError: (msg) => {
+          if (approvalRequired) {
+            setMessages((prev) =>
+              prev.map((m) => (m.id === streamId ? { ...m, streaming: false } : m))
+            )
+            return
+          }
           setMessages((prev) =>
             prev.map((m) =>
               m.id === streamId ? { ...m, streaming: false, error: msg } : m
             )
           )
           setError(msg)
+        },
+        onToolCall: (ev) => {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== streamId) return m
+              const toolCalls = [...(m.toolCalls ?? [])]
+              toolCalls.push({
+                callId: ev.call_id,
+                name: ev.tool_name,
+                params: ev.params ?? {},
+                status: ev.status,
+              })
+              return { ...m, toolCalls }
+            })
+          )
+        },
+        onToolResult: (ev) => {
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.id !== streamId) return m
+              const toolCalls = (m.toolCalls ?? []).map((tc) =>
+                tc.callId === ev.call_id
+                  ? { ...tc, status: ev.status, result: ev.result, error: ev.error }
+                  : tc
+              )
+              return { ...m, toolCalls }
+            })
+          )
+        },
+        onApprovalRequired: (ev) => {
+          approvalRequired = true
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === streamId
+                ? {
+                    ...m,
+                    streaming: false,
+                    approval: {
+                      id: ev.approval_id,
+                      toolName: ev.tool_name,
+                      params: ev.params,
+                      reason: ev.reason,
+                      content,
+                    },
+                  }
+                : m
+            )
+          )
         },
       })
     } catch (err) {
@@ -232,6 +310,44 @@ export default function ChatPage() {
       abortRef.current = null
       setSending(false)
       void refreshConversations()
+    }
+  }
+
+  async function send() {
+    const content = input.trim()
+    if (!content || sending) return
+    await runStream(content)
+  }
+
+  async function handleApproval(messageId: string, action: "approve" | "reject") {
+    const target = messages.find((m) => m.id === messageId)
+    const approval = target?.approval
+    if (!approval) return
+
+    try {
+      if (action === "approve") await api.approveApproval(approval.id)
+      else await api.rejectApproval(approval.id)
+    } catch (err) {
+      setError(toMessage(err))
+      return
+    }
+
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId && m.approval
+          ? {
+              ...m,
+              approval: {
+                ...m.approval,
+                decision: action === "approve" ? "approved" : "rejected",
+              },
+            }
+          : m
+      )
+    )
+
+    if (action === "approve") {
+      await runStream(approval.content, { skipUserEcho: true })
     }
   }
 
@@ -299,6 +415,74 @@ export default function ChatPage() {
         </div>
         <div className="flex max-w-[80%] flex-col gap-1">
           <span className="text-xs text-muted-foreground">OpsAgent</span>
+
+          {msg.toolCalls?.map((tc) => (
+            <div key={tc.callId} className="rounded-md border bg-background/60 px-3 py-2 text-xs">
+              <div className="flex items-center gap-2">
+                <Wrench className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="font-medium">{tc.name}</span>
+                <span
+                  className={cn(
+                    "rounded-full px-2 py-0.5 text-[10px]",
+                    tc.status === "running" && "bg-accent text-muted-foreground",
+                    tc.status === "success" && "bg-emerald-500/10 text-emerald-600",
+                    tc.status === "failed" && "bg-destructive/10 text-destructive"
+                  )}
+                >
+                  {tc.status === "running" ? "运行中" : tc.status === "success" ? "成功" : "失败"}
+                </span>
+              </div>
+              <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-muted-foreground">
+                {JSON.stringify(tc.params, null, 2)}
+              </pre>
+              {tc.status === "success" && tc.result && (
+                <div className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-muted-foreground">
+                  {tc.result}
+                </div>
+              )}
+              {tc.status === "failed" && tc.error && (
+                <div className="mt-1 text-destructive">{tc.error}</div>
+              )}
+            </div>
+          ))}
+
+          {msg.approval && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
+                <span className="font-medium">需要审批：{msg.approval.toolName}</span>
+              </div>
+              {msg.approval.reason && (
+                <div className="mt-1 text-muted-foreground">{msg.approval.reason}</div>
+              )}
+              <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-muted-foreground">
+                {JSON.stringify(msg.approval.params, null, 2)}
+              </pre>
+              {msg.approval.decision ? (
+                <div className="mt-2 text-xs text-muted-foreground">
+                  {msg.approval.decision === "approved" ? "已批准，正在执行…" : "已拒绝"}
+                </div>
+              ) : (
+                <div className="mt-2 flex gap-2">
+                  <button
+                    onClick={() => void handleApproval(msg.id, "approve")}
+                    className="flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white transition-opacity hover:opacity-90"
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    批准
+                  </button>
+                  <button
+                    onClick={() => void handleApproval(msg.id, "reject")}
+                    className="flex items-center gap-1 rounded-md border border-destructive/40 px-2.5 py-1 text-xs text-destructive transition-colors hover:bg-destructive/10"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                    拒绝
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {msg.content && (
             <div className="whitespace-pre-wrap rounded-lg bg-accent/40 px-4 py-3 text-sm">
               {msg.content}
@@ -307,12 +491,14 @@ export default function ChatPage() {
               )}
             </div>
           )}
-          {msg.streaming && !msg.content && (
+
+          {msg.streaming && !msg.content && !msg.toolCalls?.length && !msg.approval && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
               正在思考…
             </div>
           )}
+
           {msg.error && (
             <div className="flex items-start gap-2 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />

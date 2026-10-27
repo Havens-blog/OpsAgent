@@ -24,6 +24,10 @@ func (f *fakeChatClient) Chat(ctx context.Context, messages []llm.Message) (*llm
 	return &llm.ChatResponse{}, nil
 }
 
+func (f *fakeChatClient) ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error) {
+	return &llm.ChatResponse{}, nil
+}
+
 func (f *fakeChatClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
 	if f.err != nil {
 		return f.err
@@ -42,6 +46,10 @@ func (f *fakeChatClient) ChatStream(ctx context.Context, messages []llm.Message,
 type blockingChatClient struct{}
 
 func (b *blockingChatClient) Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error) {
+	return nil, nil
+}
+
+func (b *blockingChatClient) ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error) {
 	return nil, nil
 }
 

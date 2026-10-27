@@ -3,11 +3,13 @@ package chat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/config"
+	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 )
 
@@ -27,15 +29,38 @@ const (
 // ChatClient is the narrow LLM client surface the Service depends on.
 type ChatClient interface {
 	Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error)
+	ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error)
 	ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error
+}
+
+// ToolProvider supplies the LLM-visible tool set and executes tool calls. The
+// chat package depends on this narrow interface instead of internal/agent or
+// internal/tool, keeping the dependency graph free of cycles.
+type ToolProvider interface {
+	ToolSpecsForLLM() ([]llm.Tool, error)
+	ExecuteTool(ctx context.Context, name string, args map[string]interface{}) (interface{}, error)
+}
+
+// StreamHandler receives lifecycle events emitted by StreamWithTools.
+type StreamHandler struct {
+	OnDelta            func(string) error
+	OnToolCall         func(callID string, name string, params map[string]interface{}) error
+	OnToolResult       func(callID string, name string, status string, result string, errMsg string) error
+	OnApprovalRequired func(req guardrails.ApprovalRequest) error
 }
 
 // Service provides conversational AI capabilities.
 type Service struct {
 	client       ChatClient
+	toolProvider ToolProvider
 	systemPrompt string
 	available    bool
 	model        string
+}
+
+// SetToolProvider injects the tool provider used by StreamWithTools.
+func (s *Service) SetToolProvider(p ToolProvider) {
+	s.toolProvider = p
 }
 
 // Message represents a chat message, both as LLM input and persisted history.
@@ -171,7 +196,126 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 	if !s.IsAvailable() {
 		return fmt.Errorf("chat service not available")
 	}
+	return s.streamLLM(ctx, s.buildLLMMessages(messages), onDelta)
+}
 
+// StreamWithTools runs the tool-calling loop and then streams the final
+// answer. It first asks the model (with tools) whether a tool is needed,
+// executes any requested tools while emitting tool_call/tool_result events,
+// and finally streams the answer via the existing delta flow.
+func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h StreamHandler) (string, error) {
+	if !s.IsAvailable() {
+		return "", fmt.Errorf("chat service not available")
+	}
+
+	llmMessages := s.buildLLMMessages(messages)
+
+	var tools []llm.Tool
+	if s.toolProvider != nil {
+		var err error
+		tools, err = s.toolProvider.ToolSpecsForLLM()
+		if err != nil {
+			return "", fmt.Errorf("failed to load tools: %w", err)
+		}
+	}
+
+	if len(tools) == 0 {
+		return s.streamAnswer(ctx, llmMessages, h)
+	}
+
+	resp, err := s.client.ChatWithTools(ctx, llmMessages, tools)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("LLM call failed: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("empty response from LLM")
+	}
+
+	assistantMsg := resp.Choices[0].Message
+	if len(assistantMsg.ToolCalls) == 0 {
+		return s.streamAnswer(ctx, llmMessages, h)
+	}
+
+	// Record the assistant's tool-call request so the final answer can see it.
+	llmMessages = append(llmMessages, llm.Message{
+		Role:      "assistant",
+		Content:   assistantMsg.Content,
+		ToolCalls: assistantMsg.ToolCalls,
+	})
+
+	for _, call := range assistantMsg.ToolCalls {
+		args, err := parseToolArguments(call.Function.Arguments)
+		if err != nil {
+			if h.OnToolResult != nil {
+				_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", err.Error())
+			}
+			llmMessages = append(llmMessages, llm.Message{
+				Role:       "tool",
+				Content:    fmt.Sprintf("error: %v", err),
+				ToolCallID: call.ID,
+			})
+			continue
+		}
+
+		if h.OnToolCall != nil {
+			if err := h.OnToolCall(call.ID, call.Function.Name, args); err != nil {
+				return "", err
+			}
+		}
+
+		result, execErr := s.toolProvider.ExecuteTool(ctx, call.Function.Name, args)
+		if execErr != nil {
+			if guardrails.ApprovalRequired(execErr) {
+				if h.OnApprovalRequired != nil {
+					if ar, ok := execErr.(*guardrails.ApprovalRequiredError); ok {
+						_ = h.OnApprovalRequired(ar.Request)
+					}
+				}
+				return "", fmt.Errorf("需要审批，请在前端批准后重试")
+			}
+			if h.OnToolResult != nil {
+				_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", execErr.Error())
+			}
+			llmMessages = append(llmMessages, llm.Message{
+				Role:       "tool",
+				Content:    fmt.Sprintf("error: %v", execErr),
+				ToolCallID: call.ID,
+			})
+			continue
+		}
+
+		resultStr := stringifyToolResult(result)
+		if h.OnToolResult != nil {
+			_ = h.OnToolResult(call.ID, call.Function.Name, "success", resultStr, "")
+		}
+		llmMessages = append(llmMessages, llm.Message{
+			Role:       "tool",
+			Content:    resultStr,
+			ToolCallID: call.ID,
+		})
+	}
+
+	return s.streamAnswer(ctx, llmMessages, h)
+}
+
+// streamAnswer streams the final reply and accumulates it for persistence.
+func (s *Service) streamAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler) (string, error) {
+	var full strings.Builder
+	err := s.streamLLM(ctx, llmMessages, func(delta string) error {
+		full.WriteString(delta)
+		if h.OnDelta != nil {
+			return h.OnDelta(delta)
+		}
+		return nil
+	})
+	return full.String(), err
+}
+
+// buildLLMMessages prepends the system prompt to the conversation history.
+func (s *Service) buildLLMMessages(messages []Message) []llm.Message {
 	llmMessages := make([]llm.Message, 0, len(messages)+1)
 	llmMessages = append(llmMessages, llm.Message{
 		Role:    "system",
@@ -183,7 +327,11 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 			Content: m.Content,
 		})
 	}
+	return llmMessages
+}
 
+// streamLLM streams the given llm messages and invokes onDelta per text delta.
+func (s *Service) streamLLM(ctx context.Context, llmMessages []llm.Message, onDelta func(string) error) error {
 	var deltaErr error
 	err := s.client.ChatStream(ctx, llmMessages, func(chunk llm.ChatChunk) {
 		if deltaErr != nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
@@ -205,6 +353,30 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 		return fmt.Errorf("LLM stream failed: %w", err)
 	}
 	return nil
+}
+
+// parseToolArguments decodes an OpenAI tool-call arguments string.
+func parseToolArguments(raw string) (map[string]interface{}, error) {
+	args := map[string]interface{}{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return args, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return nil, fmt.Errorf("invalid tool arguments: %w", err)
+	}
+	return args, nil
+}
+
+// stringifyToolResult renders a tool result for the LLM and SSE transport.
+func stringifyToolResult(result interface{}) string {
+	if result == nil {
+		return ""
+	}
+	if b, err := json.Marshal(result); err == nil {
+		return string(b)
+	}
+	return fmt.Sprintf("%v", result)
 }
 
 // isPlaceholderKey detects common placeholder/invalid API keys.

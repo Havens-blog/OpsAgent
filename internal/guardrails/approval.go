@@ -2,6 +2,9 @@
 package guardrails
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -58,11 +61,12 @@ func (r *ApprovalRequest) IsExpired() bool {
 
 // ApprovalState represents the state of an approval.
 type ApprovalState struct {
-	Granted      bool
-	GrantedAt    time.Time
-	Scope        ApprovalScope
-	ExpiresAt    time.Time
-	SessionID    string
+	Granted   bool
+	GrantedAt time.Time
+	Scope     ApprovalScope
+	ExpiresAt time.Time
+	SessionID string
+	ParamHash string
 }
 
 // IsExpired checks if the approval state has expired.
@@ -71,10 +75,12 @@ func (s *ApprovalState) IsExpired() bool {
 }
 
 // ApprovalStore defines the interface for storing and retrieving approvals.
+// The paramHash binds an approval to the exact parameter version that was
+// approved, so reusing an approval with different arguments is impossible.
 type ApprovalStore interface {
-	Grant(toolName string, scope ApprovalScope, sessionID string, expirySeconds int) error
-	Revoke(toolName string, sessionID string) error
-	IsValid(toolName string, sessionID string) (bool, *ApprovalState, error)
+	Grant(toolName string, scope ApprovalScope, sessionID string, paramHash string, expirySeconds int) error
+	Revoke(toolName string, sessionID string, paramHash string) error
+	IsValid(toolName string, sessionID string, paramHash string) (bool, *ApprovalState, error)
 	CleanExpired() error
 }
 
@@ -91,38 +97,39 @@ func NewMemoryApprovalStore() *MemoryApprovalStore {
 	}
 }
 
-// Grant grants approval for a tool.
-func (s *MemoryApprovalStore) Grant(toolName string, scope ApprovalScope, sessionID string, expirySeconds int) error {
+// Grant grants approval for a tool and parameter version.
+func (s *MemoryApprovalStore) Grant(toolName string, scope ApprovalScope, sessionID string, paramHash string, expirySeconds int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := s.makeKey(toolName, sessionID)
+	key := s.makeKey(toolName, sessionID, paramHash)
 	s.approvals[key] = &ApprovalState{
 		Granted:   true,
 		GrantedAt: time.Now(),
 		Scope:     scope,
 		ExpiresAt: time.Now().Add(time.Duration(expirySeconds) * time.Second),
 		SessionID: sessionID,
+		ParamHash: paramHash,
 	}
 	return nil
 }
 
-// Revoke revokes approval for a tool.
-func (s *MemoryApprovalStore) Revoke(toolName string, sessionID string) error {
+// Revoke revokes approval for a tool and parameter version.
+func (s *MemoryApprovalStore) Revoke(toolName string, sessionID string, paramHash string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := s.makeKey(toolName, sessionID)
+	key := s.makeKey(toolName, sessionID, paramHash)
 	delete(s.approvals, key)
 	return nil
 }
 
-// IsValid checks if approval is valid for a tool.
-func (s *MemoryApprovalStore) IsValid(toolName string, sessionID string) (bool, *ApprovalState, error) {
+// IsValid checks if approval is valid for a tool and parameter version.
+func (s *MemoryApprovalStore) IsValid(toolName string, sessionID string, paramHash string) (bool, *ApprovalState, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	key := s.makeKey(toolName, sessionID)
+	key := s.makeKey(toolName, sessionID, paramHash)
 	state, exists := s.approvals[key]
 	if !exists {
 		return false, nil, nil
@@ -150,9 +157,29 @@ func (s *MemoryApprovalStore) CleanExpired() error {
 	return nil
 }
 
-// makeKey creates a unique key for the approval.
-func (s *MemoryApprovalStore) makeKey(toolName, sessionID string) string {
-	return fmt.Sprintf("%s:%s", toolName, sessionID)
+// makeKey creates a unique key for the approval, bound to the parameter hash.
+func (s *MemoryApprovalStore) makeKey(toolName, sessionID, paramHash string) string {
+	return fmt.Sprintf("%s:%s:%s", toolName, sessionID, paramHash)
+}
+
+// paramHash computes a stable hash over the tool's parameters. json.Marshal
+// emits maps with sorted keys and no insignificant whitespace, which keeps the
+// hash independent of map iteration order.
+func paramHash(params map[string]interface{}) string {
+	if params == nil {
+		params = map[string]interface{}{}
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		b = []byte(fmt.Sprintf("%v", params))
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// ParamHash exposes the canonical parameter hash to other packages.
+func ParamHash(params map[string]interface{}) string {
+	return paramHash(params)
 }
 
 // ApprovalManager manages approval requests and states.
@@ -176,8 +203,10 @@ func (m *ApprovalManager) RequireApproval(req ApprovalRequest) error {
 		return fmt.Errorf("invalid approval request: %w", err)
 	}
 
-	// Check if approval already exists
-	isValid, state, err := m.store.IsValid(req.ToolName, req.SessionID)
+	ph := paramHash(req.Params)
+
+	// Check if approval already exists for this exact parameter version.
+	isValid, state, err := m.store.IsValid(req.ToolName, req.SessionID, ph)
 	if err != nil {
 		return fmt.Errorf("failed to check approval status: %w", err)
 	}
@@ -185,7 +214,7 @@ func (m *ApprovalManager) RequireApproval(req ApprovalRequest) error {
 	if isValid && state != nil {
 		// For one-shot scope, consume the approval
 		if state.Scope == ScopeOneShot {
-			return m.store.Revoke(req.ToolName, req.SessionID)
+			return m.store.Revoke(req.ToolName, req.SessionID, ph)
 		}
 		return nil
 	}
@@ -196,14 +225,26 @@ func (m *ApprovalManager) RequireApproval(req ApprovalRequest) error {
 	}
 }
 
-// GrantApproval grants approval for a tool.
+// GrantApproval grants approval for a tool without a parameter binding. Kept
+// for backward compatibility with callers that do not track parameters; it is
+// bound to an empty parameter hash and will never satisfy RequireApproval.
 func (m *ApprovalManager) GrantApproval(toolName string, scope ApprovalScope, sessionID string, expirySeconds int) error {
-	return m.store.Grant(toolName, scope, sessionID, expirySeconds)
+	return m.store.Grant(toolName, scope, sessionID, "", expirySeconds)
 }
 
-// RevokeApproval revokes approval for a tool.
+// RevokeApproval revokes approval for a tool without a parameter binding.
 func (m *ApprovalManager) RevokeApproval(toolName string, sessionID string) error {
-	return m.store.Revoke(toolName, sessionID)
+	return m.store.Revoke(toolName, sessionID, "")
+}
+
+// GrantApprovalWithHash grants approval bound to a specific parameter hash.
+func (m *ApprovalManager) GrantApprovalWithHash(toolName string, scope ApprovalScope, sessionID string, paramHash string, expirySeconds int) error {
+	return m.store.Grant(toolName, scope, sessionID, paramHash, expirySeconds)
+}
+
+// RevokeApprovalWithHash revokes approval bound to a specific parameter hash.
+func (m *ApprovalManager) RevokeApprovalWithHash(toolName string, sessionID string, paramHash string) error {
+	return m.store.Revoke(toolName, sessionID, paramHash)
 }
 
 // ApprovalRequiredError is returned when approval is required.
