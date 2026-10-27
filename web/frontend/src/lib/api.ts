@@ -80,14 +80,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return JSON.parse(text) as T
 }
 
-function processSSEEvent(
-  raw: string,
-  callbacks: {
-    onDelta: (content: string) => void
-    onDone: (messageId: string, conversationId: string) => void
-    onError: (message: string) => void
-  }
-) {
+export interface StreamCallbacks {
+  onDelta: (content: string) => void
+  onDone: (messageId: string, conversationId: string) => void
+  onError: (message: string) => void
+  onToolCall?: (event: ToolEvent) => void
+  onToolResult?: (event: ToolEvent) => void
+  onApprovalRequired?: (event: ApprovalRequiredEvent) => void
+  signal?: AbortSignal
+}
+
+function processSSEEvent(raw: string, callbacks: StreamCallbacks) {
   const line = raw.trim()
   if (!line.startsWith("data:")) return
   const data = line.slice(5).trim()
@@ -103,17 +106,34 @@ function processSSEEvent(
   if (event.type === "delta") callbacks.onDelta(event.content)
   else if (event.type === "done") callbacks.onDone(event.message_id, event.conversation_id)
   else if (event.type === "error") callbacks.onError(event.message)
+  else if (event.type === "tool_call")
+    callbacks.onToolCall?.({
+      call_id: event.call_id,
+      tool_name: event.tool_name,
+      params: event.params,
+      status: event.status as ToolEvent["status"],
+    })
+  else if (event.type === "tool_result")
+    callbacks.onToolResult?.({
+      call_id: event.call_id,
+      tool_name: event.tool_name,
+      status: event.status as ToolEvent["status"],
+      result: event.result,
+      error: event.error,
+    })
+  else if (event.type === "approval_required")
+    callbacks.onApprovalRequired?.({
+      approval_id: event.approval_id,
+      tool_name: event.tool_name,
+      params: event.params,
+      reason: event.reason,
+    })
 }
 
 async function sendMessageStream(
   conversationId: string,
   content: string,
-  callbacks: {
-    onDelta: (content: string) => void
-    onDone: (messageId: string, conversationId: string) => void
-    onError: (message: string) => void
-    signal?: AbortSignal
-  }
+  callbacks: StreamCallbacks
 ): Promise<void> {
   const res = await fetch(
     `${API_BASE}/api/v1/conversations/${conversationId}/messages`,
@@ -361,10 +381,64 @@ export interface ConversationMessage {
   created_at: string
 }
 
+export interface ToolEvent {
+  call_id: string
+  tool_name: string
+  params?: Record<string, unknown>
+  status: "running" | "success" | "failed"
+  result?: string
+  error?: string
+}
+
+export interface ApprovalRequiredEvent {
+  approval_id: string
+  tool_name: string
+  params: Record<string, unknown>
+  reason: string
+}
+
+export interface Approval {
+  approval_id: string
+  tool_name: string
+  params: Record<string, unknown>
+  reason: string
+  conversation_id: string
+  tenant_id: number
+  user_id: number
+  param_hash: string
+  scope: string
+  expiry_seconds: number
+  expires_at: string
+  status: string
+  created_at: string
+}
+
 export type StreamEvent =
   | { type: "delta"; content: string }
   | { type: "done"; message_id: string; conversation_id: string }
   | { type: "error"; message: string }
+  | {
+      type: "tool_call"
+      call_id: string
+      tool_name: string
+      params: Record<string, unknown>
+      status: string
+    }
+  | {
+      type: "tool_result"
+      call_id: string
+      tool_name: string
+      status: string
+      result?: string
+      error?: string
+    }
+  | {
+      type: "approval_required"
+      approval_id: string
+      tool_name: string
+      params: Record<string, unknown>
+      reason: string
+    }
 
 /* ---------- LLM config types ---------- */
 
@@ -619,4 +693,17 @@ export const api = {
     request<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
 
   sendMessageStream,
+
+  listApprovals: () =>
+    request<{ approvals: Approval[]; count: number }>("/api/v1/approvals"),
+
+  approveApproval: (id: string) =>
+    request<{ status: string }>(`/api/v1/approvals/${id}/approve`, {
+      method: "POST",
+    }),
+
+  rejectApproval: (id: string) =>
+    request<{ status: string }>(`/api/v1/approvals/${id}/reject`, {
+      method: "POST",
+    }),
 }

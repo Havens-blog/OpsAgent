@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/Havens-blog/OpsAgent/internal/chat"
+	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 )
 
@@ -24,11 +25,19 @@ type sendMessageRequest struct {
 
 // sseEvent is the JSON payload carried on each SSE "data:" line.
 type sseEvent struct {
-	Type           string `json:"type"`
-	Content        string `json:"content,omitempty"`
-	Message        string `json:"message,omitempty"`
-	MessageID      string `json:"message_id,omitempty"`
-	ConversationID string `json:"conversation_id,omitempty"`
+	Type           string                 `json:"type"`
+	Content        string                 `json:"content,omitempty"`
+	Message        string                 `json:"message,omitempty"`
+	MessageID      string                 `json:"message_id,omitempty"`
+	ConversationID string                 `json:"conversation_id,omitempty"`
+	CallID         string                 `json:"call_id,omitempty"`
+	ToolName       string                 `json:"tool_name,omitempty"`
+	Params         map[string]interface{} `json:"params,omitempty"`
+	Status         string                 `json:"status,omitempty"`
+	Result         string                 `json:"result,omitempty"`
+	Error          string                 `json:"error,omitempty"`
+	ApprovalID     string                 `json:"approval_id,omitempty"`
+	Reason         string                 `json:"reason,omitempty"`
 }
 
 // writeSSE writes one SSE event and flushes when the writer supports it.
@@ -219,12 +228,72 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	ctx := r.Context()
-	var full strings.Builder
-	err = chatSvc.ChatStream(ctx, messages, func(delta string) error {
-		full.WriteString(delta)
-		return s.writeSSE(w, sseEvent{Type: "delta", Content: delta})
-	})
+	ctx := withSessionID(r.Context(), id)
+
+	handler := chat.StreamHandler{
+		OnDelta: func(delta string) error {
+			return s.writeSSE(w, sseEvent{Type: "delta", Content: delta})
+		},
+		OnToolCall: func(callID string, name string, params map[string]interface{}) error {
+			return s.writeSSE(w, sseEvent{
+				Type:     "tool_call",
+				CallID:   callID,
+				ToolName: name,
+				Params:   params,
+				Status:   "running",
+			})
+		},
+		OnToolResult: func(callID string, name string, status string, result string, errMsg string) error {
+			return s.writeSSE(w, sseEvent{
+				Type:     "tool_result",
+				CallID:   callID,
+				ToolName: name,
+				Status:   status,
+				Result:   result,
+				Error:    errMsg,
+			})
+		},
+		OnApprovalRequired: func(req guardrails.ApprovalRequest) error {
+			approvalID := uuid.New().String()
+			expiry := req.ExpirySeconds
+			if expiry <= 0 {
+				expiry = 300
+			}
+			scope := req.Scope
+			if scope == "" {
+				scope = guardrails.ScopeOneShot
+			}
+			now := time.Now()
+
+			pending := &PendingApproval{
+				ApprovalID:     approvalID,
+				ToolName:       req.ToolName,
+				Params:         req.Params,
+				Reason:         req.Reason,
+				ConversationID: id,
+				TenantID:       EIAMTenantID(ctx),
+				UserID:         EIAMUID(ctx),
+				ParamHash:      guardrails.ParamHash(req.Params),
+				Scope:          scope,
+				ExpirySeconds:  expiry,
+				ExpiresAt:      now.Add(time.Duration(expiry) * time.Second),
+				Status:         "pending",
+				CreatedAt:      now,
+			}
+			if err := s.pendingApprovals.Create(pending); err != nil {
+				return err
+			}
+			return s.writeSSE(w, sseEvent{
+				Type:       "approval_required",
+				ApprovalID: approvalID,
+				ToolName:   req.ToolName,
+				Params:     req.Params,
+				Reason:     req.Reason,
+			})
+		},
+	}
+
+	fullText, err := chatSvc.StreamWithTools(ctx, messages, handler)
 
 	if err != nil {
 		// Client disconnection cancels the request; there is no peer left to
@@ -238,7 +307,7 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 	assistantMsg := &chat.Message{
 		ID:        uuid.New().String(),
 		Role:      "assistant",
-		Content:   full.String(),
+		Content:   fullText,
 		CreatedAt: time.Now(),
 	}
 	if err := s.conversationStore.AddMessage(ctx, id, assistantMsg); err != nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/change"
 	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/config"
+	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 	"github.com/Havens-blog/OpsAgent/internal/rca"
 	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
@@ -70,6 +71,11 @@ type APIServer struct {
 	// while chat requests read it concurrently.
 	chatMu      sync.RWMutex
 	chatService *chat.Service
+
+	// Approval state shared between tool execution and the approval HTTP
+	// endpoints, plus the pending-approval store surfaced by those endpoints.
+	approvalMgr      *guardrails.ApprovalManager
+	pendingApprovals *PendingApprovalStore
 
 	// agentMeta holds display metadata for registered agents (keyed by id).
 	agentMeta map[string]*agentEntry
@@ -163,6 +169,15 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		)
 	}
 
+	// Approval state and pending-approval store are shared between the chat
+	// tool-execution path and the approval HTTP endpoints.
+	approvalMgr := guardrails.NewApprovalManager(nil)
+	pendingApprovals := NewPendingApprovalStore()
+	if chatService != nil {
+		provider := newRegistryToolProvider(buildChatToolRegistry(), settings.DataSources, approvalMgr)
+		chatService.SetToolProvider(provider)
+	}
+
 	// Bearer token for /api/v1/* access. Read from env (single source of
 	// truth shared with the frontend proxy). Empty => enforcement disabled.
 	apiAuthToken := strings.TrimSpace(os.Getenv("API_AUTH_TOKEN"))
@@ -203,6 +218,8 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		rcaStore:          rcaStore,
 		conversationStore: chat.NewMemoryConversationStore(),
 		chatService:       chatService,
+		approvalMgr:       approvalMgr,
+		pendingApprovals:  pendingApprovals,
 		auditLog:          newRecentAuditLog(100),
 	}
 
@@ -282,6 +299,10 @@ func (s *APIServer) setupRoutes() {
 	s.router.HandleFunc("/api/v1/chat", s.protected(s.chatHandler))
 	s.router.HandleFunc("/api/v1/conversations", s.protected(s.conversationsHandler))
 	s.router.HandleFunc("/api/v1/conversations/", s.protected(s.conversationHandler))
+
+	// Tool-execution approvals
+	s.router.HandleFunc("/api/v1/approvals", s.protected(s.approvalsHandler))
+	s.router.HandleFunc("/api/v1/approvals/", s.protected(s.approvalHandler))
 
 	// LLM provider catalog and configuration
 	s.router.HandleFunc("/api/v1/providers", s.protected(s.providersHandler))

@@ -82,7 +82,7 @@ func TestApprovalManager(t *testing.T) {
 		}
 
 		// Validate approval
-		isValid, _, _ := mgr.store.IsValid("restart-service", "")
+		isValid, _, _ := mgr.store.IsValid("restart-service", "", "")
 		if !isValid {
 			t.Error("Expected valid approval")
 		}
@@ -98,7 +98,7 @@ func TestApprovalManager(t *testing.T) {
 		time.Sleep(2 * time.Second)
 
 		// Should be expired
-		isValid, _, _ := mgr.store.IsValid("test-tool", "")
+		isValid, _, _ := mgr.store.IsValid("test-tool", "", "")
 		if isValid {
 			t.Error("Expected approval to be expired")
 		}
@@ -113,9 +113,36 @@ func TestApprovalManager(t *testing.T) {
 		mgr.RevokeApproval("test-tool", "")
 
 		// Should be invalid
-		isValid, _, _ := mgr.store.IsValid("test-tool", "")
+		isValid, _, _ := mgr.store.IsValid("test-tool", "", "")
 		if isValid {
 			t.Error("Expected approval to be revoked")
+		}
+	})
+
+	t.Run("param_version_binding", func(t *testing.T) {
+		mgr := NewApprovalManager(nil)
+
+		paramsA := map[string]interface{}{"service": "order-service", "count": 1}
+		paramsB := map[string]interface{}{"service": "order-service", "count": 2}
+
+		// Grant approval for params A.
+		if err := mgr.GrantApprovalWithHash("restart-service", ScopeOneShot, "session-1", ParamHash(paramsA), 300); err != nil {
+			t.Fatalf("grant A: %v", err)
+		}
+
+		// Same params should pass (and consume the one-shot grant).
+		if err := mgr.RequireApproval(ApprovalRequest{
+			ToolName: "restart-service", Operation: "restart", Params: paramsA, Scope: ScopeOneShot, SessionID: "session-1",
+		}); err != nil {
+			t.Fatalf("params A should be pre-approved, got %v", err)
+		}
+
+		// Different params must require approval again.
+		err := mgr.RequireApproval(ApprovalRequest{
+			ToolName: "restart-service", Operation: "restart", Params: paramsB, Scope: ScopeOneShot, SessionID: "session-1",
+		})
+		if !ApprovalRequired(err) {
+			t.Fatalf("params B must re-trigger approval, got %v", err)
 		}
 	})
 }
