@@ -38,6 +38,7 @@ interface ApprovalState {
   params: Record<string, unknown>
   reason: string
   content: string
+  clientMessageId?: string
   decision?: "approved" | "rejected"
 }
 
@@ -174,7 +175,11 @@ export default function ChatPage() {
     }
   }
 
-  async function runStream(content: string, opts: { skipUserEcho?: boolean } = {}) {
+  async function runStream(
+    content: string,
+    opts: { skipUserEcho?: boolean; clientMessageId?: string } = {}
+  ) {
+    const clientMessageId = opts.clientMessageId ?? crypto.randomUUID()
     let conversationId = activeId
     if (!conversationId) {
       try {
@@ -284,13 +289,14 @@ export default function ChatPage() {
                       params: ev.params,
                       reason: ev.reason,
                       content,
+                      clientMessageId,
                     },
                   }
                 : m
             )
           )
         },
-      })
+      }, clientMessageId)
     } catch (err) {
       if (isAbortError(err)) {
         setMessages((prev) =>
@@ -347,7 +353,10 @@ export default function ChatPage() {
     )
 
     if (action === "approve") {
-      await runStream(approval.content, { skipUserEcho: true })
+      await runStream(approval.content, {
+        skipUserEcho: true,
+        clientMessageId: approval.clientMessageId,
+      })
     }
   }
 

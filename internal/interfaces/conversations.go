@@ -20,7 +20,8 @@ type createConversationRequest struct {
 }
 
 type sendMessageRequest struct {
-	Content string `json:"content"`
+	Content         string `json:"content"`
+	ClientMessageID string `json:"client_message_id,omitempty"`
 }
 
 // sseEvent is the JSON payload carried on each SSE "data:" line.
@@ -200,21 +201,40 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 
-	userMsg := &chat.Message{
-		ID:        uuid.New().String(),
-		Role:      "user",
-		Content:   content,
-		CreatedAt: time.Now(),
-	}
-	if err := s.conversationStore.AddMessage(r.Context(), id, userMsg); err != nil {
-		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to persist message", err.Error())
-		return
-	}
-
 	history, err := s.conversationStore.ListMessages(r.Context(), id)
 	if err != nil {
 		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to load history", err.Error())
 		return
+	}
+
+	alreadyPersisted := false
+	for _, m := range history {
+		if req.ClientMessageID != "" && m.Role == "user" && m.ClientMessageID == req.ClientMessageID {
+			alreadyPersisted = true
+			break
+		}
+	}
+
+	// A retry after an approval carries the same client_message_id as the
+	// original send; reuse the already-persisted user message instead of
+	// appending a duplicate.
+	if req.ClientMessageID == "" || !alreadyPersisted {
+		userMsg := &chat.Message{
+			ID:              uuid.New().String(),
+			Role:            "user",
+			Content:         content,
+			ClientMessageID: req.ClientMessageID,
+			CreatedAt:       time.Now(),
+		}
+		if err := s.conversationStore.AddMessage(r.Context(), id, userMsg); err != nil {
+			s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to persist message", err.Error())
+			return
+		}
+		history, err = s.conversationStore.ListMessages(r.Context(), id)
+		if err != nil {
+			s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to load history", err.Error())
+			return
+		}
 	}
 
 	messages := make([]chat.Message, 0, len(history))
