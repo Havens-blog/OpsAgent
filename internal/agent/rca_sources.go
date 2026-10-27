@@ -293,14 +293,29 @@ type pinger interface {
 // progressive-enhancement fallback supplies the mock instead. This is what
 // makes active["metrics"/"topology"/"changes"]=true mean "verified reachable"
 // rather than merely "constructed", matching the log path's Connect semantics.
+//
+// 探测带 3 次退避重试(总预算 ~24s):同机 dev 编排下 e-cam/SLS 等依赖可能与
+// 本进程同时重启,首探落在对端编译窗口会误判"不可达"并粘滞整个进程生命周期
+// (实测 2026-10-27:opsagent 启动先于 e-cam 就绪,logs_real=false 且当日 RCA
+// 日志维度全空)。
 func pingOK(src interface{}) bool {
 	p, ok := src.(pinger)
 	if !ok {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return p.Ping(ctx) == nil
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(6 * time.Second)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := p.Ping(ctx)
+		cancel()
+		if err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // CreateRCASources creates all RCA data sources from configuration. Only the
