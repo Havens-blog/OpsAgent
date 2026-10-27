@@ -27,10 +27,11 @@ import (
 //     "no logs" is a legitimate answer, not a failure;
 //   - the bearer token is sent per request and never logged.
 type ECamLogSource struct {
-	endpoint string // e.g. http://127.0.0.1:8001 (no trailing slash)
-	token    string // bearer JWT (e-cam service token, HS256)
-	logType  string // federation log type; default "app"
-	client   *http.Client
+	endpoint      string // e.g. http://127.0.0.1:8001 (no trailing slash)
+	token         string // bearer JWT (static fallback when no token provider)
+	tokenProvider TokenProvider
+	logType       string // federation log type; default "app"
+	client        *http.Client
 }
 
 // NewECamLogSource builds an e-cam federation log source. logType may be empty
@@ -48,6 +49,21 @@ func NewECamLogSource(endpoint, token, logType string, timeout time.Duration) *E
 		logType:  logType,
 		client:   &http.Client{Timeout: timeout},
 	}
+}
+
+// WithTokenProvider 注入 S2S 令牌换取器（client_credentials）。
+// 未注入时回退静态 token（向后兼容 mktok 会话令牌）。
+func (s *ECamLogSource) WithTokenProvider(p TokenProvider) *ECamLogSource {
+	s.tokenProvider = p
+	return s
+}
+
+// bearerToken 返回本次请求的 Bearer 令牌：优先 tokenProvider 换取，否则静态 token。
+func (s *ECamLogSource) bearerToken(ctx context.Context) (string, error) {
+	if s.tokenProvider != nil {
+		return s.tokenProvider.TokenFor(ctx)
+	}
+	return s.token, nil
 }
 
 // ecamFieldFilter mirrors the e-cam search filter wire format.
@@ -73,14 +89,14 @@ type ecamSearchRequest struct {
 // and meta are present for application logs but may be empty (missing is
 // carried through as missing — never invented).
 type ecamLogEntry struct {
-	Timestamp int64           `json:"timestamp"` // Unix ms UTC
-	Service   string          `json:"service"`
-	Level     string          `json:"level"`
-	Message   string          `json:"message"`
-	Exception string          `json:"exception"`
-	TraceID   string          `json:"trace_id"`
-	Meta      ecamEntryMeta   `json:"meta"`
-	Raw       map[string]any  `json:"raw,omitempty"`
+	Timestamp int64          `json:"timestamp"` // Unix ms UTC
+	Service   string         `json:"service"`
+	Level     string         `json:"level"`
+	Message   string         `json:"message"`
+	Exception string         `json:"exception"`
+	TraceID   string         `json:"trace_id"`
+	Meta      ecamEntryMeta  `json:"meta"`
+	Raw       map[string]any `json:"raw,omitempty"`
 }
 
 // ecamEntryMeta identifies the originating store/cloud.
@@ -192,7 +208,11 @@ func (s *ECamLogSource) Ping(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ecam log source: build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	tok, err := s.bearerToken(ctx)
+	if err != nil {
+		return fmt.Errorf("ecam log source: get token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("ecam log source: ping %s: %w", s.endpoint, err)
@@ -235,7 +255,11 @@ func (s *ECamLogSource) post(ctx context.Context, path string, body any, out any
 		return fmt.Errorf("ecam log source: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	tok, err := s.bearerToken(ctx)
+	if err != nil {
+		return fmt.Errorf("ecam log source: get token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("ecam log source: POST %s: %w", path, err)

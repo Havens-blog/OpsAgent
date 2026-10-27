@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	dscore "github.com/Havens-blog/OpsAgent/internal/datasource/core"
@@ -57,10 +58,24 @@ func NewDataSourceConfigFromEnv() *DataSourceConfig {
 		K8sNamespace:       os.Getenv("K8S_NAMESPACE"),
 		ECamEndpoint:       os.Getenv("ECAM_LOGQUERY_ENDPOINT"),
 		ECamToken:          os.Getenv("ECAM_LOGQUERY_TOKEN"),
+		ECamTokenURL:       os.Getenv("ECAM_LOGQUERY_TOKEN_URL"),
+		ECamClientID:       os.Getenv("ECAM_LOGQUERY_CLIENT_ID"),
+		ECamClientSecret:   os.Getenv("ECAM_LOGQUERY_CLIENT_SECRET"),
+		ECamTenantID:       envInt64("ECAM_LOGQUERY_TENANT_ID"),
 		ECamLogType:        os.Getenv("ECAM_LOGQUERY_LOG_TYPE"),
 		ECamTimeout:        os.Getenv("ECAM_LOGQUERY_TIMEOUT"),
 		LogSources:         logSourcesFromEnv(),
 	}
+}
+
+// envInt64 读取环境变量并解析为 int64，缺省/非法返回 0。
+func envInt64(name string) int64 {
+	if v := os.Getenv(name); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // logSourcesFromEnv assembles the multi-cloud log source list from the
@@ -148,9 +163,14 @@ type DataSourceConfig struct {
 	// (/api/v1/cam/logs). Activates the app-log dimension across every cloud
 	// account e-cam federates, without any cloud SDK credentials here.
 	ECamEndpoint string
-	ECamToken    string
-	ECamLogType  string // default "app"
-	ECamTimeout  string // Go duration; default "30s"
+	ECamToken    string // static bearer fallback (mktok session token)
+	// S2S client_credentials 配置：配置后优先用 eiam 换取携带租户的令牌，取代静态 token。
+	ECamTokenURL     string
+	ECamClientID     string
+	ECamClientSecret string
+	ECamTenantID     int64  // S2S 令牌绑定的租户（eiam 校验 allowed_tenants）
+	ECamLogType      string // default "app"
+	ECamTimeout      string // Go duration; default "30s"
 	// LogSources lists the cloud log backends to query. Multiple entries are
 	// queried concurrently and merged (multi-cloud aggregation). Empty => mock.
 	LogSources []LogSourceConfig
@@ -164,7 +184,7 @@ type LogSourceConfig struct {
 	// this source so RCA can tell which cloud a line came from.
 	Name string
 	// Type is the data source type: "aliyun_sls" or "volcengine_tls".
-	Type string
+	Type            string
 	Endpoint        string
 	Region          string // TLS only
 	Project         string // SLS only
@@ -224,6 +244,11 @@ func buildLogSources(cfg *DataSourceConfig) sources.LogSource {
 			}
 		}
 		ecam := sources.NewECamLogSource(cfg.ECamEndpoint, cfg.ECamToken, cfg.ECamLogType, timeout)
+		if cfg.ECamTokenURL != "" {
+			ecam.WithTokenProvider(sources.NewServiceTokenProvider(
+				cfg.ECamTokenURL, cfg.ECamClientID, cfg.ECamClientSecret, cfg.ECamTenantID,
+			))
+		}
 		if pingOK(ecam) {
 			named = append(named, sources.NamedLogSource{Name: "e-cam-federation", Source: ecam})
 		}
