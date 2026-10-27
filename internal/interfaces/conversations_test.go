@@ -243,6 +243,93 @@ func TestSendMessageStreaming(t *testing.T) {
 	}
 }
 
+// sendMessageWithClientID POSTs a message to the handler and returns the raw
+// SSE body, failing the test on a non-200 response.
+func sendMessageWithClientID(t *testing.T, server *APIServer, convID, content, clientMessageID string) string {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{
+		"content":           content,
+		"client_message_id": clientMessageID,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/conversations/"+convID+"/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("send message status %d body %s", w.Code, w.Body.String())
+	}
+	return w.Body.String()
+}
+
+// TestSendMessageIdempotentByClientMessageID verifies a resent message with the
+// same client_message_id does not duplicate the persisted user message.
+func TestSendMessageIdempotentByClientMessageID(t *testing.T) {
+	server := newConversationServer(t, &fakeChatClient{
+		chunks: []llm.ChatChunk{
+			{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "你"}}}},
+			{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "好"}}}},
+		},
+	})
+	id := createConversation(t, server, "idempotent")
+
+	sendMessageWithClientID(t, server, id, "hello", "cid-1")
+	sendMessageWithClientID(t, server, id, "hello", "cid-1")
+
+	msgs, err := server.conversationStore.ListMessages(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+
+	users := 0
+	for _, m := range msgs {
+		if m.Role != "user" {
+			continue
+		}
+		users++
+		if m.ClientMessageID != "cid-1" {
+			t.Fatalf("user client_message_id = %q, want cid-1", m.ClientMessageID)
+		}
+	}
+	if users != 1 {
+		t.Fatalf("user messages = %d, want 1; messages = %+v", users, msgs)
+	}
+	// First send persists user + assistant; the idempotent retry persists only a
+	// second assistant reply, never a second user message.
+	if len(msgs) != 3 {
+		t.Fatalf("total messages = %d, want 3 (1 user + 2 assistant); messages = %+v", len(msgs), msgs)
+	}
+}
+
+// TestSendMessageDifferentClientMessageIDAppends verifies distinct
+// client_message_id values persist distinct user messages.
+func TestSendMessageDifferentClientMessageIDAppends(t *testing.T) {
+	server := newConversationServer(t, &fakeChatClient{
+		chunks: []llm.ChatChunk{
+			{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "你"}}}},
+			{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "好"}}}},
+		},
+	})
+	id := createConversation(t, server, "distinct")
+
+	sendMessageWithClientID(t, server, id, "hello", "cid-1")
+	sendMessageWithClientID(t, server, id, "hello", "cid-2")
+
+	msgs, err := server.conversationStore.ListMessages(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+
+	users := 0
+	for _, m := range msgs {
+		if m.Role == "user" {
+			users++
+		}
+	}
+	if users != 2 {
+		t.Fatalf("user messages = %d, want 2; messages = %+v", users, msgs)
+	}
+}
+
 // TestSendMessageError verifies an LLM error is reported as an SSE error event
 // (HTTP remains 200) and no assistant message is persisted.
 func TestSendMessageError(t *testing.T) {

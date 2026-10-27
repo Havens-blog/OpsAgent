@@ -65,11 +65,12 @@ func (s *Service) SetToolProvider(p ToolProvider) {
 
 // Message represents a chat message, both as LLM input and persisted history.
 type Message struct {
-	ID             string    `json:"id,omitempty"`
-	ConversationID string    `json:"conversation_id,omitempty"`
-	Role           string    `json:"role"` // "user" or "assistant"
-	Content        string    `json:"content"`
-	CreatedAt      time.Time `json:"created_at,omitempty"`
+	ID              string    `json:"id,omitempty"`
+	ConversationID  string    `json:"conversation_id,omitempty"`
+	Role            string    `json:"role"` // "user" or "assistant"
+	Content         string    `json:"content"`
+	ClientMessageID string    `json:"client_message_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at,omitempty"`
 }
 
 // NewService creates a new chat service from LLM configuration.

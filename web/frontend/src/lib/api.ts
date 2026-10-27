@@ -133,14 +133,18 @@ function processSSEEvent(raw: string, callbacks: StreamCallbacks) {
 async function sendMessageStream(
   conversationId: string,
   content: string,
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  clientMessageId?: string
 ): Promise<void> {
   const res = await fetch(
     `${API_BASE}/api/v1/conversations/${conversationId}/messages`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({
+        content,
+        ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
+      }),
       cache: "no-store",
       credentials: "same-origin",
       signal: callbacks.signal,
