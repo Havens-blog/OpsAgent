@@ -67,6 +67,9 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
       body,
       cache: "no-store",
       redirect: "manual",
+      // Propagate client disconnects (e.g. the chat "stop" button) upstream so
+      // the Go backend cancels the LLM stream instead of running it to the end.
+      signal: request.signal,
     })
   } catch (err) {
     return new Response(
@@ -81,10 +84,19 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
     )
   }
 
-  const resBody = await res.arrayBuffer()
   const resHeaders = new Headers()
-  const resCt = res.headers.get("content-type")
+  const resCt = res.headers.get("content-type") || ""
   if (resCt) resHeaders.set("content-type", resCt)
+
+  // Stream SSE responses byte-for-byte instead of buffering them, so deltas
+  // reach the browser as the backend emits them.
+  if (resCt.includes("text/event-stream") && res.body) {
+    const cacheControl = res.headers.get("cache-control")
+    if (cacheControl) resHeaders.set("cache-control", cacheControl)
+    return new Response(res.body, { status: res.status, headers: resHeaders })
+  }
+
+  const resBody = await res.arrayBuffer()
   return new Response(resBody, { status: res.status, headers: resHeaders })
 }
 

@@ -1,0 +1,254 @@
+// Package interfaces provides HTTP handlers for the OpsAgent API.
+package interfaces
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/Havens-blog/OpsAgent/internal/chat"
+	"github.com/Havens-blog/OpsAgent/internal/observability"
+)
+
+type createConversationRequest struct {
+	Title string `json:"title"`
+}
+
+type sendMessageRequest struct {
+	Content string `json:"content"`
+}
+
+// sseEvent is the JSON payload carried on each SSE "data:" line.
+type sseEvent struct {
+	Type           string `json:"type"`
+	Content        string `json:"content,omitempty"`
+	Message        string `json:"message,omitempty"`
+	MessageID      string `json:"message_id,omitempty"`
+	ConversationID string `json:"conversation_id,omitempty"`
+}
+
+// writeSSE writes one SSE event and flushes when the writer supports it.
+func (s *APIServer) writeSSE(w http.ResponseWriter, ev sseEvent) error {
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+// conversationsHandler dispatches the collection endpoints.
+func (s *APIServer) conversationsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listConversationsHandler(w, r)
+	case http.MethodPost:
+		s.createConversationHandler(w, r)
+	default:
+		s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
+	}
+}
+
+// conversationHandler dispatches the single-conversation endpoints.
+func (s *APIServer) conversationHandler(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/conversations/"), "/")
+	parts := strings.Split(rest, "/")
+
+	if len(parts) == 1 && parts[0] != "" {
+		switch r.Method {
+		case http.MethodGet:
+			s.getConversationHandler(w, r, parts[0])
+		case http.MethodDelete:
+			s.deleteConversationHandler(w, r, parts[0])
+		default:
+			s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
+		}
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "messages" && parts[0] != "" {
+		if r.Method != http.MethodPost {
+			s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
+			return
+		}
+		s.sendMessageHandler(w, r, parts[0])
+		return
+	}
+
+	s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Conversation endpoint not found", r.URL.Path)
+}
+
+// createConversationHandler handles POST /api/v1/conversations.
+func (s *APIServer) createConversationHandler(w http.ResponseWriter, r *http.Request) {
+	var req createConversationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
+		return
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		title = "新对话"
+	}
+
+	now := time.Now()
+	conv := &chat.Conversation{
+		ID:        uuid.New().String(),
+		TenantID:  EIAMTenantID(r.Context()),
+		UserID:    EIAMUID(r.Context()),
+		Title:     title,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := s.conversationStore.Create(r.Context(), conv); err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to create conversation", err.Error())
+		return
+	}
+
+	s.writeJSONResponse(w, http.StatusCreated, map[string]interface{}{
+		"conversation": conv,
+	})
+}
+
+// listConversationsHandler handles GET /api/v1/conversations.
+func (s *APIServer) listConversationsHandler(w http.ResponseWriter, r *http.Request) {
+	convs, err := s.conversationStore.List(r.Context())
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to list conversations", err.Error())
+		return
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"conversations": convs,
+		"count":         len(convs),
+	})
+}
+
+// getConversationHandler handles GET /api/v1/conversations/{id}.
+func (s *APIServer) getConversationHandler(w http.ResponseWriter, r *http.Request, id string) {
+	conv, err := s.conversationStore.Get(r.Context(), id)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Conversation not found", err.Error())
+		return
+	}
+
+	messages, err := s.conversationStore.ListMessages(r.Context(), id)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Conversation messages not found", err.Error())
+		return
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"conversation": conv,
+		"messages":     messages,
+	})
+}
+
+// deleteConversationHandler handles DELETE /api/v1/conversations/{id}.
+func (s *APIServer) deleteConversationHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if err := s.conversationStore.Delete(r.Context(), id); err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Conversation not found", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// sendMessageHandler handles POST /api/v1/conversations/{id}/messages as SSE.
+func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, id string) {
+	var req sendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
+		return
+	}
+
+	content := strings.TrimSpace(req.Content)
+	if content == "" {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Content is required", "")
+		return
+	}
+
+	// Conversation must exist and belong to the ctx tenant.
+	if _, err := s.conversationStore.Get(r.Context(), id); err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Conversation not found", err.Error())
+		return
+	}
+
+	// Snapshot the chat service before streaming.
+	chatSvc := s.getChatService()
+	if chatSvc == nil || !chatSvc.IsAvailable() {
+		s.writeErrorResponse(w, http.StatusServiceUnavailable, "service_unavailable",
+			"Chat service not available. Please configure LLM_API_KEY in config/settings.yaml or environment variables.", "")
+		return
+	}
+
+	userMsg := &chat.Message{
+		ID:        uuid.New().String(),
+		Role:      "user",
+		Content:   content,
+		CreatedAt: time.Now(),
+	}
+	if err := s.conversationStore.AddMessage(r.Context(), id, userMsg); err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to persist message", err.Error())
+		return
+	}
+
+	history, err := s.conversationStore.ListMessages(r.Context(), id)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to load history", err.Error())
+		return
+	}
+
+	messages := make([]chat.Message, 0, len(history))
+	for _, m := range history {
+		messages = append(messages, chat.Message{Role: m.Role, Content: m.Content})
+	}
+
+	// SSE headers are set before any streaming output is written.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ctx := r.Context()
+	var full strings.Builder
+	err = chatSvc.ChatStream(ctx, messages, func(delta string) error {
+		full.WriteString(delta)
+		return s.writeSSE(w, sseEvent{Type: "delta", Content: delta})
+	})
+
+	if err != nil {
+		// Client disconnection cancels the request; there is no peer left to
+		// receive an error event, so just stop without persisting a reply.
+		if ctx.Err() == nil {
+			_ = s.writeSSE(w, sseEvent{Type: "error", Message: err.Error()})
+		}
+		return
+	}
+
+	assistantMsg := &chat.Message{
+		ID:        uuid.New().String(),
+		Role:      "assistant",
+		Content:   full.String(),
+		CreatedAt: time.Now(),
+	}
+	if err := s.conversationStore.AddMessage(ctx, id, assistantMsg); err != nil {
+		s.logger.Error("Failed to persist assistant message",
+			observability.String("conversation_id", id),
+			observability.Err(err),
+		)
+		_ = s.writeSSE(w, sseEvent{Type: "error", Message: "failed to persist assistant message"})
+		return
+	}
+
+	_ = s.writeSSE(w, sseEvent{Type: "done", MessageID: assistantMsg.ID, ConversationID: id})
+}
