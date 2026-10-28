@@ -72,7 +72,8 @@ func (s *APIServer) initAgents() {
 	// K8S_*/e-cam credentials), the endpoint returns an empty list with a hint
 	// and NEVER queries the fallback — no mock record may reach the console.
 	s.changeSource = rcaSources.ChangeSource
-	s.changeSourceReal = active["changes"]	s.logger.Info("RCA data sources configured",
+	s.changeSourceReal = active["changes"]
+	s.logger.Info("RCA data sources configured",
 		observability.Bool("metrics_real", active["metrics"]),
 		observability.Bool("topology_real", active["topology"]),
 		observability.Bool("changes_real", active["changes"]),
