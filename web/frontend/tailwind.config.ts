@@ -60,6 +60,27 @@ const config: Config = {
         'text-tertiary': 'hsl(var(--text-tertiary))',
         'accent-blue': 'hsl(var(--accent-blue))',
         'accent-purple': 'hsl(var(--accent-purple))',
+        // Design variables (globals.css): page/surface tiers + primary states.
+        page: 'hsl(var(--bg-page))',
+        subtle: 'hsl(var(--bg-subtle))',
+        tertiary: 'hsl(var(--text-tertiary))',
+        'primary-soft': 'hsl(var(--primary-soft))',
+        'primary-border': 'hsl(var(--primary-border))',
+        'primary-hover': 'hsl(var(--primary-hover))',
+        // Status colors: state only, never type decoration.
+        warning: {
+          DEFAULT: 'hsl(var(--warning))',
+          soft: 'hsl(var(--warning-soft))',
+          border: 'hsl(var(--warning-border))',
+        },
+        success: {
+          DEFAULT: 'hsl(var(--success))',
+          soft: 'hsl(var(--success-soft))',
+        },
+        danger: {
+          DEFAULT: 'hsl(var(--danger))',
+          soft: 'hsl(var(--danger-soft))',
+        },
         // Severity colors for incidents
         severity: {
           p0: 'hsl(0, 84%, 60%)',    // Red

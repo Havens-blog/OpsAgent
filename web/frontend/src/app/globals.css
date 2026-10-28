@@ -3,46 +3,63 @@
 @tailwind utilities;
 
 @layer base {
+  /* 设计变量表（深色，默认）。语义 token：页面/表面/文字/主色/状态色。
+     组件只引用变量，深浅两套按同一语义派生，不再按主题写第二份颜色。 */
   :root {
-    /* Linear design system — aligned to haven-console theme-variables.scss.
-       Backgrounds (near-black, 3 surface tiers) */
-    --background: 240 6% 4%;        /* #08090a bg-base/page */
-    --card: 240 5% 9%;             /* #191a1b bg-surface */
-    --popover: 240 5% 9%;          /* #191a1b dialog/dropdown */
+    /* 背景与表面：页面底 < 表面 < 悬停，层次靠背景与边框 */
+    --background: 222 24% 8%;      /* 页面底 */
+    --bg-page: 222 24% 8%;         /* 页面底（同 --background） */
+    --card: 222 22% 11%;           /* 卡片表面 */
+    --popover: 222 22% 11%;
+    --bg-surface: 222 22% 11%;     /* 卡片/面板表面 */
+    --bg-subtle: 220 18% 15%;      /* 代码块/中性标签底 */
 
-    --foreground: 220 9% 97%;      /* #f7f8f8 text-primary */
+    /* 文字层级 */
+    --foreground: 214 25% 94%;     /* 主文字 */
+    --text-regular: 214 20% 82%;
+    --text-secondary: 215 16% 63%;
+    --text-tertiary: 215 15% 45%;  /* 三级文字/中性图标 */
 
-    --primary: 234 55% 60%;        /* #5e6ad2 accent-primary (靛紫) */
+    /* 主色：全局唯一，主按钮/选中/链接/焦点都引用它 */
+    --primary: 221 83% 53%;        /* 主色（与浅色权威值同一支） */
     --primary-foreground: 0 0% 100%;
+    --primary-hover: 224 76% 58%;  /* 主色悬停 */
+    --primary-soft: 222 47% 16%;   /* 选中底 */
+    --primary-border: 217 55% 32%; /* 选中描边 */
 
-    --secondary: 240 4% 13%;       /* #28282c-ish bg-hover */
+    --secondary: 220 18% 15%;
     --secondary-foreground: 220 9% 97%;
 
-    --muted: 240 4% 13%;
-    --muted-foreground: 220 8% 58%; /* #8a8f98 text-secondary */
+    --muted: 220 18% 15%;
+    --muted-foreground: 215 16% 63%; /* 次文字 */
 
-    --accent: 240 5% 14%;
+    --accent: 220 18% 17%;
     --accent-foreground: 220 9% 97%;
 
-    --destructive: 0 84% 60%;      /* #ef4444 */
-    --destructive-foreground: 220 9% 97%;
+    --border: 220 16% 20%;
+    --input: 220 16% 20%;
+    --ring: 221 83% 60%;           /* 焦点环 = 主色系 */
 
-    --border: 240 4% 18%;          /* ≈ rgba(255,255,255,0.08) on #08090a */
-    --input: 240 4% 18%;
-    --ring: 244 100% 67%;          /* #7170ff accent-blue */
+    /* 状态色：只表达状态；过程/成功/信息类走中性色 */
+    --success: 158 74% 44%;
+    --success-soft: 160 40% 12%;
+    --warning: 32 95% 58%;
+    --warning-soft: 28 45% 14%;
+    --warning-border: 30 45% 26%;
+    --danger: 0 84% 62%;
+    --danger-soft: 0 40% 14%;
+
+    --destructive: 0 84% 62%;
+    --destructive-foreground: 0 0% 100%;
 
     --radius: 0.5rem;
 
-    /* Linear multi-tier tokens not natively in the old theme. Mapped to
-       Tailwind color utilities so components can use them directly. */
+    /* 既有分层 token（保留）：浮起表面与悬停态 */
     --bg-elevated: 240 5% 6%;      /* #0f1011 */
-    --bg-surface: 240 5% 9%;       /* #191a1b */
-    --bg-hover: 240 4% 13%;        /* #28282c */
-    --text-regular: 220 14% 82%;  /* #d0d6e0 */
-    --text-secondary: 220 8% 58%; /* #8a8f98 */
-    --text-tertiary: 230 5% 39%;  /* #62666d */
-    --accent-blue: 244 100% 67%;   /* #7170ff */
-    --accent-purple: 258 84% 66%; /* #8b5cf6 */
+    --bg-hover: 220 18% 17%;
+    /* 旧的双色强调已取消紫/青两套，统一回主色 */
+    --accent-blue: 221 83% 53%;
+    --accent-purple: 221 83% 53%;
 
     /* Border strength tiers + glassmorphism (aligned to watch-alert
        theme-variables.css, byte-equal to haven-console). Full color strings —
@@ -52,42 +69,55 @@
     --glass-bg-hover: rgba(255, 255, 255, 0.06);
   }
 
-  /* 浅色主题 — Linear light mode 映射，值同 watch-alert theme-variables.css。
+  /* 浅色主题 — 用户确认的设计变量表（权威值）。
      html.light 由 lib/theme.ts 切换（hc_theme 契约，与 haven-console/watch-alert 共享）。 */
   :root.light {
-    --background: 220 9% 97%;      /* #f7f8f8 bg-page */
-    --card: 0 0% 100%;             /* #ffffff bg-surface */
+    --background: 216 38% 97%;     /* #F6F8FB 页面底 */
+    --bg-page: 216 38% 97%;
+    --card: 0 0% 100%;             /* #FFFFFF 卡片 */
     --popover: 0 0% 100%;
+    --bg-surface: 0 0% 100%;
+    --bg-subtle: 210 40% 96%;      /* #F1F5F9 */
 
-    --foreground: 0 0% 7%;         /* #111111 text-primary */
+    --foreground: 215 28% 17%;     /* #1F2937 主文字 */
+    --text-regular: 215 25% 27%;
+    --text-secondary: 215 16% 47%; /* #64748B */
+    --text-tertiary: 215 20% 65%;  /* #94A3B8 */
 
-    --primary: 234 55% 60%;        /* #5e6ad2 accent-primary（浅色主色同 Linear light） */
+    --primary: 221 83% 53%;        /* #2563EB 唯一主色 */
     --primary-foreground: 0 0% 100%;
+    --primary-hover: 224 76% 48%;  /* #1D4ED8 */
+    --primary-soft: 214 100% 97%;  /* #EFF6FF 选中底/浅标签 */
+    --primary-border: 213 97% 87%; /* #BFDBFE 选中描边 */
 
-    --secondary: 220 14% 96%;      /* #f3f4f5 bg-hover */
+    --secondary: 210 40% 96%;
     --secondary-foreground: 0 0% 7%;
 
-    --muted: 220 14% 96%;
-    --muted-foreground: 0 0% 40%;  /* #666666 text-secondary */
+    --muted: 210 40% 96%;          /* #F1F5F9 代码块/灰标签 */
+    --muted-foreground: 215 16% 47%; /* #64748B 次文字 */
 
-    --accent: 220 14% 96%;
+    --accent: 210 40% 96%;
     --accent-foreground: 0 0% 7%;
 
-    --destructive: 0 84% 60%;      /* #ef4444 */
+    --border: 214 32% 91%;         /* #E2E8F0 */
+    --input: 214 32% 91%;
+    --ring: 221 83% 53%;           /* 焦点 = 主色 */
+
+    --success: 161 94% 30%;        /* #059669 */
+    --success-soft: 152 81% 96%;   /* #ECFDF5 */
+    --warning: 32 95% 44%;         /* #D97706 */
+    --warning-soft: 33 100% 96%;   /* #FFF7ED */
+    --warning-border: 32 98% 83%;  /* #FED7AA */
+    --danger: 0 72% 51%;           /* #DC2626 */
+    --danger-soft: 0 86% 97%;      /* #FEF2F2 */
+
+    --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
 
-    --border: 0 0% 90%;            /* #e6e6e6 */
-    --input: 0 0% 90%;
-    --ring: 244 100% 67%;          /* #7170ff */
-
     --bg-elevated: 0 0% 100%;      /* #ffffff */
-    --bg-surface: 0 0% 100%;
-    --bg-hover: 220 14% 96%;       /* #f3f4f5 */
-    --text-regular: 0 0% 20%;      /* #333333 */
-    --text-secondary: 0 0% 40%;    /* #666666 */
-    --text-tertiary: 0 0% 60%;     /* #999999 */
-    --accent-blue: 244 100% 67%;   /* #7170ff（两主题一致） */
-    --accent-purple: 258 84% 66%;
+    --bg-hover: 210 40% 96%;
+    --accent-blue: 221 83% 53%;    /* 统一主色 */
+    --accent-purple: 221 83% 53%;  /* 统一主色 */
 
     --border-strong: #d0d6e0;
     --glass-bg: rgba(255, 255, 255, 0.8);
