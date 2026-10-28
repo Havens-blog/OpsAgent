@@ -11,6 +11,7 @@ import {
   ChevronRight,
   ChevronUp,
   Circle,
+  CircleAlert,
   Copy,
   Download,
   GitBranch,
@@ -69,12 +70,46 @@ const KIND_ORDER = ["deployment", "config", "scale", "k8s_event"]
 
 const KIND_BADGE: Record<string, string> = {
   deployment:
-    "border-transparent bg-indigo-500/15 text-indigo-700 dark:text-indigo-300",
+    "border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300",
   config:
-    "border-transparent bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+    "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-300",
   scale:
-    "border-transparent bg-orange-500/15 text-orange-700 dark:text-orange-300",
-  k8s_event: "border-transparent bg-sky-500/15 text-sky-700 dark:text-sky-300",
+    "border-orange-200 bg-orange-50 text-orange-700 dark:border-orange-500/30 dark:bg-orange-500/15 dark:text-orange-300",
+  k8s_event:
+    "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300",
+}
+
+// Curated Chinese labels for well-known Kubernetes event reasons. Display-only
+// convenience: the raw reason is always shown next to it, and unknown reasons
+// fall back to the raw text — nothing is inferred about root cause.
+const REASON_LABELS: Record<string, string> = {
+  FailedMount: "存储卷挂载失败",
+  FailedToRetrieveImagePullSecret: "镜像拉取凭据获取失败",
+  Failed: "执行失败",
+  FailedScheduling: "调度失败",
+  FailedCreate: "创建失败",
+  FailedGetScale: "未找到扩缩容目标",
+  FailedGetResourceMetric: "资源指标获取失败",
+  FailedComputeMetricsReplicas: "副本指标计算失败",
+  BackOff: "容器反复重启",
+  Unhealthy: "就绪探针检查失败",
+  Pulling: "正在拉取镜像",
+  Pulled: "镜像拉取完成",
+  Created: "资源已创建",
+  Started: "容器已启动",
+  Killing: "容器正在终止",
+  Evicted: "Pod 被驱逐",
+  OOMKilling: "内存超限被终止",
+  Preempting: "发生抢占",
+  SuccessfulCreate: "创建成功",
+  SuccessfulDelete: "删除成功",
+  ExternalProvisioning: "外部存储卷供应中",
+  AllocIPSucceed: "IP 分配成功",
+}
+
+function reasonLabel(reason?: string): string {
+  if (!reason) return ""
+  return REASON_LABELS[reason] ?? reason
 }
 
 function kindLabel(kind: string): string {
@@ -187,12 +222,12 @@ function fmtDateTime(iso?: string): string {
   return date.toLocaleString("zh-CN", { hour12: false })
 }
 
-/** Severity icon: warning = amber, info = blue, anything else = neutral. */
+/** Severity icon: warning = orange, info = blue, anything else = neutral. */
 function LevelIcon({ level, className }: { level?: string; className?: string }) {
   const normalized = (level ?? "").toLowerCase()
   if (normalized === "warning") {
     return (
-      <AlertTriangle className={cn("h-4 w-4 text-amber-500", className)} />
+      <CircleAlert className={cn("h-4 w-4 text-orange-500", className)} />
     )
   }
   if (normalized === "info") {
@@ -1149,7 +1184,7 @@ export default function ChangesPage() {
                               className={cn(
                                 "flex w-full items-start gap-3 rounded-md border px-3 py-3 text-left transition-colors",
                                 isSelected
-                                  ? "border-sky-500/60 bg-sky-500/5 dark:bg-sky-500/10"
+                                  ? "border-sky-500 bg-sky-50 dark:border-sky-500/70 dark:bg-sky-500/10"
                                   : "border-transparent hover:bg-accent/40"
                               )}
                             >
@@ -1195,7 +1230,7 @@ export default function ChangesPage() {
                                     {kindLabel(item.kind)}
                                   </span>
                                   {item.reason && (
-                                    <span className="inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                    <span className="inline-flex items-center rounded border border-orange-200 bg-orange-50 px-1.5 py-0.5 font-mono text-[10px] font-medium text-orange-700 dark:border-orange-500/30 dark:bg-orange-500/15 dark:text-orange-300">
                                       {item.reason}
                                     </span>
                                   )}
@@ -1318,13 +1353,18 @@ export default function ChangesPage() {
                 </button>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2">
-                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300" />
-                  <div className="min-w-0">
-                    <p className="break-words text-xs font-semibold text-amber-800 dark:text-amber-200">
-                      {selected.reason || levelLabel(selected.level)}
+                <div className="flex items-start gap-2 rounded-md border border-orange-200 bg-orange-50 px-3 py-2.5 dark:border-orange-500/30 dark:bg-orange-500/10">
+                  <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-orange-500" />
+                  <div className="min-w-0 space-y-1.5">
+                    <p className="break-words text-xs font-semibold text-orange-800 dark:text-orange-200">
+                      {reasonLabel(selected.reason) || levelLabel(selected.level)}
                     </p>
-                    <p className="mt-0.5 break-words text-[11px] text-amber-700/90 dark:text-amber-200/80">
+                    {selected.reason && (
+                      <span className="inline-flex max-w-full items-center truncate rounded border border-orange-300 bg-white/70 px-1.5 py-0.5 font-mono text-[10px] font-medium text-orange-700 dark:border-orange-500/40 dark:bg-orange-500/10 dark:text-orange-300">
+                        {selected.reason}
+                      </span>
+                    )}
+                    <p className="break-words text-[11px] text-orange-700/90 dark:text-orange-200/80">
                       {kindLabel(selected.kind)} · {levelLabel(selected.level)}
                     </p>
                   </div>
