@@ -2,6 +2,7 @@
 package interfaces
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"sort"
@@ -170,6 +171,9 @@ func (s *APIServer) approveApprovalHandler(w http.ResponseWriter, r *http.Reques
 	}
 	_ = s.pendingApprovals.SetStatus(id, "approved")
 
+	// If this approval was created for an async agent task, resume execution.
+	s.maybeReexecuteTask(r.Context(), p)
+
 	s.writeJSONResponse(w, http.StatusOK, map[string]string{"status": "approved"})
 }
 
@@ -187,5 +191,46 @@ func (s *APIServer) rejectApprovalHandler(w http.ResponseWriter, r *http.Request
 	_ = s.approvalMgr.RevokeApprovalWithHash(p.ToolName, p.ConversationID, p.ParamHash)
 	_ = s.pendingApprovals.SetStatus(id, "rejected")
 
+	// If this approval was created for an async agent task, mark it rejected.
+	s.maybeRejectTask(r.Context(), p)
+
 	s.writeJSONResponse(w, http.StatusOK, map[string]string{"status": "rejected"})
+}
+
+// maybeReexecuteTask resumes a task whose pending approval was just granted.
+// ConversationID doubles as the task id for agent-task approvals; chat
+// approvals (ConversationID == conversation id) never match a task here.
+func (s *APIServer) maybeReexecuteTask(ctx context.Context, p *PendingApproval) {
+	if s.taskStore == nil {
+		return
+	}
+	task, err := s.taskStore.Get(ctx, p.ConversationID)
+	if err != nil || task.ApprovalID != p.ApprovalID {
+		return
+	}
+
+	task.Status = TaskStatusRunning
+	task.ApprovalID = ""
+	task.Error = ""
+	if err := s.taskStore.Update(ctx, task); err != nil {
+		return
+	}
+
+	go s.runAgentTask(task.AgentID, task.ID, task.TenantID)
+}
+
+// maybeRejectTask marks a task rejected when its pending approval is denied.
+func (s *APIServer) maybeRejectTask(ctx context.Context, p *PendingApproval) {
+	if s.taskStore == nil {
+		return
+	}
+	task, err := s.taskStore.Get(ctx, p.ConversationID)
+	if err != nil || task.ApprovalID != p.ApprovalID {
+		return
+	}
+
+	task.Status = TaskStatusRejected
+	task.ApprovalID = ""
+	task.Error = "approval rejected"
+	_ = s.taskStore.Update(ctx, task)
 }

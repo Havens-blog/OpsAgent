@@ -7,8 +7,12 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Havens-blog/OpsAgent/internal/agent"
+	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // executableAgent is the narrow interface the API layer needs: run a task.
@@ -124,10 +128,13 @@ func wrapInspector(a *agent.InspectorAgent) executableAgent {
 	return a
 }
 
-// agentTaskRequest is the body accepted by POST /api/v1/agents/{id}.
+// agentTaskRequest is the body accepted by POST /api/v1/agents/{id} and
+// POST /api/v1/agents/{id}/tasks. ClientTaskID is optional and only used by the
+// async endpoint for idempotency.
 type agentTaskRequest struct {
-	Description string                 `json:"description"`
-	Params      map[string]interface{} `json:"params,omitempty"`
+	Description  string                 `json:"description"`
+	Params       map[string]interface{} `json:"params,omitempty"`
+	ClientTaskID string                 `json:"client_task_id,omitempty"`
 }
 
 // getAgentInfo returns metadata about a registered agent.
@@ -201,4 +208,242 @@ func (s *APIServer) executeAgentTask(w http.ResponseWriter, r *http.Request, age
 		resp["error"] = result.Error.Error()
 	}
 	s.writeJSONResponse(w, http.StatusOK, resp)
+}
+
+// submitAgentTaskHandler handles POST /api/v1/agents/{id}/tasks.
+func (s *APIServer) submitAgentTaskHandler(w http.ResponseWriter, r *http.Request) {
+	s.submitAgentTask(w, r, r.PathValue("id"))
+}
+
+// getAgentTaskHandler handles GET /api/v1/tasks/{id}.
+func (s *APIServer) getAgentTaskHandler(w http.ResponseWriter, r *http.Request) {
+	s.getAgentTask(w, r, r.PathValue("id"))
+}
+
+// submitAgentTask creates a task record and returns immediately; the actual
+// execution runs on a background goroutine. A non-empty client_task_id makes
+// the submission idempotent within (agent, tenant).
+func (s *APIServer) submitAgentTask(w http.ResponseWriter, r *http.Request, agentID string) {
+	if _, ok := s.agents[agentID]; !ok {
+		s.writeErrorResponse(w, http.StatusNotFound, "agent_not_found",
+			"Agent not found or not available: "+agentID, "")
+		return
+	}
+
+	var req agentTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request",
+			"Failed to decode request", err.Error())
+		return
+	}
+	if req.Description == "" {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request",
+			"Task description is required", "")
+		return
+	}
+
+	ctx := r.Context()
+	if req.ClientTaskID != "" {
+		if existing, ok := s.taskStore.FindByClientTaskID(ctx, agentID, req.ClientTaskID); ok {
+			s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+				"task":       toAgentTaskDTO(existing),
+				"duplicated": true,
+			})
+			return
+		}
+	}
+
+	now := time.Now()
+	task := &AgentTask{
+		ID:           uuid.New().String(),
+		AgentID:      agentID,
+		Description:  req.Description,
+		Params:       req.Params,
+		ClientTaskID: req.ClientTaskID,
+		Status:       TaskStatusPending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := s.taskStore.Create(ctx, task); err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error",
+			"Failed to create task", err.Error())
+		return
+	}
+
+	// Encode the response before the goroutine mutates the task via Update.
+	s.writeJSONResponse(w, http.StatusCreated, map[string]interface{}{
+		"task":       toAgentTaskDTO(task),
+		"duplicated": false,
+	})
+
+	go s.runAgentTask(agentID, task.ID, task.TenantID)
+}
+
+// getAgentTask returns the current task state (cross-tenant reads are 404).
+func (s *APIServer) getAgentTask(w http.ResponseWriter, r *http.Request, id string) {
+	task, err := s.taskStore.Get(r.Context(), id)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Task not found", "")
+		return
+	}
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"task": toAgentTaskDTO(task),
+	})
+}
+
+// runAgentTask drives one execution attempt to a terminal or approval-awaiting
+// state. It runs on a fresh background context so the HTTP request can return.
+func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
+	ctx := tenant.WithID(context.Background(), tenantID)
+	task, err := s.taskStore.Get(ctx, taskID)
+	if err != nil {
+		return
+	}
+
+	exec, ok := s.agents[agentID]
+	if !ok {
+		task.Status = TaskStatusFailed
+		task.Error = "agent not found or not available: " + agentID
+		_ = s.taskStore.Update(ctx, task)
+		return
+	}
+
+	task.Status = TaskStatusRunning
+	task.Error = ""
+	task.ApprovalID = ""
+	if err := s.taskStore.Update(ctx, task); err != nil {
+		return
+	}
+
+	agentTask := &agent.Task{
+		ID:          taskID,
+		Description: task.Description,
+		Params:      task.Params,
+		CreatedAt:   time.Now(),
+		Status:      TaskStatusRunning,
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	result, execErr := exec.Execute(execCtx, agentTask)
+	if execErr != nil {
+		if ar, ok := execErr.(*guardrails.ApprovalRequiredError); ok {
+			s.handleApprovalRequired(ctx, task, ar.Request)
+			return
+		}
+		task.Status = TaskStatusFailed
+		task.Error = execErr.Error()
+		task.Result = nil
+		_ = s.taskStore.Update(ctx, task)
+		return
+	}
+
+	task.Status = TaskStatusCompleted
+	task.Result = result
+	task.Error = ""
+	_ = s.taskStore.Update(ctx, task)
+}
+
+// handleApprovalRequired parks a task in awaiting_approval and creates the
+// PendingApproval the user acts on through /api/v1/approvals.
+func (s *APIServer) handleApprovalRequired(ctx context.Context, task *AgentTask, req guardrails.ApprovalRequest) {
+	expiry := req.ExpirySeconds
+	if expiry <= 0 {
+		expiry = 300
+	}
+	scope := req.Scope
+	if scope == "" {
+		scope = guardrails.ScopeOneShot
+	}
+	now := time.Now()
+
+	pending := &PendingApproval{
+		ApprovalID:     uuid.New().String(),
+		ToolName:       req.ToolName,
+		Params:         req.Params,
+		Reason:         req.Reason,
+		ConversationID: task.ID,
+		TenantID:       task.TenantID,
+		UserID:         task.UserID,
+		ParamHash:      guardrails.ParamHash(req.Params),
+		Scope:          scope,
+		ExpirySeconds:  expiry,
+		ExpiresAt:      now.Add(time.Duration(expiry) * time.Second),
+		Status:         "pending",
+		CreatedAt:      now,
+	}
+	if err := s.pendingApprovals.Create(pending); err != nil {
+		task.Status = TaskStatusFailed
+		task.Error = "failed to create approval: " + err.Error()
+		_ = s.taskStore.Update(ctx, task)
+		return
+	}
+
+	task.Status = TaskStatusAwaitingApproval
+	task.ApprovalID = pending.ApprovalID
+	task.Error = ""
+	_ = s.taskStore.Update(ctx, task)
+}
+
+// agentTaskDTO is the transport shape of an AgentTask. The result is flattened
+// so duration_ms and error are first-class fields the console already consumes.
+type agentTaskDTO struct {
+	ID           string                 `json:"id"`
+	AgentID      string                 `json:"agent_id"`
+	Description  string                 `json:"description"`
+	Params       map[string]interface{} `json:"params,omitempty"`
+	ClientTaskID string                 `json:"client_task_id,omitempty"`
+	Status       string                 `json:"status"`
+	Result       *agentResultDTO        `json:"result,omitempty"`
+	Error        string                 `json:"error,omitempty"`
+	ApprovalID   string                 `json:"approval_id,omitempty"`
+	TenantID     int64                  `json:"tenant_id"`
+	UserID       int64                  `json:"user_id"`
+	CreatedAt    time.Time              `json:"created_at"`
+	UpdatedAt    time.Time              `json:"updated_at"`
+}
+
+type agentResultDTO struct {
+	Success    bool                   `json:"success"`
+	Response   string                 `json:"response"`
+	Data       map[string]interface{} `json:"data,omitempty"`
+	ToolsUsed  []string               `json:"tools_used,omitempty"`
+	DurationMS int64                  `json:"duration_ms"`
+	Error      string                 `json:"error,omitempty"`
+	Metadata   map[string]interface{} `json:"metadata,omitempty"`
+}
+
+func toAgentTaskDTO(t *AgentTask) *agentTaskDTO {
+	if t == nil {
+		return nil
+	}
+	dto := &agentTaskDTO{
+		ID:           t.ID,
+		AgentID:      t.AgentID,
+		Description:  t.Description,
+		Params:       t.Params,
+		ClientTaskID: t.ClientTaskID,
+		Status:       t.Status,
+		Error:        t.Error,
+		ApprovalID:   t.ApprovalID,
+		TenantID:     t.TenantID,
+		UserID:       t.UserID,
+		CreatedAt:    t.CreatedAt,
+		UpdatedAt:    t.UpdatedAt,
+	}
+	if t.Result != nil {
+		dto.Result = &agentResultDTO{
+			Success:    t.Result.Success,
+			Response:   t.Result.Response,
+			Data:       t.Result.Data,
+			ToolsUsed:  t.Result.ToolsUsed,
+			DurationMS: t.Result.Duration.Milliseconds(),
+			Metadata:   t.Result.Metadata,
+		}
+		if t.Result.Error != nil {
+			dto.Result.Error = t.Result.Error.Error()
+		}
+	}
+	return dto
 }
