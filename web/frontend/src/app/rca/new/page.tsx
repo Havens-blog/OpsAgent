@@ -1,7 +1,7 @@
 "use client"
 
-import { useState } from "react"
-import { useRouter } from "next/navigation"
+import { Suspense, useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { ArrowLeft } from "lucide-react"
 import {
@@ -25,19 +25,52 @@ const DIMENSIONS = [
   { key: "trace_evidence", label: "链路追踪分析", weight: "2%", desc: "Trace 异常检测" },
 ]
 
+/**
+ * useSearchParams needs a Suspense boundary so the shell can be rendered while
+ * the query string (nullable during prerender) resolves; without it the page
+ * would have to be fully dynamic.
+ */
 export default function NewRCAPage() {
+  return (
+    <Suspense fallback={<NewRCAFallback />}>
+      <NewRCAForm />
+    </Suspense>
+  )
+}
+
+function NewRCAFallback() {
+  return (
+    <div className="space-y-8">
+      <header>
+        <h1 className="text-3xl font-bold tracking-tight">新建 RCA 分析</h1>
+        <p className="text-muted-foreground">配置分析参数并启动根因分析任务</p>
+      </header>
+      <Card className="flex h-40 items-center justify-center text-sm text-muted-foreground">
+        正在加载分析参数…
+      </Card>
+    </div>
+  )
+}
+
+function NewRCAForm() {
   const router = useRouter()
+  // Query prefill from the change timeline ("发起 RCA 分析"): the resource's
+  // service (omitted when the record has none) and a reason/message summary.
+  // Without query params this page behaves exactly as before.
+  const searchParams = useSearchParams()
+  const prefillService = (searchParams.get("service") ?? "").trim()
+  const prefillSymptom = (searchParams.get("symptom") ?? "").trim()
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const [form, setForm] = useState({
+  const [form, setForm] = useState(() => ({
     incident_id: "",
     severity: "P2",
     start_time: "",
     end_time: "",
-    affected_services: "",
-    description: "",
-  })
+    affected_services: prefillService,
+    description: prefillSymptom,
+  }))
 
 
   async function handleSubmit(e: React.FormEvent) {

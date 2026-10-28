@@ -334,7 +334,8 @@ export interface ServiceGraph {
 /* ---------- Changes (real change source) ---------- */
 
 /** One real change record from GET /api/v1/changes — a projection of
- * models.Change. No fabricated author/status/correlation fields. */
+ * models.Change plus the fields the backend lifts out of its details map. No
+ * fabricated author/status/correlation fields. */
 export interface ChangeItem {
   id: string
   /** Change kind: deployment | config | scale | k8s_event | ... */
@@ -345,6 +346,23 @@ export interface ChangeItem {
   message: string
   /** RFC3339 timestamp. */
   time: string
+  /** details.namespace — empty when the source did not provide one. */
+  namespace?: string
+  /** details.reason — the raw source reason, never interpreted. */
+  reason?: string
+  /** details.level — info | warning | ... (empty when absent). */
+  level?: string
+  /** details.object — the concrete cluster object name. */
+  object?: string
+  /** details.kind — the object type (Pod, HorizontalPodAutoscaler, ...). */
+  object_kind?: string
+  /** details.cluster. */
+  cluster?: string
+  /** Number of source records collapsed into this one (1 when dedupe is off). */
+  occurrences?: number
+  /** Earliest/latest occurrence (equal to `time` when not deduplicated). */
+  first_seen?: string
+  last_seen?: string
   details?: Record<string, string>
 }
 
@@ -357,20 +375,49 @@ export interface ChangesSourceInfo {
 }
 
 /** Window-wide statistics computed server-side over the FULL source result
- * (before payload truncation), so the console stats stay honest. */
+ * (before filtering, grouping and paging), so the console cards and type tabs
+ * stay honest and stable while the user filters. */
 export interface ChangesStats {
   total: number
   by_kind: Record<string, number>
   services: number
   top_services: string[]
+  systems: string[]
+  namespaces: string[]
+  level_counts: Record<string, number>
+}
+
+/** Query contract of GET /api/v1/changes. */
+export interface ChangesQuery {
+  /** Relative window in hours (backend default 24, clamped to 1..168). */
+  hours?: number
+  /** Explicit RFC3339 window; when either is set it wins over `hours`. */
+  start?: string
+  end?: string
+  /** Page size (backend default 20, clamped to 1..200). */
+  limit?: number
+  /** Page offset (>= 0). */
+  offset?: number
+  kind?: string
+  system?: string
+  namespace?: string
+  /** Case-insensitive substring over service/object/message/reason. */
+  q?: string
+  order?: "desc" | "asc"
+  /** Collapse (object|service, reason) groups to their newest record. */
+  dedupe?: boolean
 }
 
 export interface ChangesResponse {
   changes: ChangeItem[]
+  /** Records in THIS page. */
   count: number
-  /** Total records the source returned for the window (may exceed count). */
-  total?: number
-  /** True when the payload was truncated to `limit` for render safety. */
+  /** Records after filtering (and grouping) — the paging denominator. */
+  total: number
+  offset: number
+  limit: number
+  has_more: boolean
+  /** Kept for backward compatibility: mirrors has_more. */
   truncated?: boolean
   stats?: ChangesStats
   source: ChangesSourceInfo
@@ -635,6 +682,30 @@ interface SaveResult {
   error?: string
 }
 
+/** Serializes a change query, omitting empty values so the backend defaults
+ * (hours=24, limit=20, offset=0, order=desc) always apply. */
+function changesQueryString(query?: ChangesQuery): string {
+  if (!query) return ""
+  const params = new URLSearchParams()
+  const set = (key: string, value: string | number | boolean | undefined) => {
+    if (value === undefined || value === "") return
+    params.set(key, String(value))
+  }
+  set("hours", query.hours)
+  set("start", query.start)
+  set("end", query.end)
+  set("limit", query.limit)
+  set("offset", query.offset)
+  set("kind", query.kind)
+  set("system", query.system)
+  set("namespace", query.namespace)
+  set("q", query.q)
+  set("order", query.order)
+  set("dedupe", query.dedupe)
+  const serialized = params.toString()
+  return serialized ? `?${serialized}` : ""
+}
+
 /* ---------- Endpoints ---------- */
 
 export const api = {
@@ -760,11 +831,12 @@ export const api = {
   getTopology: () =>
     request<{ status: string; topology: ServiceGraph }>("/api/v1/topology"),
 
-  /** Real change events from the configured change source (hours window, default 24, backend caps at 168). */
-  getChanges: (hours?: number) =>
-    request<ChangesResponse>(
-      `/api/v1/changes${hours != null ? `?hours=${encodeURIComponent(hours)}` : ""}`
-    ),
+  /**
+   * Real change events from the configured change source. Takes the full
+   * window/filter/paging contract of GET /api/v1/changes.
+   */
+  getChanges: (query?: ChangesQuery) =>
+    request<ChangesResponse>(`/api/v1/changes${changesQueryString(query)}`),
 
   chat: (messages: ChatMessage[]) =>
     request<ChatResponse>("/api/v1/chat", {
