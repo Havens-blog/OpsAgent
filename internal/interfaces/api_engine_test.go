@@ -91,13 +91,15 @@ type changesEnvelope struct {
 	HasMore   bool `json:"has_more"`
 	Truncated bool `json:"truncated"`
 	Stats     *struct {
-		Total       int            `json:"total"`
-		ByKind      map[string]int `json:"by_kind"`
-		Services    int            `json:"services"`
-		TopServices []string       `json:"top_services"`
-		Systems     []string       `json:"systems"`
-		Namespaces  []string       `json:"namespaces"`
-		LevelCounts map[string]int `json:"level_counts"`
+		Total        int            `json:"total"`
+		ByKind       map[string]int `json:"by_kind"`
+		ByObjectKind map[string]int `json:"by_object_kind"`
+		ByReason     map[string]int `json:"by_reason"`
+		Services     int            `json:"services"`
+		TopServices  []string       `json:"top_services"`
+		Systems      []string       `json:"systems"`
+		Namespaces   []string       `json:"namespaces"`
+		LevelCounts  map[string]int `json:"level_counts"`
 	} `json:"stats"`
 	Source struct {
 		Real bool   `json:"real"`
@@ -601,6 +603,137 @@ func TestChangesEndpoint(t *testing.T) {
 			if resp.Stats == nil || resp.Stats.Total != 3 {
 				t.Errorf("query %q: expected unfiltered stats total 3, got %+v", tc.query, resp.Stats)
 			}
+		}
+
+		if fake.calls != 1 {
+			t.Errorf("Expected every filtered request to reuse the cached list (1 call), got %d", fake.calls)
+		}
+	})
+
+	t.Run("object_kind_reason_and_level_filters", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Second)
+		fake := &fakeChangeSource{changes: []models.Change{
+			changeFixture("pod-order", now.Add(-5*time.Minute), "k8s_event", "order-service",
+				"Back-off restarting failed container",
+				map[string]string{
+					"namespace": "prod", "reason": "BackOff", "level": "warning",
+					"object": "order-abc", "kind": "Pod",
+				}),
+			changeFixture("hpa-order", now.Add(-15*time.Minute), "k8s_event", "order-service",
+				"Failed to get resource metric",
+				map[string]string{
+					"namespace": "prod", "reason": "FailedGetResourceMetric", "level": "warning",
+					"object": "order-hpa", "kind": "HorizontalPodAutoscaler",
+				}),
+			changeFixture("deploy-payment", now.Add(-20*time.Minute), "deployment", "payment-service",
+				"Deployment updated: registry/payment:v1.2.3",
+				map[string]string{
+					"namespace": "staging", "reason": "ScalingReplicaSet", "level": "info",
+					"object": "payment-deploy", "kind": "Deployment",
+				}),
+			changeFixture("pod-cart", now.Add(-25*time.Minute), "k8s_event", "cart-service",
+				"Pulling image cart:v1",
+				map[string]string{
+					"namespace": "prod", "reason": "Pulling", "level": "info",
+					"object": "cart-xyz", "kind": "Pod",
+				}),
+			// No details at all: no object_kind/reason to facet on and no level
+			// (the stats bucket such records as "unknown").
+			changeFixture("svc-bare", now.Add(-30*time.Minute), "k8s_event", "bare-service",
+				"Something changed", nil),
+		}}
+		server.changeSource = fake
+		server.changeSourceReal = true
+
+		type want struct {
+			query string
+			total int
+			ids   []string
+		}
+		cases := []want{
+			{query: "?object_kind=Pod", total: 2, ids: []string{"pod-order", "pod-cart"}},
+			{query: "?object_kind=HorizontalPodAutoscaler", total: 1, ids: []string{"hpa-order"}},
+			{query: "?object_kind=Deployment", total: 1, ids: []string{"deploy-payment"}},
+			{query: "?object_kind=NotARealKind", total: 0, ids: nil},
+			{query: "?reason=BackOff", total: 1, ids: []string{"pod-order"}},
+			{query: "?reason=Pulling", total: 1, ids: []string{"pod-cart"}},
+			{query: "?reason=FailedGetResourceMetric", total: 1, ids: []string{"hpa-order"}},
+			{query: "?reason=NoSuchReason", total: 0, ids: nil},
+			{query: "?level=warning", total: 2, ids: []string{"pod-order", "hpa-order"}},
+			{query: "?level=info", total: 2, ids: []string{"deploy-payment", "pod-cart"}},
+			// "unknown" is the bucket the endpoint itself publishes in
+			// level_counts for records without a level, so it stays filterable
+			// (records that DO carry a level are of course never returned).
+			{query: "?level=unknown", total: 1, ids: []string{"svc-bare"}},
+			{query: "?level=error", total: 0, ids: nil},
+			{
+				query: "?object_kind=Pod&reason=BackOff&level=warning",
+				total: 1,
+				ids:   []string{"pod-order"},
+			},
+			{
+				query: "?object_kind=Pod&reason=FailedGetResourceMetric&level=warning",
+				total: 0,
+				ids:   nil,
+			},
+			{
+				query: "?kind=k8s_event&namespace=prod&object_kind=Pod&level=info",
+				total: 1,
+				ids:   []string{"pod-cart"},
+			},
+		}
+		for _, tc := range cases {
+			code, resp := callChanges(t, server, tc.query)
+			if code != http.StatusOK {
+				t.Fatalf("query %q: expected 200, got %d", tc.query, code)
+			}
+			if resp.Total != tc.total || resp.Count != len(tc.ids) {
+				t.Errorf("query %q: expected total=%d count=%d, got total=%d count=%d",
+					tc.query, tc.total, len(tc.ids), resp.Total, resp.Count)
+			}
+			for i, id := range tc.ids {
+				if i < len(resp.Changes) && resp.Changes[i].ID != id {
+					t.Errorf("query %q: expected id %s at %d, got %s", tc.query, id, i, resp.Changes[i].ID)
+				}
+			}
+
+			// Facets are window-wide: the new filters never narrow them.
+			if resp.Stats == nil {
+				t.Fatalf("query %q: expected window-wide stats", tc.query)
+			}
+			if resp.Stats.Total != 5 {
+				t.Errorf("query %q: expected unfiltered stats total 5, got %d", tc.query, resp.Stats.Total)
+			}
+			if resp.Stats.ByObjectKind["Pod"] != 2 || resp.Stats.ByObjectKind["HorizontalPodAutoscaler"] != 1 ||
+				resp.Stats.ByObjectKind["Deployment"] != 1 || len(resp.Stats.ByObjectKind) != 3 {
+				t.Errorf("query %q: expected by_object_kind Pod=2 HPA=1 Deployment=1, got %v",
+					tc.query, resp.Stats.ByObjectKind)
+			}
+			if resp.Stats.ByReason["BackOff"] != 1 || resp.Stats.ByReason["Pulling"] != 1 ||
+				resp.Stats.ByReason["FailedGetResourceMetric"] != 1 || resp.Stats.ByReason["ScalingReplicaSet"] != 1 ||
+				len(resp.Stats.ByReason) != 4 {
+				t.Errorf("query %q: expected by_reason counts over the full window, got %v",
+					tc.query, resp.Stats.ByReason)
+			}
+			if resp.Stats.LevelCounts["warning"] != 2 || resp.Stats.LevelCounts["info"] != 2 ||
+				resp.Stats.LevelCounts["unknown"] != 1 {
+				t.Errorf("query %q: expected level_counts warning=2 info=2 unknown=1, got %v",
+					tc.query, resp.Stats.LevelCounts)
+			}
+		}
+
+		// The new filters compose with dedupe and paging in the documented
+		// order: filter → dedupe → offset/limit.
+		code, paged := callChanges(t, server, "?object_kind=Pod&dedupe=true&limit=1")
+		if code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", code)
+		}
+		if paged.Total != 2 || paged.Count != 1 || !paged.HasMore {
+			t.Errorf("expected total=2 count=1 has_more=true, got total=%d count=%d has_more=%v",
+				paged.Total, paged.Count, paged.HasMore)
+		}
+		if paged.Changes[0].ID != "pod-order" {
+			t.Errorf("expected the newest Pod event first, got %s", paged.Changes[0].ID)
 		}
 
 		if fake.calls != 1 {

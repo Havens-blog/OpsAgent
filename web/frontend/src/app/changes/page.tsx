@@ -6,8 +6,10 @@ import {
   AlertTriangle,
   Activity,
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Circle,
   Copy,
   Download,
@@ -96,6 +98,27 @@ function orderedKinds(counts: Record<string, number> | undefined): [string, numb
     if (ra !== rb) return ra - rb
     return a[0].localeCompare(b[0])
   })
+}
+
+/** Object-kind chips: most frequent first, ties broken alphabetically. */
+function countsByDescending(counts: Record<string, number> | undefined): [string, number][] {
+  return Object.entries(counts ?? {})
+    .filter(([, count]) => count > 0)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+}
+
+/** Preview size before the object-kind chips collapse behind 「展开更多」. */
+const OBJECT_KIND_PREVIEW = 8
+
+/** Cap on the reason dropdown entries (the long tail stays reachable via search). */
+const REASON_OPTION_LIMIT = 20
+
+/** Level dropdown labels; every level the backend did not name reads as 未知. */
+function levelFilterLabel(level: string): string {
+  if (level === "warning") return "警告"
+  if (level === "info") return "信息"
+  if (level === "error") return "错误"
+  return "未知"
 }
 
 /** Sort key (YYYY-MM-DD in local time) for date grouping. */
@@ -281,6 +304,10 @@ export default function ChangesPage() {
   const [kind, setKind] = useState("")
   const [system, setSystem] = useState("")
   const [namespace, setNamespace] = useState("")
+  const [objectKind, setObjectKind] = useState("")
+  const [reason, setReason] = useState("")
+  const [level, setLevel] = useState("")
+  const [objectKindExpanded, setObjectKindExpanded] = useState(false)
   const [searchText, setSearchText] = useState("")
   const [searchQuery, setSearchQuery] = useState("")
   const [order, setOrder] = useState<Order>("desc")
@@ -328,6 +355,9 @@ export default function ChangesPage() {
         kind: kind || undefined,
         system: system || undefined,
         namespace: namespace || undefined,
+        object_kind: objectKind || undefined,
+        reason: reason || undefined,
+        level: level || undefined,
         q: searchQuery || undefined,
         order,
         dedupe,
@@ -341,7 +371,20 @@ export default function ChangesPage() {
       setLoadError(error instanceof Error ? error.message : "变更记录加载失败")
       setStatus("error")
     }
-  }, [hours, page, pageSize, kind, system, namespace, searchQuery, order, dedupe])
+  }, [
+    hours,
+    page,
+    pageSize,
+    kind,
+    system,
+    namespace,
+    objectKind,
+    reason,
+    level,
+    searchQuery,
+    order,
+    dedupe,
+  ])
 
   useEffect(() => {
     void loadChanges()
@@ -376,6 +419,55 @@ export default function ChangesPage() {
   const windowMeta = WINDOWS.find((w) => w.hours === hours) ?? WINDOWS[2]
   const days = useMemo(() => groupByDay(changes), [changes])
   const kindRows = useMemo(() => orderedKinds(stats?.by_kind), [stats])
+  const objectKindRows = useMemo(
+    () => countsByDescending(stats?.by_object_kind),
+    [stats]
+  )
+  const reasonRows = useMemo(
+    () => countsByDescending(stats?.by_reason).slice(0, REASON_OPTION_LIMIT),
+    [stats]
+  )
+  const levelRows = useMemo(
+    () => countsByDescending(stats?.level_counts),
+    [stats]
+  )
+
+  // Second-level tabs only make sense for the event kinds that actually carry
+  // an object type; deployment/config/scale rows would be an empty line.
+  const showObjectKinds =
+    (kind === "" || kind === "k8s_event") &&
+    (objectKindRows.length > 0 || objectKind !== "")
+
+  const visibleObjectKinds = useMemo(() => {
+    if (objectKindExpanded || objectKindRows.length <= OBJECT_KIND_PREVIEW) {
+      return objectKindRows
+    }
+    return objectKindRows.slice(0, OBJECT_KIND_PREVIEW)
+  }, [objectKindExpanded, objectKindRows])
+
+  // A selection beyond the collapsed preview has no chip on screen, so it is
+  // called out in text — the row never hides an active filter silently.
+  const hiddenObjectKind =
+    objectKind !== "" &&
+    !visibleObjectKinds.some(([name]) => name === objectKind)
+
+  // A selected reason may sit outside the top-N list (e.g. after a state
+  // restore); it stays selectable instead of rendering a blank control.
+  const reasonOptions = useMemo(() => {
+    const options = [...reasonRows]
+    if (reason && !options.some(([name]) => name === reason)) {
+      options.push([reason, stats?.by_reason?.[reason] ?? 0])
+    }
+    return options
+  }, [reasonRows, reason, stats])
+
+  const levelOptions = useMemo(() => {
+    const options = [...levelRows]
+    if (level && !options.some(([name]) => name === level)) {
+      options.push([level, stats?.level_counts?.[level] ?? 0])
+    }
+    return options
+  }, [levelRows, level, stats])
 
   const dominantKind = kindRows[0]
   const dominantShare =
@@ -387,7 +479,22 @@ export default function ChangesPage() {
     (kind ? 1 : 0) +
     (system ? 1 : 0) +
     (namespace ? 1 : 0) +
+    (objectKind ? 1 : 0) +
+    (reason ? 1 : 0) +
+    (level ? 1 : 0) +
     (searchQuery ? 1 : 0)
+
+  const clearFilters = useCallback(() => {
+    setKind("")
+    setSystem("")
+    setNamespace("")
+    setObjectKind("")
+    setReason("")
+    setLevel("")
+    setSearchText("")
+    setSearchQuery("")
+    setPage(1)
+  }, [])
 
   const exportQuery: ChangesQuery = useMemo(
     () => ({
@@ -395,11 +502,25 @@ export default function ChangesPage() {
       kind: kind || undefined,
       system: system || undefined,
       namespace: namespace || undefined,
+      object_kind: objectKind || undefined,
+      reason: reason || undefined,
+      level: level || undefined,
       q: searchQuery || undefined,
       order,
       dedupe,
     }),
-    [hours, kind, system, namespace, searchQuery, order, dedupe]
+    [
+      hours,
+      kind,
+      system,
+      namespace,
+      objectKind,
+      reason,
+      level,
+      searchQuery,
+      order,
+      dedupe,
+    ]
   )
 
   const copyText = useCallback(async (text: string, field: string) => {
@@ -655,7 +776,7 @@ export default function ChangesPage() {
 
       <Card>
         <CardContent className="py-4">
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
             <label className="relative md:col-span-2 lg:col-span-1">
               <span className="sr-only">搜索变更</span>
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
@@ -723,6 +844,46 @@ export default function ChangesPage() {
                 ))}
               </select>
             </label>
+
+            <label>
+              <span className="sr-only">事件原因</span>
+              <select
+                value={reason}
+                onChange={(e) => {
+                  setReason(e.target.value)
+                  setPage(1)
+                }}
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm outline-none focus:border-primary"
+              >
+                <option value="">全部原因</option>
+                {reasonOptions.map(([name, count]) => (
+                  <option key={name} value={name}>
+                    {count > 0 ? `${name} (${count})` : name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span className="sr-only">级别</span>
+              <select
+                value={level}
+                onChange={(e) => {
+                  setLevel(e.target.value)
+                  setPage(1)
+                }}
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm outline-none focus:border-primary"
+              >
+                <option value="">全部级别</option>
+                {levelOptions.map(([name, count]) => (
+                  <option key={name} value={name}>
+                    {count > 0
+                      ? `${levelFilterLabel(name)} (${count})`
+                      : levelFilterLabel(name)}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
 
           {activeFilterCount > 0 && (
@@ -730,14 +891,7 @@ export default function ChangesPage() {
               <span>已启用 {activeFilterCount} 个筛选条件</span>
               <button
                 type="button"
-                onClick={() => {
-                  setKind("")
-                  setSystem("")
-                  setNamespace("")
-                  setSearchText("")
-                  setSearchQuery("")
-                  setPage(1)
-                }}
+                onClick={clearFilters}
                 className="inline-flex items-center gap-1 rounded-md border px-2 py-1 font-medium text-foreground hover:bg-accent"
               >
                 <RotateCcw className="h-3 w-3" />
@@ -785,6 +939,85 @@ export default function ChangesPage() {
               </button>
             ))}
           </div>
+
+          {showObjectKinds && (
+            <div className="rounded-lg border bg-accent/20 px-3 py-2.5">
+              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                <span className="text-xs font-semibold text-foreground">
+                  对象类型
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  按事件的 object kind 再分一层
+                </span>
+              </div>
+
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setObjectKind("")
+                    setPage(1)
+                  }}
+                  className={cn(
+                    "inline-flex max-w-full items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
+                    objectKind === ""
+                      ? "border-transparent bg-primary text-primary-foreground"
+                      : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                  )}
+                >
+                  <span className="truncate">全部对象</span>
+                  <span className="tabular-nums opacity-80">
+                    {stats?.total ?? 0}
+                  </span>
+                </button>
+
+                {visibleObjectKinds.map(([name, count]) => (
+                  <button
+                    key={name}
+                    type="button"
+                    onClick={() => {
+                      setObjectKind((prev) => (prev === name ? "" : name))
+                      setPage(1)
+                    }}
+                    className={cn(
+                      "inline-flex max-w-full items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
+                      objectKind === name
+                        ? "border-transparent bg-primary text-primary-foreground"
+                        : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                    )}
+                  >
+                    <span className="truncate">{name}</span>
+                    <span className="tabular-nums opacity-80">{count}</span>
+                  </button>
+                ))}
+
+                {objectKindRows.length > OBJECT_KIND_PREVIEW && (
+                  <button
+                    type="button"
+                    onClick={() => setObjectKindExpanded((prev) => !prev)}
+                    className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  >
+                    {objectKindExpanded ? (
+                      <>
+                        收起 <ChevronUp className="h-3 w-3" />
+                      </>
+                    ) : (
+                      <>
+                        展开更多（{objectKindRows.length - OBJECT_KIND_PREVIEW}）{" "}
+                        <ChevronDown className="h-3 w-3" />
+                      </>
+                    )}
+                  </button>
+                )}
+
+                {hiddenObjectKind && (
+                  <span className="text-[11px] text-muted-foreground">
+                    已选 {objectKind}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
 
           <Card>
             <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -944,6 +1177,11 @@ export default function ChangesPage() {
                                   {item.namespace && (
                                     <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
                                       {item.namespace}
+                                    </span>
+                                  )}
+                                  {item.object_kind && (
+                                    <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                      {item.object_kind}
                                     </span>
                                   )}
                                   <span

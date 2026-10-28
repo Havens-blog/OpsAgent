@@ -375,15 +375,20 @@ export interface ChangesSourceInfo {
 }
 
 /** Window-wide statistics computed server-side over the FULL source result
- * (before filtering, grouping and paging), so the console cards and type tabs
- * stay honest and stable while the user filters. */
+ * (before filtering, grouping and paging), so the console cards, type tabs and
+ * the object-kind/reason facets stay honest and stable while the user filters. */
 export interface ChangesStats {
   total: number
   by_kind: Record<string, number>
+  /** details.kind facet (Pod, HorizontalPodAutoscaler, ...) over the window. */
+  by_object_kind: Record<string, number>
+  /** details.reason facet over the window. */
+  by_reason: Record<string, number>
   services: number
   top_services: string[]
   systems: string[]
   namespaces: string[]
+  /** details.level facet; records without one land in "unknown". */
   level_counts: Record<string, number>
 }
 
@@ -401,6 +406,12 @@ export interface ChangesQuery {
   kind?: string
   system?: string
   namespace?: string
+  /** Exact details.kind match (the object type, e.g. Pod). */
+  object_kind?: string
+  /** Exact details.reason match. */
+  reason?: string
+  /** Exact details.level match ("unknown" targets records with no level). */
+  level?: string
   /** Case-insensitive substring over service/object/message/reason. */
   q?: string
   order?: "desc" | "asc"
@@ -699,6 +710,9 @@ function changesQueryString(query?: ChangesQuery): string {
   set("kind", query.kind)
   set("system", query.system)
   set("namespace", query.namespace)
+  set("object_kind", query.object_kind)
+  set("reason", query.reason)
+  set("level", query.level)
   set("q", query.q)
   set("order", query.order)
   set("dedupe", query.dedupe)
