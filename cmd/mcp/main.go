@@ -17,14 +17,15 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/Havens-blog/OpsAgent/internal/agent"
 	"github.com/Havens-blog/OpsAgent/internal/config"
-	"github.com/Havens-blog/OpsAgent/internal/mcp"
-	"github.com/Havens-blog/OpsAgent/internal/datasource/registry"
 	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
+	"github.com/Havens-blog/OpsAgent/internal/datasource/registry"
+	"github.com/Havens-blog/OpsAgent/internal/mcp"
 )
 
 var (
-	port = flag.Int("port", 8081, "MCP server port")
+	port       = flag.Int("port", 8081, "MCP server port")
 	configFile = flag.String("config", "config/settings.yaml", "Config file path")
 )
 
@@ -53,6 +54,15 @@ func main() {
 
 	// Create MCP server
 	server := mcp.NewServer(reg)
+
+	// Wire the topology source exactly like the REST API does: build the RCA
+	// source set from the environment and inject the topology dimension
+	// together with whether it is real. Without this the topology tool has no
+	// data source and must report that honestly instead of inventing a graph.
+	dsCfg := agent.NewDataSourceConfigFromEnv()
+	rcaSources, dsActive := agent.CreateRCASourcesWithFallback(dsCfg)
+	server.SetTopologySource(rcaSources.TopologySource, dsActive["topology"])
+	log.Printf("Topology source configured: %v", dsActive["topology"])
 
 	// Start server
 	addr := fmt.Sprintf(":%d", *port)

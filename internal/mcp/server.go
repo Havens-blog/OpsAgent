@@ -7,9 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/datasource/registry"
+	"github.com/Havens-blog/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
 )
 
 // Server represents the MCP server.
@@ -17,6 +21,14 @@ type Server struct {
 	registry   *registry.Registry
 	rcaEngine  interface{} // Can be set later if needed
 	httpServer *http.Server
+
+	// topologySource is the same progressive-enhancement source the REST API
+	// (/api/v1/topology) uses. topologyReal records whether it is backed by a
+	// genuinely configured backend (ARMS APM) rather than the honest empty
+	// fallback: an unconfigured dimension must be reported as such, never
+	// rendered as a fabricated graph.
+	topologySource sources.TopologySource
+	topologyReal   bool
 }
 
 // NewServer creates a new MCP server.
@@ -29,6 +41,16 @@ func NewServer(reg *registry.Registry) *Server {
 // SetRCAEngine sets the RCA engine (optional).
 func (s *Server) SetRCAEngine(engine interface{}) {
 	s.rcaEngine = engine
+}
+
+// SetTopologySource injects the service topology source and whether it is
+// backed by a real backend. Callers pass the TopologySource and the
+// active["topology"] flag from agent.CreateRCASourcesWithFallback, so the MCP
+// topology tool answers from exactly the same data as REST GET
+// /api/v1/topology.
+func (s *Server) SetTopologySource(src sources.TopologySource, real bool) {
+	s.topologySource = src
+	s.topologyReal = real
 }
 
 // ToolCall represents a tool call request.
@@ -296,28 +318,214 @@ func (s *Server) handleMetricsQuery(ctx context.Context, args map[string]interfa
 	return &ToolResponse{Content: content}, nil
 }
 
+// maxTopologyEdgesShown caps how many edges the whole-graph summary lists, so a
+// large production graph cannot blow up the tool output.
+const maxTopologyEdgesShown = 20
+
+// topologyUnconfiguredText is the honest answer when no real topology backend
+// is configured. It names the variables to set and the REST equivalent, and
+// deliberately reports no nodes at all.
+const topologyUnconfiguredText = "服务拓扑源未配置，无法返回真实拓扑数据。\n" +
+	"本工具只在配置了真实拓扑源（ARMS APM）时返回数据，未配置期间不会编造任何节点或依赖关系。\n" +
+	"配置环境变量 ARMS_APM_ENDPOINT 与 ARMS_APM_TOKEN 后重启 MCP 服务重试；" +
+	"也可直接调用 REST 接口 GET /api/v1/topology 查看当前拓扑源返回的内容。"
+
 // handleTopologyGet handles topology requests.
 func (s *Server) handleTopologyGet(ctx context.Context, args map[string]interface{}) (*ToolResponse, error) {
 	// Parse arguments
 	service, _ := args["service"].(string)
 
-	// Get topology from data sources
-	content := []interface{}{
-		map[string]interface{}{
-			"type": "text",
-			"text": fmt.Sprintf("Service Topology:\n%s\n\nTopology retrieved successfully", formatTopology(service)),
-		},
+	src := s.topologySource
+	if src == nil || !s.topologyReal {
+		return textResponse(topologyUnconfiguredText), nil
 	}
 
-	return &ToolResponse{Content: content}, nil
+	topo, err := src.GetTopology(ctx)
+	if err != nil {
+		return &ToolResponse{
+			Content: []interface{}{
+				map[string]interface{}{
+					"type": "text",
+					"text": fmt.Sprintf(
+						"拓扑查询失败，未返回任何拓扑数据。\n原因: %v\n请检查 ARMS_APM_ENDPOINT/ARMS_APM_TOKEN 的有效性及后端连通性，或用 REST 接口 GET /api/v1/topology 复核。",
+						err),
+				},
+			},
+			IsError: true,
+		}, nil
+	}
+
+	return textResponse(formatTopology(topo, service)), nil
 }
 
-// formatTopology formats topology for display.
-func formatTopology(service string) string {
-	if service != "" {
-		return fmt.Sprintf("Showing topology for service: %s\n\napi-gateway\n├── order-service\n└── user-service", service)
+// textResponse wraps plain text into the MCP content shape.
+func textResponse(text string) *ToolResponse {
+	return &ToolResponse{
+		Content: []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": text,
+			},
+		},
 	}
-	return "Full service topology:\n\napi-gateway\n├── order-service\n│   ├── postgres-order\n│   └── redis-cache\n├── payment-service\n└── user-service"
+}
+
+// formatTopology renders a REAL topology graph: a one-hop neighbourhood when a
+// service is requested, otherwise a bounded summary of the whole graph. It
+// never invents nodes, and says so plainly when the data is absent. Output is
+// deterministically sorted so it is stable across calls and testable.
+func formatTopology(topo *models.Topology, service string) string {
+	if topo == nil {
+		topo = &models.Topology{}
+	}
+
+	if service != "" {
+		return formatServiceNeighborhood(topo, service)
+	}
+	return formatTopologySummary(topo)
+}
+
+// formatServiceNeighborhood renders the one-hop upstream/downstream relations
+// of a single service, taken from the graph's edges (From = caller, To =
+// callee), each annotated with its relation type.
+func formatServiceNeighborhood(topo *models.Topology, service string) string {
+	if len(topo.Nodes) == 0 && len(topo.Edges) == 0 {
+		return fmt.Sprintf(
+			"未找到服务 %q 的拓扑数据：已配置的拓扑源返回了空拓扑图（0 个节点、0 条边）。\n可用 REST 接口 GET /api/v1/topology 复核。",
+			service)
+	}
+
+	known := topo.HasService(service)
+	if !known {
+		for _, e := range topo.Edges {
+			if e.From == service || e.To == service {
+				known = true
+				break
+			}
+		}
+	}
+	if !known {
+		return fmt.Sprintf(
+			"未找到服务 %q 的拓扑数据：当前拓扑图共 %d 个节点、%d 条边，其中不含该服务。\n该结果来自真实拓扑源，未做任何推断或补全。",
+			service, len(topo.Nodes), len(topo.Edges))
+	}
+
+	upstream := make([]string, 0)
+	downstream := make([]string, 0)
+	for _, e := range sortedEdges(topo.Edges) {
+		switch {
+		case e.To == service && e.From != "":
+			upstream = append(upstream, fmt.Sprintf("  - %s (%s)", e.From, edgeTypeLabel(e.Type)))
+		case e.From == service && e.To != "":
+			downstream = append(downstream, fmt.Sprintf("  - %s (%s)", e.To, edgeTypeLabel(e.Type)))
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "服务拓扑（一跳直接关系）：%s\n", service)
+	fmt.Fprintf(&b, "数据来源：已配置的真实拓扑源；仅列出直接相邻节点，不做多跳推断。\n\n")
+	fmt.Fprintf(&b, "上游调用方（调用 %s，共 %d 个）:\n", service, len(upstream))
+	b.WriteString(joinOrNone(upstream))
+	fmt.Fprintf(&b, "\n下游依赖（%s 调用，共 %d 个）:\n", service, len(downstream))
+	b.WriteString(joinOrNone(downstream))
+	return b.String()
+}
+
+// formatTopologySummary renders the whole graph as a bounded, deterministic
+// summary: node total, per-type counts, edge total and the first few edges.
+func formatTopologySummary(topo *models.Topology) string {
+	if len(topo.Nodes) == 0 && len(topo.Edges) == 0 {
+		return "已配置的拓扑源返回了空拓扑图：0 个节点、0 条边。\n" +
+			"这表示当前时间窗内没有采集到任何服务依赖数据，不是未配置；可用 REST 接口 GET /api/v1/topology 复核。"
+	}
+
+	typeCounts := make(map[string]int, len(topo.Nodes))
+	for _, n := range topo.Nodes {
+		typeCounts[nodeTypeLabel(n.Type)]++
+	}
+	types := make([]string, 0, len(typeCounts))
+	for t := range typeCounts {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+
+	edges := sortedEdges(topo.Edges)
+
+	var b strings.Builder
+	b.WriteString("服务拓扑摘要（数据源：已配置的真实拓扑源）\n")
+	fmt.Fprintf(&b, "节点总数: %d\n", len(topo.Nodes))
+	b.WriteString("节点类型分布:\n")
+	for _, t := range types {
+		fmt.Fprintf(&b, "  %s: %d\n", t, typeCounts[t])
+	}
+	fmt.Fprintf(&b, "边总数: %d\n", len(topo.Edges))
+
+	shown := edges
+	if len(shown) > maxTopologyEdgesShown {
+		shown = shown[:maxTopologyEdgesShown]
+	}
+	if len(shown) == 0 {
+		b.WriteString("依赖边: 无\n")
+		return strings.TrimRight(b.String(), "\n")
+	}
+
+	fmt.Fprintf(&b, "依赖边（按 from/to/type 排序，显示前 %d 条）:\n", len(shown))
+	for _, e := range shown {
+		fmt.Fprintf(&b, "  %s -> %s (%s)\n", e.From, e.To, edgeTypeLabel(e.Type))
+	}
+	if omitted := len(edges) - len(shown); omitted > 0 {
+		fmt.Fprintf(&b, "  ... 其余 %d 条已省略，完整图请用 REST 接口 GET /api/v1/topology 获取。\n", omitted)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// sortedEdges returns the edges ordered by from/to/type with exact duplicates
+// removed, so the rendered output is deterministic.
+func sortedEdges(edges []models.DependencyEdge) []models.DependencyEdge {
+	out := make([]models.DependencyEdge, 0, len(edges))
+	out = append(out, edges...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].From != out[j].From {
+			return out[i].From < out[j].From
+		}
+		if out[i].To != out[j].To {
+			return out[i].To < out[j].To
+		}
+		return out[i].Type < out[j].Type
+	})
+
+	deduped := out[:0]
+	for i, e := range out {
+		if i > 0 && e == out[i-1] {
+			continue
+		}
+		deduped = append(deduped, e)
+	}
+	return deduped
+}
+
+// nodeTypeLabel keeps an absent node type explicit instead of blank.
+func nodeTypeLabel(t string) string {
+	if t == "" {
+		return "unknown"
+	}
+	return t
+}
+
+// edgeTypeLabel keeps an absent edge type explicit instead of blank.
+func edgeTypeLabel(t string) string {
+	if t == "" {
+		return "unknown"
+	}
+	return t
+}
+
+// joinOrNone renders a neighbour list, or an honest "(无)" when there is none.
+func joinOrNone(lines []string) string {
+	if len(lines) == 0 {
+		return "  (无)\n"
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // handleChangesList handles change list requests. The MCP server has no real
