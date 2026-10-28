@@ -67,6 +67,12 @@ func (s *APIServer) initAgents() {
 	dsCfg := agent.NewDataSourceConfigFromEnv()
 	rcaSources, active := agent.CreateRCASourcesWithFallback(dsCfg)
 	s.dataSourceStatus = active
+	// Share the change source with /api/v1/changes. changeSourceReal gates the
+	// handler: when the dimension fell back to the honest empty source (no
+	// K8S_*/e-cam credentials), the endpoint returns an empty list with a hint
+	// and NEVER queries the fallback — no mock record may reach the console.
+	s.changeSource = rcaSources.ChangeSource
+	s.changeSourceReal = active["changes"]
 	s.logger.Info("RCA data sources configured",
 		observability.Bool("metrics_real", active["metrics"]),
 		observability.Bool("topology_real", active["topology"]),

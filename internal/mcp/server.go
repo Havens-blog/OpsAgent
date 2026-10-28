@@ -14,15 +14,15 @@ import (
 
 // Server represents the MCP server.
 type Server struct {
-	registry    *registry.Registry
-	rcaEngine   interface{} // Can be set later if needed
+	registry   *registry.Registry
+	rcaEngine  interface{} // Can be set later if needed
 	httpServer *http.Server
 }
 
 // NewServer creates a new MCP server.
 func NewServer(reg *registry.Registry) *Server {
 	return &Server{
-		registry:  reg,
+		registry: reg,
 	}
 }
 
@@ -184,7 +184,7 @@ func (s *Server) CallTool(ctx context.Context, call ToolCall) (*ToolResponse, er
 		return s.handleChangesList(ctx, call.Arguments)
 	default:
 		return &ToolResponse{
-			Content:  []interface{}{fmt.Sprintf("Unknown tool: %s", call.Name)},
+			Content: []interface{}{fmt.Sprintf("Unknown tool: %s", call.Name)},
 			IsError: true,
 		}, nil
 	}
@@ -320,7 +320,11 @@ func formatTopology(service string) string {
 	return "Full service topology:\n\napi-gateway\n├── order-service\n│   ├── postgres-order\n│   └── redis-cache\n├── payment-service\n└── user-service"
 }
 
-// handleChangesList handles change list requests.
+// handleChangesList handles change list requests. The MCP server has no real
+// change source wired (Server carries only a datasource registry), so it
+// reports that honestly instead of fabricating records. Real change data is
+// served by the REST API (GET /api/v1/changes) from the configured
+// Kubernetes / platform-event source.
 func (s *Server) handleChangesList(ctx context.Context, args map[string]interface{}) (*ToolResponse, error) {
 	// Parse arguments
 	startTimeStr, _ := args["start_time"].(string)
@@ -332,16 +336,21 @@ func (s *Server) handleChangesList(ctx context.Context, args map[string]interfac
 	if err != nil {
 		startTime = time.Now().Add(-24 * time.Hour)
 	}
-	var endTime time.Time
-	endTime, err = time.Parse(time.RFC3339, endTimeStr)
+	endTime, err := time.Parse(time.RFC3339, endTimeStr)
 	if err != nil {
 		endTime = time.Now()
 	}
 
+	text := fmt.Sprintf("Recent Changes:\nTime: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	if service != "" {
+		text += fmt.Sprintf("Service: %s\n", service)
+	}
+	text += "\nChanges found: 0\n变更源未配置或不可用，暂无真实变更记录。\n请配置 K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE 或平台事件源后，通过 REST API GET /api/v1/changes 查询真实变更数据。"
+
 	content := []interface{}{
 		map[string]interface{}{
 			"type": "text",
-			"text": fmt.Sprintf("Recent Changes:\nTime: %s to %s\nService: %s\n\nChanges found:\n- 09:15 order-service deployment v2.3.1\n- 09:10 postgres-order config update", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), service),
+			"text": text,
 		},
 	}
 
