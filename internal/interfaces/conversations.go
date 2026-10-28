@@ -19,6 +19,10 @@ type createConversationRequest struct {
 	Title string `json:"title"`
 }
 
+type renameConversationRequest struct {
+	Title string `json:"title"`
+}
+
 type sendMessageRequest struct {
 	Content         string `json:"content"`
 	ClientMessageID string `json:"client_message_id,omitempty"`
@@ -79,6 +83,8 @@ func (s *APIServer) conversationHandler(w http.ResponseWriter, r *http.Request) 
 			s.getConversationHandler(w, r, parts[0])
 		case http.MethodDelete:
 			s.deleteConversationHandler(w, r, parts[0])
+		case http.MethodPatch:
+			s.renameConversationHandler(w, r, parts[0])
 		default:
 			s.writeErrorResponse(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed", "")
 		}
@@ -171,6 +177,36 @@ func (s *APIServer) deleteConversationHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// renameConversationHandler handles PATCH /api/v1/conversations/{id}.
+func (s *APIServer) renameConversationHandler(w http.ResponseWriter, r *http.Request, id string) {
+	var req renameConversationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
+		return
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Title is required", "")
+		return
+	}
+
+	if err := s.conversationStore.UpdateTitle(r.Context(), id, title); err != nil {
+		s.writeErrorResponse(w, http.StatusNotFound, "not_found", "Conversation not found", err.Error())
+		return
+	}
+
+	conv, err := s.conversationStore.Get(r.Context(), id)
+	if err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to load conversation", err.Error())
+		return
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
+		"conversation": conv,
+	})
 }
 
 // sendMessageHandler handles POST /api/v1/conversations/{id}/messages as SSE.

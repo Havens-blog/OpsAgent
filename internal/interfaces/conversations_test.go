@@ -190,6 +190,55 @@ func TestConversationCRUD(t *testing.T) {
 	})
 }
 
+// TestRenameConversation covers PATCH /api/v1/conversations/{id}.
+func TestRenameConversation(t *testing.T) {
+	server := newConversationServer(t, nil)
+	id := createConversation(t, server, "before")
+
+	t.Run("renames conversation", func(t *testing.T) {
+		payload, _ := json.Marshal(map[string]string{"title": "after"})
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/conversations/"+id, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("patch status %d body %s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Conversation chat.Conversation `json:"conversation"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal patch: %v", err)
+		}
+		if resp.Conversation.Title != "after" {
+			t.Fatalf("title = %q, want after", resp.Conversation.Title)
+		}
+	})
+
+	t.Run("rejects empty title", func(t *testing.T) {
+		payload, _ := json.Marshal(map[string]string{"title": "   "})
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/conversations/"+id, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("patch empty title status %d, want 400", w.Code)
+		}
+	})
+
+	t.Run("missing conversation is not-found", func(t *testing.T) {
+		payload, _ := json.Marshal(map[string]string{"title": "x"})
+		req := httptest.NewRequest(http.MethodPatch, "/api/v1/conversations/does-not-exist", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("patch missing status %d, want 404", w.Code)
+		}
+	})
+}
+
 // TestSendMessageStreaming verifies delta events stream in order and a done
 // event ends the stream with the assistant message persisted.
 func TestSendMessageStreaming(t *testing.T) {

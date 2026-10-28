@@ -68,6 +68,36 @@ func TestPersistentConversationStoreRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPersistentConversationStoreUpdateTitleRoundTrip verifies a rename is
+// persisted and survives a reopen.
+func TestPersistentConversationStoreUpdateTitleRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conversations.json")
+	st, err := NewPersistentConversationStore(path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	ctx := tenant.WithID(context.Background(), 1)
+	if err := st.Create(ctx, conversation("conv-a", "old")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.UpdateTitle(ctx, "conv-a", "renamed"); err != nil {
+		t.Fatalf("update title: %v", err)
+	}
+
+	reopened, err := NewPersistentConversationStore(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	conv, err := reopened.Get(ctx, "conv-a")
+	if err != nil {
+		t.Fatalf("get after reopen: %v", err)
+	}
+	if conv.Title != "renamed" {
+		t.Fatalf("title = %q, want renamed", conv.Title)
+	}
+}
+
 // TestPersistentConversationStoreCorruptFile verifies a corrupt snapshot is
 // reported as an error instead of being silently dropped.
 func TestPersistentConversationStoreCorruptFile(t *testing.T) {

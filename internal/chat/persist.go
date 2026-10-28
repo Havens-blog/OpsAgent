@@ -186,6 +186,22 @@ func (s *PersistentConversationStore) Delete(ctx context.Context, id string) err
 	return s.persistLocked()
 }
 
+// UpdateTitle renames a conversation within the ctx tenant and persists the
+// snapshot, or reports not-found when it does not exist in this tenant.
+func (s *PersistentConversationStore) UpdateTitle(ctx context.Context, id string, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tid := tenant.IDFrom(ctx)
+	conv, ok := s.conversations[tid][id]
+	if !ok {
+		return fmt.Errorf("conversation not found: %s", id)
+	}
+	conv.Title = title
+	conv.UpdatedAt = time.Now()
+	return s.persistLocked()
+}
+
 // AddMessage appends a message to a conversation, touches its UpdatedAt, and
 // persists the snapshot.
 func (s *PersistentConversationStore) AddMessage(ctx context.Context, convID string, msg *Message) error {
