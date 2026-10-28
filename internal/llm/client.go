@@ -240,19 +240,23 @@ func (c *Client) doChat(ctx context.Context, req *ChatRequest, streamHandler fun
 // handleStream handles streaming response.
 func (c *Client) handleStream(resp *http.Response, handler func(ChatChunk)) (*ChatResponse, error) {
 	scanner := bufio.NewScanner(resp.Body)
+	// Some providers emit individual SSE lines longer than the default 64KB
+	// scanner buffer (large tool arguments, long deltas). Raise the cap and
+	// allow growth so a single long line never aborts the whole stream.
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var lastChunk *ChatChunk
+	receivedAny := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Skip empty lines and non-data lines
-		if !strings.HasPrefix(line, "data: ") {
+		// Accept "data:" with any amount of trailing whitespace; SSE permits no
+		// space after the colon and some gateways normalize it differently.
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-
-		// Remove "data: " prefix
-		data := strings.TrimPrefix(line, "data: ")
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 
 		// Check for end of stream
 		if data == "[DONE]" {
@@ -266,6 +270,7 @@ func (c *Client) handleStream(resp *http.Response, handler func(ChatChunk)) (*Ch
 		}
 
 		lastChunk = &chunk
+		receivedAny = true
 
 		if handler != nil {
 			handler(chunk)
@@ -276,8 +281,14 @@ func (c *Client) handleStream(resp *http.Response, handler func(ChatChunk)) (*Ch
 		return nil, fmt.Errorf("error reading stream: %w", err)
 	}
 
-	// Return final response (reconstructed from chunks)
-	if lastChunk != nil && len(lastChunk.Choices) > 0 {
+	// Success is determined by whether we consumed any streamed chunk, not by
+	// whether the final chunk carried choices: several OpenAI-compatible
+	// providers end with an empty-choices/usage-only chunk before [DONE].
+	if !receivedAny {
+		return nil, fmt.Errorf("no valid response received")
+	}
+
+	if lastChunk != nil {
 		return &ChatResponse{
 			ID:      lastChunk.ID,
 			Object:  lastChunk.Object,
@@ -286,8 +297,7 @@ func (c *Client) handleStream(resp *http.Response, handler func(ChatChunk)) (*Ch
 			Choices: lastChunk.Choices,
 		}, nil
 	}
-
-	return nil, fmt.Errorf("no valid response received")
+	return &ChatResponse{}, nil
 }
 
 // GetModels returns available models for the current provider by querying its
