@@ -1,19 +1,27 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useRouter } from "next/navigation"
 import {
-  Activity,
   AlertTriangle,
+  Activity,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Circle,
+  Copy,
+  Download,
   GitBranch,
+  Info,
   Inbox,
   Loader2,
   RefreshCw,
+  RotateCcw,
+  Search,
   Settings,
   TrendingUp,
+  X,
 } from "lucide-react"
-import { Badge } from "@/components/ui/badge"
 import {
   Card,
   CardContent,
@@ -21,25 +29,54 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { api, type ChangeItem, type ChangesResponse } from "@/lib/api"
+import {
+  api,
+  type ChangeItem,
+  type ChangesQuery,
+  type ChangesResponse,
+  type ChangesStats,
+} from "@/lib/api"
+import { cn } from "@/lib/utils"
 
 type LoadStatus = "loading" | "error" | "ready"
+type Order = "desc" | "asc"
 
-/** 页面固定查询近 24 小时的真实变更。 */
-const WINDOW_HOURS = 24
+const WINDOWS = [
+  { hours: 1, label: "最近1小时", short: "1小时" },
+  { hours: 6, label: "最近6小时", short: "6小时" },
+  { hours: 24, label: "最近24小时", short: "24小时" },
+  { hours: 72, label: "最近3天", short: "3天" },
+  { hours: 168, label: "最近7天", short: "7天" },
+]
 
-/** 时间线每页条数，避免一次性渲染上千条真实事件。 */
-const PAGE_SIZE = 50
+const PAGE_SIZES = [20, 50, 100]
+
+/** Export caps: the backend page size is 200, so a full export loops offsets. */
+const EXPORT_PAGE_SIZE = 200
+const EXPORT_MAX_ROWS = 2000
 
 const KIND_LABELS: Record<string, string> = {
   deployment: "部署",
-  config: "配置变更",
+  config: "配置",
   scale: "扩缩容",
   k8s_event: "K8s 事件",
 }
 
+/** Type-tab ordering; unknown kinds are appended alphabetically. */
+const KIND_ORDER = ["deployment", "config", "scale", "k8s_event"]
+
+const KIND_BADGE: Record<string, string> = {
+  deployment:
+    "border-transparent bg-indigo-500/15 text-indigo-700 dark:text-indigo-300",
+  config:
+    "border-transparent bg-emerald-500/15 text-emerald-700 dark:text-emerald-300",
+  scale:
+    "border-transparent bg-orange-500/15 text-orange-700 dark:text-orange-300",
+  k8s_event: "border-transparent bg-sky-500/15 text-sky-700 dark:text-sky-300",
+}
+
 function kindLabel(kind: string): string {
-  return KIND_LABELS[kind] ?? kind
+  return KIND_LABELS[kind] ?? kind ?? "—"
 }
 
 function kindIcon(kind: string) {
@@ -49,24 +86,252 @@ function kindIcon(kind: string) {
   return Activity
 }
 
-function fmtTime(iso: string): string {
+function orderedKinds(counts: Record<string, number> | undefined): [string, number][] {
+  const entries = Object.entries(counts ?? {}).filter(([, count]) => count > 0)
+  return entries.sort((a, b) => {
+    const ia = KIND_ORDER.indexOf(a[0])
+    const ib = KIND_ORDER.indexOf(b[0])
+    const ra = ia === -1 ? KIND_ORDER.length : ia
+    const rb = ib === -1 ? KIND_ORDER.length : ib
+    if (ra !== rb) return ra - rb
+    return a[0].localeCompare(b[0])
+  })
+}
+
+/** Sort key (YYYY-MM-DD in local time) for date grouping. */
+function dayKey(date: Date): string {
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
+}
+
+/** 「今天 · 10月28日」/「昨天 · 10月27日」/「10月26日」 */
+function dayLabel(date: Date, today: Date): string {
+  const monthDay = `${date.getMonth() + 1}月${date.getDate()}日`
+  const stamp = dayKey(date)
+  if (stamp === dayKey(today)) return `今天 · ${monthDay}`
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000)
+  if (stamp === dayKey(yesterday)) return `昨天 · ${monthDay}`
+  if (date.getFullYear() !== today.getFullYear()) {
+    return `${date.getFullYear()}年${monthDay}`
+  }
+  return monthDay
+}
+
+interface DayGroup {
+  key: string
+  label: string
+  items: ChangeItem[]
+}
+
+/** Groups the current page by local calendar day (server order is preserved). */
+function groupByDay(items: ChangeItem[]): DayGroup[] {
+  const today = new Date()
+  const groups: DayGroup[] = []
+  const byKey = new Map<string, DayGroup>()
+  for (const item of items) {
+    const date = new Date(item.time)
+    if (Number.isNaN(date.getTime())) {
+      const fallback = byKey.get("unknown") ?? { key: "unknown", label: "时间未知", items: [] }
+      if (!byKey.has("unknown")) {
+        byKey.set("unknown", fallback)
+        groups.push(fallback)
+      }
+      fallback.items.push(item)
+      continue
+    }
+    const key = dayKey(date)
+    let group = byKey.get(key)
+    if (!group) {
+      group = { key, label: dayLabel(date, today), items: [] }
+      byKey.set(key, group)
+      groups.push(group)
+    }
+    group.items.push(item)
+  }
+  return groups
+}
+
+function fmtClock(iso?: string): string {
+  if (!iso) return "--:--:--"
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return "--:--:--"
+  return date.toLocaleTimeString("zh-CN", { hour12: false })
+}
+
+function fmtDateTime(iso?: string): string {
+  if (!iso) return "—"
   const date = new Date(iso)
   if (Number.isNaN(date.getTime())) return iso
   return date.toLocaleString("zh-CN", { hour12: false })
 }
 
+/** Severity icon: warning = amber, info = blue, anything else = neutral. */
+function LevelIcon({ level, className }: { level?: string; className?: string }) {
+  const normalized = (level ?? "").toLowerCase()
+  if (normalized === "warning") {
+    return (
+      <AlertTriangle className={cn("h-4 w-4 text-amber-500", className)} />
+    )
+  }
+  if (normalized === "info") {
+    return <Info className={cn("h-4 w-4 text-sky-500", className)} />
+  }
+  return <Circle className={cn("h-4 w-4 text-muted-foreground", className)} />
+}
+
+function levelLabel(level?: string): string {
+  const normalized = (level ?? "").toLowerCase()
+  if (normalized === "warning") return "警告"
+  if (normalized === "info") return "信息"
+  if (!normalized) return "级别未知"
+  return level as string
+}
+
+function resourceName(item: ChangeItem): string {
+  return item.object || item.service || "—"
+}
+
+function paginationItems(current: number, count: number): (number | "gap")[] {
+  if (count <= 7) return Array.from({ length: count }, (_, i) => i + 1)
+  const items: (number | "gap")[] = [1]
+  const start = Math.max(2, current - 1)
+  const end = Math.min(count - 1, current + 1)
+  if (start > 2) items.push("gap")
+  for (let page = start; page <= end; page++) items.push(page)
+  if (end < count - 1) items.push("gap")
+  items.push(count)
+  return items
+}
+
+/** JSON summary of one record — real fields only, no derived conclusions. */
+function recordSummary(item: ChangeItem): string {
+  return JSON.stringify(
+    {
+      id: item.id,
+      time: item.time,
+      kind: item.kind,
+      system: item.system,
+      namespace: item.namespace ?? "",
+      resource: item.object || item.service || "",
+      object_kind: item.object_kind ?? "",
+      reason: item.reason ?? "",
+      level: item.level ?? "",
+      cluster: item.cluster ?? "",
+      service: item.service ?? "",
+      occurrences: item.occurrences ?? 1,
+      first_seen: item.first_seen ?? item.time,
+      last_seen: item.last_seen ?? item.time,
+      message: item.message,
+      details: item.details ?? {},
+    },
+    null,
+    2
+  )
+}
+
+function csvCell(value: string): string {
+  const text = value.replace(/\r?\n/g, " ")
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function Switch({
+  checked,
+  onToggle,
+  label,
+}: {
+  checked: boolean
+  onToggle: (next: boolean) => void
+  label: string
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onToggle(!checked)}
+      className={cn(
+        "inline-flex items-center gap-2 rounded-md px-1.5 py-1 text-xs transition-colors",
+        checked ? "text-foreground" : "text-muted-foreground",
+        "hover:bg-accent"
+      )}
+    >
+      <span
+        className={cn(
+          "relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors",
+          checked ? "bg-primary" : "bg-muted-foreground/30"
+        )}
+      >
+        <span
+          className={cn(
+            "inline-block h-3 w-3 rounded-full bg-white shadow transition-transform",
+            checked ? "translate-x-3.5" : "translate-x-0.5"
+          )}
+        />
+      </span>
+      {label}
+    </button>
+  )
+}
+
 export default function ChangesPage() {
+  const router = useRouter()
+
+  const [hours, setHours] = useState(24)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(PAGE_SIZES[0])
+  const [kind, setKind] = useState("")
+  const [system, setSystem] = useState("")
+  const [namespace, setNamespace] = useState("")
+  const [searchText, setSearchText] = useState("")
+  const [searchQuery, setSearchQuery] = useState("")
+  const [order, setOrder] = useState<Order>("desc")
+  const [dedupe, setDedupe] = useState(false)
+
   const [data, setData] = useState<ChangesResponse | null>(null)
   const [status, setStatus] = useState<LoadStatus>("loading")
   const [loadError, setLoadError] = useState("")
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [copiedField, setCopiedField] = useState("")
+  const [exportState, setExportState] = useState<{
+    status: "idle" | "busy" | "done" | "error"
+    message: string
+  }>({ status: "idle", message: "" })
+
   const requestIdRef = useRef(0)
+  const copyTimerRef = useRef<number | null>(null)
+
+  // Debounce the search box so typing does not fire a request per keystroke.
+  useEffect(() => {
+    const trimmed = searchText.trim()
+    if (trimmed === searchQuery) return
+    const timer = window.setTimeout(() => {
+      setSearchQuery(trimmed)
+      setPage(1)
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [searchText, searchQuery])
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+    }
+  }, [])
 
   const loadChanges = useCallback(async () => {
     const requestId = ++requestIdRef.current
     setStatus("loading")
     setLoadError("")
     try {
-      const response = await api.getChanges(WINDOW_HOURS)
+      const response = await api.getChanges({
+        hours,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
+        kind: kind || undefined,
+        system: system || undefined,
+        namespace: namespace || undefined,
+        q: searchQuery || undefined,
+        order,
+        dedupe,
+      })
       if (requestId !== requestIdRef.current) return
       setData(response)
       setStatus("ready")
@@ -76,7 +341,7 @@ export default function ChangesPage() {
       setLoadError(error instanceof Error ? error.message : "变更记录加载失败")
       setStatus("error")
     }
-  }, [])
+  }, [hours, page, pageSize, kind, system, namespace, searchQuery, order, dedupe])
 
   useEffect(() => {
     void loadChanges()
@@ -85,268 +350,875 @@ export default function ChangesPage() {
     }
   }, [loadChanges])
 
-  const changes: ChangeItem[] = useMemo(() => data?.changes ?? [], [data])
-  const [page, setPage] = useState(1)
+  const changes = useMemo(() => data?.changes ?? [], [data])
+  const stats: ChangesStats | null = data?.stats ?? null
+  const sourceReal = data?.source.real ?? false
+  const total = data?.total ?? 0
+  const hasMore = data?.has_more ?? false
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+
+  // Keep the pager inside the valid range when a filter shrinks the result set.
+  useEffect(() => {
+    if (page > pageCount) setPage(pageCount)
+  }, [page, pageCount])
 
   useEffect(() => {
-    setPage(1)
-  }, [data])
+    if (selectedId && !changes.some((item) => item.id === selectedId)) {
+      setSelectedId(null)
+    }
+  }, [changes, selectedId])
 
-  // Prefer server-side stats: they cover the FULL window even when the
-  // payload is truncated; fall back to the returned items otherwise.
-  const stats = useMemo(() => {
-    let byKind: Record<string, number> = {}
-    let serviceCount = 0
-    let serviceNames: string[] = []
-    let total = changes.length
-    if (data?.stats) {
-      byKind = data.stats.by_kind ?? {}
-      serviceCount = data.stats.services
-      serviceNames = data.stats.top_services ?? []
-      total = data.stats.total
-    } else {
-      const services = new Set<string>()
-      for (const change of changes) {
-        const kind = change.kind || "unknown"
-        byKind[kind] = (byKind[kind] ?? 0) + 1
-        if (change.service) services.add(change.service)
+  const selected = useMemo(
+    () => changes.find((item) => item.id === selectedId) ?? null,
+    [changes, selectedId]
+  )
+
+  const windowMeta = WINDOWS.find((w) => w.hours === hours) ?? WINDOWS[2]
+  const days = useMemo(() => groupByDay(changes), [changes])
+  const kindRows = useMemo(() => orderedKinds(stats?.by_kind), [stats])
+
+  const dominantKind = kindRows[0]
+  const dominantShare =
+    dominantKind && stats && stats.total > 0
+      ? Math.round((dominantKind[1] / stats.total) * 100)
+      : 0
+
+  const activeFilterCount =
+    (kind ? 1 : 0) +
+    (system ? 1 : 0) +
+    (namespace ? 1 : 0) +
+    (searchQuery ? 1 : 0)
+
+  const exportQuery: ChangesQuery = useMemo(
+    () => ({
+      hours,
+      kind: kind || undefined,
+      system: system || undefined,
+      namespace: namespace || undefined,
+      q: searchQuery || undefined,
+      order,
+      dedupe,
+    }),
+    [hours, kind, system, namespace, searchQuery, order, dedupe]
+  )
+
+  const copyText = useCallback(async (text: string, field: string) => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedField(field)
+    } catch {
+      setCopiedField("复制失败，请手动选择文本")
+    }
+    if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+    copyTimerRef.current = window.setTimeout(() => setCopiedField(""), 2500)
+  }, [])
+
+  const startRca = useCallback(
+    (item: ChangeItem) => {
+      const params = new URLSearchParams()
+      if (item.service) params.set("service", item.service)
+      const symptom = [item.reason, (item.message || "").split("\n")[0]]
+        .filter(Boolean)
+        .join(" · ")
+      if (symptom) params.set("symptom", symptom.slice(0, 200))
+      const query = params.toString()
+      router.push(query ? `/rca/new?${query}` : "/rca/new")
+    },
+    [router]
+  )
+
+  async function handleExport() {
+    if (!sourceReal) {
+      setExportState({
+        status: "error",
+        message: "变更源未配置，无真实数据可导出",
+      })
+      return
+    }
+    setExportState({ status: "busy", message: "正在导出当前筛选结果…" })
+    try {
+      const rows: ChangeItem[] = []
+      let offset = 0
+      let reportedTotal = 0
+      for (;;) {
+        const response = await api.getChanges({
+          ...exportQuery,
+          limit: EXPORT_PAGE_SIZE,
+          offset,
+        })
+        if (!response.source.real) {
+          throw new Error("变更源未配置，无真实数据可导出")
+        }
+        reportedTotal = response.total
+        rows.push(...response.changes)
+        offset += response.changes.length
+        if (!response.has_more || response.changes.length === 0) break
+        if (rows.length >= EXPORT_MAX_ROWS) break
       }
-      serviceCount = services.size
-      serviceNames = [...services].sort()
-    }
-    const kindCounts = Object.entries(byKind)
-      .filter(([, count]) => count > 0)
-      .sort((a, b) => b[1] - a[1])
-    return {
-      total,
-      kindCounts,
-      services: serviceCount,
-      serviceNames,
-    }
-  }, [changes, data])
 
-  const pageCount = Math.max(1, Math.ceil(changes.length / PAGE_SIZE))
-  const safePage = Math.min(page, pageCount)
-  const pagedChanges = changes.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
+      const items = rows.slice(0, EXPORT_MAX_ROWS)
+      if (items.length === 0) {
+        setExportState({ status: "error", message: "当前筛选条件下没有可导出的记录" })
+        return
+      }
 
-  const sourceReal = data?.source.real ?? false
+      const header = [
+        "发生时间",
+        "类型",
+        "来源",
+        "命名空间",
+        "资源名",
+        "对象类型",
+        "原因",
+        "级别",
+        "服务",
+        "描述",
+        "合并条数",
+        "首次出现",
+        "最近出现",
+      ]
+      const body = items.map((item) => [
+        fmtDateTime(item.time),
+        kindLabel(item.kind),
+        item.system ?? "",
+        item.namespace ?? "",
+        item.object || item.service || "",
+        item.object_kind ?? "",
+        item.reason ?? "",
+        item.level ?? "",
+        item.service ?? "",
+        item.message ?? "",
+        String(item.occurrences ?? 1),
+        item.first_seen ? fmtDateTime(item.first_seen) : "",
+        item.last_seen ? fmtDateTime(item.last_seen) : "",
+      ])
+      const csv = [header, ...body]
+        .map((row) => row.map(csvCell).join(","))
+        .join("\r\n")
+
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .slice(0, 19)
+      const blob = new Blob([`\uFEFF${csv}`], {
+        type: "text/csv;charset=utf-8;",
+      })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement("a")
+      anchor.href = url
+      anchor.download = `变更记录_${windowMeta.short}_${stamp}.csv`
+      document.body.appendChild(anchor)
+      anchor.click()
+      document.body.removeChild(anchor)
+      URL.revokeObjectURL(url)
+
+      const truncated = reportedTotal > items.length
+      setExportState({
+        status: "done",
+        message: truncated
+          ? `已导出前 ${items.length} 条（当前筛选共 ${reportedTotal} 条，导出上限 ${EXPORT_MAX_ROWS} 条）`
+          : `已导出 ${items.length} 条真实记录`,
+      })
+    } catch (error) {
+      setExportState({
+        status: "error",
+        message: error instanceof Error ? error.message : "导出失败",
+      })
+    }
+  }
+
+  const showingSkeleton = status === "loading" && data === null
+  const refreshing = status === "loading" && data !== null
 
   return (
-    <div className="space-y-8">
-      <header>
-        <h1 className="text-3xl font-bold tracking-tight">Changes</h1>
-        <p className="text-muted-foreground">
-          变更记录 — 来自真实变更源的部署 / 配置 / 扩缩容与集群事件（近 {WINDOW_HOURS} 小时）
-        </p>
-      </header>
-
-      {status === "loading" && (
-        <Card className="flex h-[320px] flex-col items-center justify-center gap-3 text-center">
-          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-500/10 text-indigo-500">
-            <Loader2 className="h-6 w-6 animate-spin" />
-          </span>
-          <div>
-            <p className="text-sm font-medium">正在加载变更记录</p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              正在查询真实变更源…
-            </p>
-          </div>
-        </Card>
-      )}
-
-      {status === "error" && (
-        <Card className="flex h-[320px] flex-col items-center justify-center gap-4 px-6 text-center">
-          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/10 text-red-500">
-            <AlertTriangle className="h-6 w-6" />
-          </span>
-          <div>
-            <p className="text-sm font-semibold">变更记录加载失败</p>
-            <p className="mt-1 max-w-lg break-words text-xs text-muted-foreground">
-              {loadError || "后端 /api/v1/changes 暂不可用"}
-            </p>
-          </div>
+    <div className="space-y-6">
+      <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-3xl font-bold tracking-tight">变更记录</h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            聚合部署、配置、扩缩容与集群事件，追踪服务变化。
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="sr-only" htmlFor="changes-window">
+            时间范围
+          </label>
+          <select
+            id="changes-window"
+            value={hours}
+            onChange={(e) => {
+              setHours(Number(e.target.value))
+              setPage(1)
+            }}
+            className="h-9 rounded-md border bg-background px-3 text-sm outline-none focus:border-primary"
+          >
+            {WINDOWS.map((w) => (
+              <option key={w.hours} value={w.hours}>
+                {w.label}
+              </option>
+            ))}
+          </select>
           <button
             type="button"
             onClick={() => void loadChanges()}
-            className="inline-flex h-9 items-center gap-2 rounded-md bg-indigo-600 px-4 text-xs font-medium text-white hover:bg-indigo-500"
+            className="inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium hover:bg-accent"
           >
-            <RefreshCw className="h-3.5 w-3.5" />
-            重试
+            <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
+            刷新
           </button>
-        </Card>
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={exportState.status === "busy"}
+            className="inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium hover:bg-accent disabled:opacity-50"
+          >
+            {exportState.status === "busy" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Download className="h-4 w-4" />
+            )}
+            导出
+          </button>
+        </div>
+      </header>
+
+      {exportState.message && (
+        <div
+          className={cn(
+            "flex items-start gap-2 rounded-md border px-3 py-2 text-xs",
+            exportState.status === "error"
+              ? "border-destructive/30 bg-destructive/10 text-destructive"
+              : "border-border bg-accent/40 text-muted-foreground"
+          )}
+        >
+          {exportState.status === "done" && (
+            <Check className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          )}
+          <span className="break-words">{exportState.message}</span>
+        </div>
       )}
 
-      {status === "ready" && !sourceReal && (
-        <Card className="flex h-[320px] flex-col items-center justify-center gap-3 px-6 text-center">
-          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-600 dark:text-amber-300">
-            <AlertTriangle className="h-6 w-6" />
-          </span>
-          <div>
-            <p className="text-sm font-semibold">变更源未配置</p>
-            <p className="mt-1 max-w-lg text-xs leading-5 text-muted-foreground">
-              {data?.source.hint ||
-                "未配置真实变更源（K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE 或平台事件源）"}
-            </p>
+      <div className="grid gap-4 md:grid-cols-3">
+        <Card>
+          <CardContent className="py-4">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">
+              近{windowMeta.short}记录
+            </div>
+            <div className="mt-1 text-2xl font-bold">
+              {stats ? stats.total : "—"}
+            </div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {stats
+                ? `部署 ${stats.by_kind?.deployment ?? 0} | 配置 ${
+                    stats.by_kind?.config ?? 0
+                  } | 扩缩容 ${stats.by_kind?.scale ?? 0}`
+                : "暂无统计数据"}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="py-4">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">
+              涉及服务
+            </div>
+            <div className="mt-1 text-2xl font-bold">
+              {stats ? stats.services : "—"}
+            </div>
+            <div className="mt-1 truncate text-xs text-muted-foreground">
+              {stats?.top_services && stats.top_services.length > 0
+                ? `主要服务 ${stats.top_services.slice(0, 3).join("、")}`
+                : "无服务字段的真实记录"}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent className="py-4">
+            <div className="text-xs uppercase tracking-wide text-muted-foreground">
+              记录类型
+            </div>
+            <div className="mt-1 text-2xl font-bold">
+              {dominantKind ? kindLabel(dominantKind[0]) : "—"}
+            </div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {kindRows.length === 0
+                ? "当前窗口内暂无变更事件。"
+                : kindRows.length === 1
+                  ? "当前数据均为集群事件。"
+                  : `${kindRows
+                      .slice(0, 2)
+                      .map(([k, count]) => `${kindLabel(k)} ${count} 条`)
+                      .join(" · ")}（占 ${dominantShare}%）`}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardContent className="py-4">
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+            <label className="relative md:col-span-2 lg:col-span-1">
+              <span className="sr-only">搜索变更</span>
+              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <input
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                placeholder="搜索服务、资源名称或事件内容"
+                className="h-9 w-full rounded-md border bg-background pl-9 pr-3 text-sm outline-none focus:border-primary"
+              />
+            </label>
+
+            <label>
+              <span className="sr-only">类型</span>
+              <select
+                value={kind}
+                onChange={(e) => {
+                  setKind(e.target.value)
+                  setPage(1)
+                }}
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm outline-none focus:border-primary"
+              >
+                <option value="">全部类型</option>
+                {kindRows.map(([k]) => (
+                  <option key={k} value={k}>
+                    {kindLabel(k)}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span className="sr-only">来源</span>
+              <select
+                value={system}
+                onChange={(e) => {
+                  setSystem(e.target.value)
+                  setPage(1)
+                }}
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm outline-none focus:border-primary"
+              >
+                <option value="">全部来源</option>
+                {(stats?.systems ?? []).map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span className="sr-only">命名空间</span>
+              <select
+                value={namespace}
+                onChange={(e) => {
+                  setNamespace(e.target.value)
+                  setPage(1)
+                }}
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm outline-none focus:border-primary"
+              >
+                <option value="">全部命名空间</option>
+                {(stats?.namespaces ?? []).map((ns) => (
+                  <option key={ns} value={ns}>
+                    {ns}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
-        </Card>
-      )}
 
-      {status === "ready" && sourceReal && changes.length === 0 && (
-        <Card className="flex h-[320px] flex-col items-center justify-center gap-3 px-6 text-center">
-          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-            <Inbox className="h-6 w-6" />
-          </span>
-          <div>
-            <p className="text-sm font-semibold">
-              近 {WINDOW_HOURS} 小时无真实变更记录
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              变更源已连接
-              {data?.source.type ? `（${data.source.type}）` : ""}
-              ，该时间窗口内未查询到变更事件
-            </p>
-          </div>
-        </Card>
-      )}
+          {activeFilterCount > 0 && (
+            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <span>已启用 {activeFilterCount} 个筛选条件</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setKind("")
+                  setSystem("")
+                  setNamespace("")
+                  setSearchText("")
+                  setSearchQuery("")
+                  setPage(1)
+                }}
+                className="inline-flex items-center gap-1 rounded-md border px-2 py-1 font-medium text-foreground hover:bg-accent"
+              >
+                <RotateCcw className="h-3 w-3" />
+                重置
+              </button>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
-      {status === "ready" && sourceReal && changes.length > 0 && (
-        <>
-          <div className="grid gap-4 md:grid-cols-3">
-            <Card>
-              <CardContent className="py-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">
-                  近 {WINDOW_HOURS}h 变更
-                </div>
-                <div className="mt-1 text-2xl font-bold">{stats.total}</div>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardContent className="py-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">
-                  类型分布
-                </div>
-                <div className="mt-1 text-2xl font-bold">
-                  {stats.kindCounts.length}
-                  <span className="ml-1 text-xs font-normal text-muted-foreground">
-                    种类型
-                  </span>
-                </div>
-                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                  {stats.kindCounts.map(([kind, count]) => (
-                    <span key={kind}>
-                      {kindLabel(kind)} {count}
-                    </span>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
-            <Card>
-              <CardContent className="py-4">
-                <div className="text-xs uppercase tracking-wide text-muted-foreground">
-                  涉及服务
-                </div>
-                <div className="mt-1 text-2xl font-bold">{stats.services}</div>
-                {stats.serviceNames.length > 0 && (
-                  <div
-                    className="mt-1 truncate text-xs text-muted-foreground"
-                    title={stats.serviceNames.join("、")}
-                  >
-                    {stats.serviceNames.slice(0, 3).join("、")}
-                    {stats.serviceNames.length > 3 ? " 等" : ""}
-                  </div>
+      <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1fr)_360px] xl:grid-cols-[minmax(0,1fr)_400px]">
+        <div className="min-w-0 space-y-6">
+          <div className="flex flex-wrap gap-1 border-b">
+            <button
+              type="button"
+              onClick={() => {
+                setKind("")
+                setPage(1)
+              }}
+              className={cn(
+                "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+                kind === ""
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              )}
+            >
+              全部 {stats?.total ?? 0}
+            </button>
+            {kindRows.map(([k, count]) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => {
+                  setKind(k)
+                  setPage(1)
+                }}
+                className={cn(
+                  "-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+                  kind === k
+                    ? "border-primary text-foreground"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
                 )}
-              </CardContent>
-            </Card>
+              >
+                {kindLabel(k)} {count}
+              </button>
+            ))}
           </div>
 
           <Card>
-            <CardHeader>
-              <CardTitle>变更时间线</CardTitle>
-              <CardDescription>
-                按时间倒序 · 数据来自真实变更源
-                {data?.window
-                  ? `（查询窗口 ${fmtTime(data.window.start)} ~ ${fmtTime(data.window.end)}）`
-                  : ""}
-              </CardDescription>
+            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <CardTitle>变更时间线</CardTitle>
+                <CardDescription>
+                  {data?.window
+                    ? `查询窗口 ${fmtDateTime(data.window.start)} ~ ${fmtDateTime(data.window.end)}`
+                    : `近${windowMeta.short}的真实变更记录`}
+                </CardDescription>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Switch
+                  checked={order === "desc"}
+                  onToggle={(next) => {
+                    setOrder(next ? "desc" : "asc")
+                    setPage(1)
+                  }}
+                  label="最新优先"
+                />
+                <Switch
+                  checked={dedupe}
+                  onToggle={(next) => {
+                    setDedupe(next)
+                    setPage(1)
+                  }}
+                  label="合并重复事件"
+                />
+              </div>
             </CardHeader>
-            <CardContent className="space-y-4">
-              {data?.truncated && (
-                <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>
-                    该窗口内真实变更源共返回 {data.total ?? stats.total} 条，为保证页面流畅仅加载最新 {changes.length} 条；
-                    统计卡片按全部 {stats.total} 条计算。
-                  </span>
-                </div>
-              )}
-              <div className="space-y-4">
-                {pagedChanges.map((change, index) => {
-                  const Icon = kindIcon(change.kind)
-                  return (
+
+            <CardContent className="space-y-5">
+              {showingSkeleton && (
+                <div className="space-y-3">
+                  {Array.from({ length: 6 }).map((_, index) => (
                     <div
-                      key={`${change.id}-${(safePage - 1) * PAGE_SIZE + index}`}
-                      className="flex gap-4 rounded-md border bg-accent/20 p-4"
+                      key={index}
+                      className="flex animate-pulse items-start gap-4 rounded-md border p-4"
                     >
-                      <div className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-md bg-secondary">
-                        <Icon className="h-5 w-5" />
-                      </div>
-                      <div className="min-w-0 flex-1 space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="font-semibold">
-                            {change.service || "—"}
-                          </span>
-                          <Badge variant="secondary" className="text-xs">
-                            {kindLabel(change.kind)}
-                          </Badge>
-                          <Badge variant="outline" className="font-mono text-xs">
-                            {change.system}
-                          </Badge>
-                        </div>
-                        <div className="break-words text-sm">
-                          {change.message}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {fmtTime(change.time)}
-                        </div>
+                      <div className="h-3 w-16 rounded bg-muted" />
+                      <div className="h-8 w-8 rounded-full bg-muted" />
+                      <div className="flex-1 space-y-2">
+                        <div className="h-3 w-40 rounded bg-muted" />
+                        <div className="h-3 w-3/4 rounded bg-muted" />
                       </div>
                     </div>
-                  )
-                })}
-              </div>
-              {pageCount > 1 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4">
-                  <span className="text-xs text-muted-foreground">
-                    第 {(safePage - 1) * PAGE_SIZE + 1}-{Math.min(safePage * PAGE_SIZE, changes.length)} 条 / 已加载 {changes.length} 条
+                  ))}
+                </div>
+              )}
+
+              {status === "error" && (
+                <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-destructive/10 text-destructive">
+                    <AlertTriangle className="h-6 w-6" />
                   </span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      aria-label="上一页"
-                      disabled={safePage <= 1}
-                      onClick={() => setPage(safePage - 1)}
-                      className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                    </button>
-                    <span className="min-w-16 text-center font-mono text-xs">
-                      {safePage} / {pageCount}
-                    </span>
-                    <button
-                      type="button"
-                      aria-label="下一页"
-                      disabled={safePage >= pageCount}
-                      onClick={() => setPage(safePage + 1)}
-                      className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      <ChevronRight className="h-4 w-4" />
-                    </button>
+                  <div>
+                    <p className="text-sm font-semibold">变更记录加载失败</p>
+                    <p className="mt-1 max-w-lg break-words text-xs text-muted-foreground">
+                      {loadError || "后端 /api/v1/changes 暂不可用"}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void loadChanges()}
+                    className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    重试
+                  </button>
+                </div>
+              )}
+
+              {status !== "error" && !showingSkeleton && !sourceReal && (
+                <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-600 dark:text-amber-300">
+                    <AlertTriangle className="h-6 w-6" />
+                  </span>
+                  <div>
+                    <p className="text-sm font-semibold">变更源未配置</p>
+                    <p className="mt-1 max-w-lg break-words text-xs leading-5 text-muted-foreground">
+                      {data?.source.hint ||
+                        "未配置真实变更源（K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE 或平台事件源）"}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {status !== "error" && !showingSkeleton && sourceReal && total === 0 && (
+                <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                    <Inbox className="h-6 w-6" />
+                  </span>
+                  <div>
+                    <p className="text-sm font-semibold">
+                      近{windowMeta.short}无真实变更记录
+                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      变更源已连接
+                      {data?.source.type ? `（${data.source.type}）` : ""}
+                      ，当前筛选条件下未查询到变更事件
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {status !== "error" && !showingSkeleton && sourceReal && total > 0 && (
+                <div className="space-y-6">
+                  {days.map((day) => (
+                    <div key={day.key} className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-muted-foreground">
+                          {day.label}
+                        </span>
+                        <span className="h-px flex-1 bg-border" />
+                        <span className="text-xs text-muted-foreground">
+                          {day.items.length} 条
+                        </span>
+                      </div>
+
+                      <div className="relative">
+                        {day.items.map((item, index) => {
+                          const Icon = kindIcon(item.kind)
+                          const isSelected = item.id === selectedId
+                          return (
+                            <button
+                              key={`${item.id}-${index}`}
+                              type="button"
+                              onClick={() => setSelectedId(item.id)}
+                              className={cn(
+                                "flex w-full items-start gap-3 rounded-md border px-3 py-3 text-left transition-colors",
+                                isSelected
+                                  ? "border-sky-500/60 bg-sky-500/5 dark:bg-sky-500/10"
+                                  : "border-transparent hover:bg-accent/40"
+                              )}
+                            >
+                              <span className="w-16 shrink-0 pt-0.5 font-mono text-xs text-muted-foreground">
+                                {fmtClock(item.time)}
+                              </span>
+
+                              <span className="relative flex w-4 shrink-0 justify-center self-stretch">
+                                <span className="absolute inset-y-0 w-px bg-border" />
+                                <span
+                                  className={cn(
+                                    "relative mt-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-background",
+                                    isSelected ? "bg-sky-500" : "bg-muted-foreground/50"
+                                  )}
+                                />
+                              </span>
+
+                              <LevelIcon level={item.level} className="mt-0.5 shrink-0" />
+
+                              <span className="min-w-0 flex-1 space-y-1">
+                                <span className="flex flex-wrap items-center gap-2">
+                                  <span className="truncate text-sm font-semibold">
+                                    {resourceName(item)}
+                                  </span>
+                                  {item.namespace && (
+                                    <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                      {item.namespace}
+                                    </span>
+                                  )}
+                                  <span
+                                    className={cn(
+                                      "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold",
+                                      KIND_BADGE[item.kind] ??
+                                        "border-transparent bg-secondary text-secondary-foreground"
+                                    )}
+                                  >
+                                    <Icon className="h-3 w-3" />
+                                    {kindLabel(item.kind)}
+                                  </span>
+                                  {item.reason && (
+                                    <span className="inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                      {item.reason}
+                                    </span>
+                                  )}
+                                  {dedupe && (item.occurrences ?? 1) > 1 && (
+                                    <span className="inline-flex items-center rounded-full bg-secondary px-2 py-0.5 text-[10px] font-semibold text-secondary-foreground">
+                                      ×{item.occurrences}
+                                    </span>
+                                  )}
+                                </span>
+                                <span className="line-clamp-2 block break-words text-xs text-muted-foreground">
+                                  {item.message || "（源事件无描述）"}
+                                </span>
+                              </span>
+
+                              <ChevronRight
+                                className={cn(
+                                  "mt-1 h-4 w-4 shrink-0 text-muted-foreground",
+                                  isSelected && "text-sky-500"
+                                )}
+                              />
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {status !== "error" && !showingSkeleton && sourceReal && total > 0 && (
+                <div className="flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between">
+                  <span className="text-xs text-muted-foreground">
+                    共 {total} 条
+                    {pageCount > 1 ? ` · 第 ${page}/${pageCount} 页` : ""}
+                  </span>
+
+                  <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        aria-label="上一页"
+                        disabled={page <= 1}
+                        onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                      </button>
+                      {paginationItems(page, pageCount).map((item, index) =>
+                        item === "gap" ? (
+                          <span
+                            key={`gap-${index}`}
+                            className="px-1 text-xs text-muted-foreground"
+                          >
+                            …
+                          </span>
+                        ) : (
+                          <button
+                            key={item}
+                            type="button"
+                            onClick={() => setPage(item)}
+                            className={cn(
+                              "h-8 min-w-8 rounded-md border px-2 text-xs font-medium",
+                              item === page
+                                ? "border-primary bg-primary/10 text-foreground"
+                                : "hover:bg-accent"
+                            )}
+                          >
+                            {item}
+                          </button>
+                        )
+                      )}
+                      <button
+                        type="button"
+                        aria-label="下一页"
+                        disabled={!hasMore}
+                        onClick={() => setPage((prev) => prev + 1)}
+                        className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <ChevronRight className="h-4 w-4" />
+                      </button>
+                    </div>
+
+                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                      每页
+                      <select
+                        value={pageSize}
+                        onChange={(e) => {
+                          setPageSize(Number(e.target.value))
+                          setPage(1)
+                        }}
+                        className="h-8 rounded-md border bg-background px-2 text-xs outline-none focus:border-primary"
+                      >
+                        {PAGE_SIZES.map((size) => (
+                          <option key={size} value={size}>
+                            {size}
+                          </option>
+                        ))}
+                      </select>
+                      条
+                    </label>
                   </div>
                 </div>
               )}
             </CardContent>
           </Card>
-        </>
-      )}
+        </div>
+
+        <aside className="min-w-0 lg:sticky lg:top-6 lg:self-start">
+          {selected ? (
+            <Card className="min-w-0">
+              <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
+                <CardTitle className="text-base">记录详情</CardTitle>
+                <button
+                  type="button"
+                  aria-label="关闭详情"
+                  onClick={() => setSelectedId(null)}
+                  className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300" />
+                  <div className="min-w-0">
+                    <p className="break-words text-xs font-semibold text-amber-800 dark:text-amber-200">
+                      {selected.reason || levelLabel(selected.level)}
+                    </p>
+                    <p className="mt-0.5 break-words text-[11px] text-amber-700/90 dark:text-amber-200/80">
+                      {kindLabel(selected.kind)} · {levelLabel(selected.level)}
+                    </p>
+                  </div>
+                </div>
+
+                <dl className="grid grid-cols-2 gap-x-3 gap-y-3 text-xs">
+                  <div className="min-w-0">
+                    <dt className="text-muted-foreground">事件时间</dt>
+                    <dd className="mt-0.5 break-words font-medium">
+                      {fmtDateTime(selected.time)}
+                    </dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="text-muted-foreground">来源</dt>
+                    <dd className="mt-0.5 break-words font-medium">
+                      {selected.system || "—"}
+                    </dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="text-muted-foreground">类型</dt>
+                    <dd className="mt-0.5 break-words font-medium">
+                      {kindLabel(selected.kind)}
+                    </dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="text-muted-foreground">命名空间</dt>
+                    <dd className="mt-0.5 break-words font-medium">
+                      {selected.namespace || "—"}
+                    </dd>
+                  </div>
+                  <div className="col-span-2 min-w-0">
+                    <dt className="text-muted-foreground">资源名</dt>
+                    <dd className="mt-0.5 flex flex-wrap items-center gap-2 font-medium">
+                      <span className="break-all">{resourceName(selected)}</span>
+                      {selected.object_kind && (
+                        <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                          {selected.object_kind}
+                        </span>
+                      )}
+                    </dd>
+                  </div>
+                  {dedupe && (
+                    <div className="col-span-2 min-w-0">
+                      <dt className="text-muted-foreground">合并统计</dt>
+                      <dd className="mt-0.5 break-words font-medium">
+                        {selected.occurrences ?? 1} 条 · 首次{" "}
+                        {fmtDateTime(selected.first_seen ?? selected.time)} · 最近{" "}
+                        {fmtDateTime(selected.last_seen ?? selected.time)}
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold">原始事件</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        void copyText(
+                          selected.message || "",
+                          "已复制原始事件内容"
+                        )
+                      }
+                      className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] hover:bg-accent"
+                    >
+                      <Copy className="h-3 w-3" />
+                      复制
+                    </button>
+                  </div>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-3 font-mono text-[11px] leading-5">
+                    {selected.message || "（源事件未提供描述）"}
+                  </pre>
+                  <p className="text-[11px] text-muted-foreground">
+                    保留源事件内容，不代表已确认根因。
+                  </p>
+                </div>
+
+                <div className="space-y-1 rounded-md border bg-accent/20 p-3">
+                  <div className="text-xs font-semibold">关联服务</div>
+                  <p className="break-words text-xs font-medium">
+                    {selected.service || "—"}
+                  </p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {selected.service
+                      ? "来源于变更记录自身的 service 字段。"
+                      : "尚未关联服务，不要凭 Pod 名称推断服务关系。"}
+                  </p>
+                </div>
+
+                {copiedField && (
+                  <p className="text-[11px] text-muted-foreground">{copiedField}</p>
+                )}
+
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyText(recordSummary(selected), "已复制记录 JSON 摘要")
+                    }
+                    className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md border px-3 text-xs font-medium hover:bg-accent"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    复制记录
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => startRca(selected)}
+                    className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground hover:bg-primary/90"
+                  >
+                    发起 RCA 分析
+                  </button>
+                </div>
+              </CardContent>
+            </Card>
+          ) : (
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">记录详情</CardTitle>
+                <CardDescription>选择时间线中的一条记录查看详情</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-2 py-6 text-center text-xs text-muted-foreground">
+                <span className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-muted">
+                  <Activity className="h-5 w-5" />
+                </span>
+                <p>点击任意变更事件，可查看原始事件内容、命名空间与资源信息。</p>
+                <p>详情仅展示源事件字段，不做根因推断。</p>
+              </CardContent>
+            </Card>
+          )}
+        </aside>
+      </div>
     </div>
   )
 }
