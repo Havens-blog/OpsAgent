@@ -58,28 +58,24 @@ type APIServer struct {
 	// RCA engine reasons over. Previously a separate mock topology.ARMSClient
 	// served this endpoint, so real topology never reached the console.
 	topologySource sources.TopologySource
-
 	// changeSource is the REAL change-event source shared with the RCA engine
 	// (K8s deployment conditions or e-cam k8s-events, whichever is configured
-	// and verified reachable). changeSourceReal mirrors active["changes"]:
-	// when false, the dimension fell back to the honest empty source and
-	// /api/v1/changes MUST return an empty list with an explanatory hint —
-	// never query the fallback, never fabricate entries. Both are injected by
-	// initAgents from the same CreateRCASourcesWithFallback result the agents
-	// use, so the console and the RCA engine see one identical change feed.
+	// and reachable). changeSourceReal mirrors active["changes"]: when false the
+	// dimension fell back to the honest empty source and /api/v1/changes MUST
+	// return an empty list with a hint — never query the fallback, never
+	// fabricate entries.
 	changeSource     sources.ChangeSource
 	changeSourceReal bool
 
 	// changeCache memoizes the (expensive) real-source query for a short TTL:
-	// the K8s event scan takes seconds, and console reloads/polling would
-	// otherwise re-pay it on every visit. Keyed by the quantized window.
+	// the upstream event scan takes seconds, so console reloads would otherwise
+	// re-pay it on every visit. Keyed by the quantized window + source identity.
 	changeCacheMu    sync.Mutex
 	changeCacheSrc   sources.ChangeSource
 	changeCacheKey   string
 	changeCacheAt    time.Time
 	changeCacheItems []changeItemDTO
 	changeCacheStats map[string]interface{}
-
 
 	// RCA engine and report store
 	rcaEngine *engine.Engine
@@ -268,7 +264,6 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	// Construct and register the coordinator + specialist agents (nil-safe:
 	// a failed construction simply omits that agent).
 	server.initAgents()
-
 
 	server.setupRoutes()
 
@@ -1160,29 +1155,6 @@ func (s *APIServer) changesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// listAgentsHandler handles agent listing requests. It returns both a plain
-// id list (for backward compatibility) and rich metadata for each agent.
-func (s *APIServer) listAgentsHandler(w http.ResponseWriter, r *http.Request) {
-	ids := make([]string, 0, len(s.agents))
-	details := make([]*agentEntry, 0, len(s.agents))
-	for id := range s.agents {
-		ids = append(ids, id)
-		if meta, ok := s.agentMeta[id]; ok {
-			details = append(details, meta)
-		}
-	}
-
-	response := map[string]interface{}{
-		"agents":  ids,
-		"count":   len(ids),
-		"details": details,
-	}
-
-	s.writeJSONResponse(w, http.StatusOK, response)
-}
-
-// agentHandler handles individual agent requests (GET info, POST execute).
-func (s *APIServer) agentHandler(w http.ResponseWriter, r *http.Request) {
 // changeStats aggregates window-wide statistics over the FULL source result
 // (before any limit), so console stats stay honest even when the payload is
 // truncated for render safety.
@@ -1250,6 +1222,29 @@ func (s *APIServer) changeCacheSet(key string, items []changeItemDTO, stats map[
 	s.changeCacheStats = stats
 }
 
+// listAgentsHandler handles agent listing requests. It returns both a plain
+// id list (for backward compatibility) and rich metadata for each agent.
+func (s *APIServer) listAgentsHandler(w http.ResponseWriter, r *http.Request) {
+	ids := make([]string, 0, len(s.agents))
+	details := make([]*agentEntry, 0, len(s.agents))
+	for id := range s.agents {
+		ids = append(ids, id)
+		if meta, ok := s.agentMeta[id]; ok {
+			details = append(details, meta)
+		}
+	}
+
+	response := map[string]interface{}{
+		"agents":  ids,
+		"count":   len(ids),
+		"details": details,
+	}
+
+	s.writeJSONResponse(w, http.StatusOK, response)
+}
+
+// agentHandler handles individual agent requests (GET info, POST execute).
+func (s *APIServer) agentHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := strings.TrimPrefix(r.URL.Path, "/api/v1/agents/")
 
 	if agentID == "" {
