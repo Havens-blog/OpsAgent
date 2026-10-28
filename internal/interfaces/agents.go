@@ -13,7 +13,6 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 	"github.com/Havens-blog/OpsAgent/internal/tenant"
-	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
 
 // executableAgent is the narrow interface the API layer needs: run a task.
@@ -54,10 +53,17 @@ func (s *APIServer) initAgents() {
 		return exec
 	}
 
-	// Build RCA data sources FIRST: the log analyst needs the shared log
-	// source and the monitor needs the full set for its RCA engine.
-	// Progressive enhancement: real integrations where credentials are present
-	// (from env), honest empty sources otherwise.
+	// Specialist agents.
+	logAnalyst, laErr := agent.NewLogAnalystAgent(s.settings)
+	register("log_analyst", "LogAnalyst", "log_analyst",
+		"日志模式识别与错误关联分析",
+		[]string{"log_analysis", "pattern_detection", "error_correlation"},
+		wrapLogAnalyst(logAnalyst), laErr)
+
+	// Build RCA data sources with progressive enhancement: real integrations
+	// where credentials are present (from env), mock for every other
+	// dimension. The system is always functional and upgrades per-dimension as
+	// credentials are supplied.
 	dsCfg := agent.NewDataSourceConfigFromEnv()
 	rcaSources, active := agent.CreateRCASourcesWithFallback(dsCfg)
 	s.dataSourceStatus = active
@@ -66,25 +72,12 @@ func (s *APIServer) initAgents() {
 	// K8S_*/e-cam credentials), the endpoint returns an empty list with a hint
 	// and NEVER queries the fallback — no mock record may reach the console.
 	s.changeSource = rcaSources.ChangeSource
-	s.changeSourceReal = active["changes"]
-	s.logger.Info("RCA data sources configured",
+	s.changeSourceReal = active["changes"]	s.logger.Info("RCA data sources configured",
 		observability.Bool("metrics_real", active["metrics"]),
 		observability.Bool("topology_real", active["topology"]),
 		observability.Bool("changes_real", active["changes"]),
 		observability.Bool("logs_real", active["logs"]),
 	)
-
-	// Specialist agents.
-	logAnalyst, laErr := agent.NewLogAnalystAgent(s.settings)
-	if laErr == nil && logAnalyst != nil {
-		// Without this the analyst dead-ends on "log source not configured" —
-		// it has no source of its own and must share the RCA log source.
-		logAnalyst.SetLogSource(rcaSources.LogSource)
-	}
-	register("log_analyst", "LogAnalyst", "log_analyst",
-		"日志模式识别与错误关联分析",
-		[]string{"log_analysis", "pattern_detection", "error_correlation"},
-		wrapLogAnalyst(logAnalyst), laErr)
 
 	monitor, mErr := agent.NewMonitorAgent(s.settings, rcaSources)
 	register("monitor", "Monitor", "monitor",
@@ -98,45 +91,18 @@ func (s *APIServer) initAgents() {
 		[]string{"inspection", "compliance_check", "resource_audit"},
 		wrapInspector(inspector), iErr)
 
-	// Bind each specialist's real tools: into the agent's own registry (its LLM
-	// path can call them) and into s.agentTools for the chat tool registry —
-	// one source of truth; chat used to get unbound "use method directly" stubs.
-	bind := func(name string, tools []*tool.Tool, initialize func([]*tool.Tool) error) {
-		if len(tools) == 0 {
-			return
-		}
-		if err := initialize(tools); err != nil {
-			s.logger.Warn("Agent tool registration failed",
-				observability.String("agent", name),
-				observability.Err(err),
-			)
-		}
-		s.agentTools = append(s.agentTools, tools...)
-	}
-	if logAnalyst != nil {
-		bind("log_analyst", logAnalyst.BoundTools(), logAnalyst.Initialize)
-	}
-	if monitor != nil {
-		bind("monitor", monitor.BoundTools(), monitor.Initialize)
-	}
-	if inspector != nil {
-		bind("inspector", inspector.BoundTools(), inspector.Initialize)
-	}
-
-	// Coordinator orchestrates the specialists. Register the TYPED agents (not
-	// their embedded *BaseAgent): Go dispatches statically, and only the typed
-	// Execute carries the task-type routing into the real capabilities.
+	// Coordinator orchestrates the specialists.
 	coordinator, cErr := agent.NewCoordinatorAgent(s.settings)
 	if cErr == nil {
 		// Register specialists for delegation (best-effort).
 		if logAnalyst != nil {
-			_ = coordinator.RegisterAgent("log_analyst", logAnalyst)
+			_ = coordinator.RegisterAgent("log_analyst", logAnalyst.BaseAgent)
 		}
 		if monitor != nil {
-			_ = coordinator.RegisterAgent("monitor", monitor)
+			_ = coordinator.RegisterAgent("monitor", monitor.BaseAgent)
 		}
 		if inspector != nil {
-			_ = coordinator.RegisterAgent("inspector", inspector)
+			_ = coordinator.RegisterAgent("inspector", inspector.BaseAgent)
 		}
 	}
 	register("coordinator", "Coordinator", "coordinator",
