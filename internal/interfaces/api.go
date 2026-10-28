@@ -77,6 +77,9 @@ type APIServer struct {
 	approvalMgr      *guardrails.ApprovalManager
 	pendingApprovals *PendingApprovalStore
 
+	// Async agent task records (tenant-scoped, in-memory).
+	taskStore AgentTaskStore
+
 	// agentMeta holds display metadata for registered agents (keyed by id).
 	agentMeta map[string]*agentEntry
 
@@ -237,6 +240,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		chatService:       chatService,
 		approvalMgr:       approvalMgr,
 		pendingApprovals:  pendingApprovals,
+		taskStore:         NewMemoryAgentTaskStore(),
 		auditLog:          newRecentAuditLog(100),
 	}
 
@@ -334,6 +338,10 @@ func (s *APIServer) setupRoutes() {
 	// Agent management
 	s.router.HandleFunc("/api/v1/agents", s.protected(s.listAgentsHandler))
 	s.router.HandleFunc("/api/v1/agents/", s.protected(s.agentHandler))
+
+	// Async agent task lifecycle
+	s.router.HandleFunc("POST /api/v1/agents/{id}/tasks", s.protected(s.submitAgentTaskHandler))
+	s.router.HandleFunc("GET /api/v1/tasks/{id}", s.protected(s.getAgentTaskHandler))
 
 	// Inspection endpoints
 	s.router.HandleFunc("/api/v1/inspection/run", s.protected(s.inspectionHandler))

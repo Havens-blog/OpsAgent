@@ -268,6 +268,44 @@ export interface AgentExecResult {
   error?: string
 }
 
+export type AgentTaskStatus =
+  | "pending"
+  | "running"
+  | "awaiting_approval"
+  | "completed"
+  | "failed"
+  | "rejected"
+
+export interface AgentTaskResult {
+  success: boolean
+  response: string
+  data?: Record<string, unknown>
+  tools_used?: string[]
+  duration_ms: number
+  error?: string
+}
+
+export interface AgentTask {
+  id: string
+  agent_id: string
+  description: string
+  params?: Record<string, unknown>
+  client_task_id?: string
+  status: AgentTaskStatus
+  result?: AgentTaskResult
+  error?: string
+  approval_id?: string
+  tenant_id: number
+  user_id: number
+  created_at: string
+  updated_at: string
+}
+
+export interface SubmitAgentTaskResponse {
+  task: AgentTask
+  duplicated: boolean
+}
+
 export interface ServiceNode {
   id: string
   name: string
@@ -635,11 +673,28 @@ export const api = {
 
   listAgents: () => request<AgentInfo>("/api/v1/agents"),
 
+  /** @deprecated Use submitAgentTask + getAgentTask for async execution. */
   executeAgent: (agentId: string, description: string, params?: Record<string, unknown>) =>
     request<AgentExecResult>(`/api/v1/agents/${agentId}`, {
       method: "POST",
       body: JSON.stringify({ description, params }),
     }),
+
+  submitAgentTask: (
+    agentId: string,
+    body: {
+      description: string
+      params?: Record<string, unknown>
+      client_task_id?: string
+    }
+  ) =>
+    request<SubmitAgentTaskResponse>(`/api/v1/agents/${agentId}/tasks`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  getAgentTask: (id: string) =>
+    request<{ task: AgentTask }>(`/api/v1/tasks/${id}`),
 
   getDataSources: () =>
     request<DataSourceStatus>("/api/v1/config/datasources"),
