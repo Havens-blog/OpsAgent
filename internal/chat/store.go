@@ -27,6 +27,7 @@ type ConversationStore interface {
 	Get(ctx context.Context, id string) (*Conversation, error)
 	List(ctx context.Context) ([]*Conversation, error)
 	Delete(ctx context.Context, id string) error
+	UpdateTitle(ctx context.Context, id string, title string) error
 	AddMessage(ctx context.Context, convID string, msg *Message) error
 	ListMessages(ctx context.Context, convID string) ([]*Message, error)
 }
@@ -120,6 +121,21 @@ func (s *MemoryConversationStore) Delete(ctx context.Context, id string) error {
 	}
 	delete(s.conversations[tid], id)
 	delete(s.messages[tid], id)
+	return nil
+}
+
+// UpdateTitle renames a conversation within the ctx tenant, or not-found.
+func (s *MemoryConversationStore) UpdateTitle(ctx context.Context, id string, title string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tid := tenant.IDFrom(ctx)
+	conv, ok := s.conversations[tid][id]
+	if !ok {
+		return fmt.Errorf("conversation not found: %s", id)
+	}
+	conv.Title = title
+	conv.UpdatedAt = time.Now()
 	return nil
 }
 

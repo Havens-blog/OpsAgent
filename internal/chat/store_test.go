@@ -99,6 +99,39 @@ func TestConversationStoreListOrder(t *testing.T) {
 	}
 }
 
+// TestConversationStoreUpdateTitle verifies renaming within a tenant and
+// cross-tenant not-found isolation.
+func TestConversationStoreUpdateTitle(t *testing.T) {
+	st := NewMemoryConversationStore()
+	ctxA := tenant.WithID(context.Background(), 1)
+	ctxB := tenant.WithID(context.Background(), 2)
+
+	_ = st.Create(ctxA, conversation("conv-a", "old"))
+	_ = st.Create(ctxB, conversation("conv-b", "B"))
+
+	if err := st.UpdateTitle(ctxA, "conv-a", "renamed"); err != nil {
+		t.Fatalf("update title: %v", err)
+	}
+
+	conv, err := st.Get(ctxA, "conv-a")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if conv.Title != "renamed" {
+		t.Fatalf("title = %q, want renamed", conv.Title)
+	}
+	if conv.UpdatedAt.IsZero() {
+		t.Error("UpdatedAt should be set after rename")
+	}
+
+	if err := st.UpdateTitle(ctxA, "conv-b", "nope"); err == nil {
+		t.Error("tenant A must NOT rename tenant B's conv-b")
+	}
+	if err := st.UpdateTitle(ctxB, "conv-a", "nope"); err == nil {
+		t.Error("tenant B must NOT rename tenant A's conv-a")
+	}
+}
+
 // TestConversationStoreAddMessageTouchesUpdatedAt verifies AddMessage bumps the
 // conversation timestamp so newly active conversations surface to the top.
 func TestConversationStoreAddMessageTouchesUpdatedAt(t *testing.T) {

@@ -696,6 +696,12 @@ export const api = {
   deleteConversation: (id: string) =>
     request<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
 
+  renameConversation: (id: string, title: string) =>
+    request<{ conversation: Conversation }>(`/api/v1/conversations/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    }),
+
   sendMessageStream,
 
   listApprovals: () =>

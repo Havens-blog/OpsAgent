@@ -7,6 +7,7 @@ import {
   Check,
   Loader2,
   MessageSquare,
+  Pencil,
   Plus,
   Send,
   ShieldAlert,
@@ -91,8 +92,11 @@ export default function ChatPage() {
   const [loadingList, setLoadingList] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingTitle, setEditingTitle] = useState("")
 
   const abortRef = useRef<AbortController | null>(null)
+  const renamingRef = useRef(false)
   const streamIdRef = useRef<string>("")
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -195,6 +199,42 @@ export default function ChatPage() {
       }
     } catch (err) {
       setError(toMessage(err))
+    }
+  }
+
+  function startRename(conversation: Conversation) {
+    setEditingId(conversation.id)
+    setEditingTitle(conversation.title)
+  }
+
+  function cancelRename() {
+    setEditingId(null)
+    setEditingTitle("")
+  }
+
+  async function saveRename(id: string) {
+    if (renamingRef.current) return
+    const title = editingTitle.trim()
+    if (!title) {
+      cancelRename()
+      return
+    }
+    if (title === conversations.find((c) => c.id === id)?.title) {
+      cancelRename()
+      return
+    }
+
+    renamingRef.current = true
+    try {
+      const { conversation } = await api.renameConversation(id, title)
+      setConversations((prev) =>
+        prev.map((c) => (c.id === id ? conversation : c))
+      )
+      cancelRename()
+    } catch (err) {
+      setError(toMessage(err))
+    } finally {
+      renamingRef.current = false
     }
   }
 
@@ -590,43 +630,77 @@ export default function ChatPage() {
                   const active = c.id === activeId
                   return (
                     <li key={c.id}>
-                      <div
-                        className={cn(
-                          "group flex items-center gap-1 rounded-md transition-colors",
-                          active
-                            ? "bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] text-white"
-                            : "hover:bg-accent"
-                        )}
-                      >
-                        <button
-                          onClick={() => void selectConversation(c.id)}
-                          className="min-w-0 flex-1 px-3 py-2 text-left"
-                        >
-                          <span className="block truncate text-sm font-medium">
-                            {c.title}
-                          </span>
-                          <span
-                            className={cn(
-                              "block truncate text-xs",
-                              active ? "text-white/70" : "text-muted-foreground"
-                            )}
-                          >
-                            {formatTime(c.updated_at)}
-                          </span>
-                        </button>
-                        <button
-                          onClick={() => void removeConversation(c.id)}
-                          aria-label="删除会话"
+                      {editingId === c.id ? (
+                        <div className="flex items-center gap-1 rounded-md bg-accent">
+                          <input
+                            autoFocus
+                            value={editingTitle}
+                            onChange={(e) => setEditingTitle(e.target.value)}
+                            onFocus={(e) => e.currentTarget.select()}
+                            onBlur={() => void saveRename(c.id)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault()
+                                void saveRename(c.id)
+                              } else if (e.key === "Escape") {
+                                cancelRename()
+                              }
+                            }}
+                            aria-label="重命名会话"
+                            className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[#7170ff] focus:ring-1 focus:ring-[#7170ff]"
+                          />
+                        </div>
+                      ) : (
+                        <div
                           className={cn(
-                            "mr-1 rounded-md p-1.5 opacity-0 transition-opacity group-hover:opacity-100",
+                            "group flex items-center gap-1 rounded-md transition-colors",
                             active
-                              ? "text-white hover:bg-white/20"
-                              : "text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                              ? "bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] text-white"
+                              : "hover:bg-accent"
                           )}
                         >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
-                      </div>
+                          <button
+                            onClick={() => void selectConversation(c.id)}
+                            className="min-w-0 flex-1 px-3 py-2 text-left"
+                          >
+                            <span className="block truncate text-sm font-medium">
+                              {c.title}
+                            </span>
+                            <span
+                              className={cn(
+                                "block truncate text-xs",
+                                active ? "text-white/70" : "text-muted-foreground"
+                              )}
+                            >
+                              {formatTime(c.updated_at)}
+                            </span>
+                          </button>
+                          <button
+                            onClick={() => startRename(c)}
+                            aria-label="重命名会话"
+                            className={cn(
+                              "rounded-md p-1.5 opacity-0 transition-opacity group-hover:opacity-100",
+                              active
+                                ? "text-white hover:bg-white/20"
+                                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                            )}
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                          <button
+                            onClick={() => void removeConversation(c.id)}
+                            aria-label="删除会话"
+                            className={cn(
+                              "mr-1 rounded-md p-1.5 opacity-0 transition-opacity group-hover:opacity-100",
+                              active
+                                ? "text-white hover:bg-white/20"
+                                : "text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                            )}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+                      )}
                     </li>
                   )
                 })}
