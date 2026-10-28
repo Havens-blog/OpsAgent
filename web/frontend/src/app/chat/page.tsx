@@ -96,6 +96,29 @@ export default function ChatPage() {
   const streamIdRef = useRef<string>("")
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  // High-frequency stream deltas are accumulated here and flushed once per
+  // animation frame, so the UI does not re-render the whole message list for
+  // every tiny LLM delta (which caused visible jank).
+  const deltaBufRef = useRef<{ streamId: string; parts: string[]; rafId: number | null }>({
+    streamId: "",
+    parts: [],
+    rafId: null,
+  })
+
+  function flushDeltaBuffer() {
+    const buf = deltaBufRef.current
+    if (buf.rafId != null) {
+      cancelAnimationFrame(buf.rafId)
+      buf.rafId = null
+    }
+    const chunk = buf.parts.join("")
+    buf.parts = []
+    if (!chunk) return
+    const sid = buf.streamId
+    setMessages((prev) =>
+      prev.map((m) => (m.id === sid ? { ...m, content: m.content + chunk } : m))
+    )
+  }
 
   function stopStream() {
     abortRef.current?.abort()
@@ -222,18 +245,31 @@ export default function ChatPage() {
       await api.sendMessageStream(conversationId, content, {
         signal: controller.signal,
         onDelta: (delta) => {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === streamId ? { ...m, content: m.content + delta } : m
-            )
-          )
+          const buf = deltaBufRef.current
+          if (buf.streamId !== streamId) {
+            if (buf.rafId != null) {
+              cancelAnimationFrame(buf.rafId)
+              buf.rafId = null
+            }
+            buf.streamId = streamId
+            buf.parts = []
+          }
+          buf.parts.push(delta)
+          if (buf.rafId == null) {
+            buf.rafId = requestAnimationFrame(() => {
+              buf.rafId = null
+              flushDeltaBuffer()
+            })
+          }
         },
         onDone: () => {
+          flushDeltaBuffer()
           setMessages((prev) =>
             prev.map((m) => (m.id === streamId ? { ...m, streaming: false } : m))
           )
         },
         onError: (msg) => {
+          flushDeltaBuffer()
           if (approvalRequired) {
             setMessages((prev) =>
               prev.map((m) => (m.id === streamId ? { ...m, streaming: false } : m))
