@@ -22,6 +22,8 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/datasource/credentials"
 	"github.com/Havens-blog/OpsAgent/internal/datasource/registry"
 	"github.com/Havens-blog/OpsAgent/internal/mcp"
+	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
+	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
 )
 
 var (
@@ -55,14 +57,38 @@ func main() {
 	// Create MCP server
 	server := mcp.NewServer(reg)
 
-	// Wire the topology source exactly like the REST API does: build the RCA
-	// source set from the environment and inject the topology dimension
-	// together with whether it is real. Without this the topology tool has no
-	// data source and must report that honestly instead of inventing a graph.
+	// Wire the RCA data sources exactly like the REST API does: build the source
+	// set from the environment ONCE and inject the topology, metric and log
+	// dimensions together with whether each is real. Without this the tools have
+	// no data source and must report that honestly instead of inventing results.
 	dsCfg := agent.NewDataSourceConfigFromEnv()
 	rcaSources, dsActive := agent.CreateRCASourcesWithFallback(dsCfg)
 	server.SetTopologySource(rcaSources.TopologySource, dsActive["topology"])
-	log.Printf("Topology source configured: %v", dsActive["topology"])
+	server.SetMetricSource(rcaSources.MetricSource, dsActive["metrics"])
+	server.SetLogSource(rcaSources.LogSource, dsActive["logs"])
+	log.Printf("RCA sources real: metrics=%v logs=%v topology=%v changes=%v",
+		dsActive["metrics"], dsActive["logs"], dsActive["topology"], dsActive["changes"])
+
+	// Build the real RCA engine over those same sources (mirrors
+	// internal/interfaces/api.go), so opsagent_rca_analyze runs the identical
+	// analysis as POST /api/v1/rca/analyze. On failure the engine stays
+	// unwired and the tool says so rather than fabricating a report.
+	traceSource := rcaSources.TraceSource
+	if traceSource == nil {
+		traceSource = sources.NewEmptyTraceSource()
+	}
+	rcaEngine, err := engine.NewEngine(
+		engine.WithLogSource(rcaSources.LogSource),
+		engine.WithMetricSource(rcaSources.MetricSource),
+		engine.WithTraceSource(traceSource),
+		engine.WithTopologySource(rcaSources.TopologySource),
+		engine.WithChangeSource(rcaSources.ChangeSource),
+	)
+	if err != nil {
+		log.Printf("Warning: RCA engine not wired into MCP (%v); opsagent_rca_analyze will report it honestly", err)
+	} else {
+		server.SetRCAEngine(rcaEngine)
+	}
 
 	// Start server
 	addr := fmt.Sprintf(":%d", *port)
