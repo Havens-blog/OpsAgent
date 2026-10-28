@@ -79,16 +79,19 @@ func changeItemFromModel(c models.Change) changeItemDTO {
 
 // changeQuery is the parsed contract of one GET /api/v1/changes request.
 type changeQuery struct {
-	start     time.Time
-	end       time.Time
-	order     string
-	limit     int
-	offset    int
-	kind      string
-	system    string
-	namespace string
-	q         string
-	dedupe    bool
+	start      time.Time
+	end        time.Time
+	order      string
+	limit      int
+	offset     int
+	kind       string
+	system     string
+	namespace  string
+	objectKind string
+	reason     string
+	level      string
+	q          string
+	dedupe     bool
 }
 
 // changeQueryError carries the client-facing reason a query param was
@@ -193,6 +196,9 @@ func parseChangeQuery(r *http.Request) (changeQuery, *changeQueryError) {
 	q.kind = strings.TrimSpace(raw.Get("kind"))
 	q.system = strings.TrimSpace(raw.Get("system"))
 	q.namespace = strings.TrimSpace(raw.Get("namespace"))
+	q.objectKind = strings.TrimSpace(raw.Get("object_kind"))
+	q.reason = strings.TrimSpace(raw.Get("reason"))
+	q.level = strings.TrimSpace(raw.Get("level"))
 	q.q = strings.TrimSpace(raw.Get("q"))
 	return q, nil
 }
@@ -202,9 +208,11 @@ func parseChangeQuery(r *http.Request) (changeQuery, *changeQueryError) {
 //
 // Query params: explicit start/end (RFC3339, take precedence) or hours
 // (default 24, clamped to 1..168); limit (default 20, clamped to 1..200);
-// offset (default 0); kind/system/namespace (exact match); q (case-insensitive
-// substring over service/object/message/reason); order (desc|asc); dedupe
-// (group by object|service + reason, keep the newest, report occurrences).
+// offset (default 0); kind/system/namespace/object_kind/reason/level (exact
+// match, empty means no filter — a value no record carries yields an empty
+// result rather than an error); q (case-insensitive substring over
+// service/object/message/reason); order (desc|asc); dedupe (group by
+// object|service + reason, keep the newest, report occurrences).
 //
 // The expensive source scan is cached for changeCacheTTL as the FULL, already
 // ordered window list plus the window-wide stats; every request then filters,
@@ -324,8 +332,10 @@ func sortChangeItems(items []changeItemDTO, order string) {
 	})
 }
 
-// filterChangeItems applies the exact-match kind/system/namespace filters and
-// the case-insensitive text search over the real source fields.
+// filterChangeItems applies the exact-match kind/system/namespace/object_kind/
+// reason/level filters and the case-insensitive text search over the real
+// source fields. Filtering happens before dedupe and paging, so total/has_more
+// are always computed over the filtered list.
 func filterChangeItems(items []changeItemDTO, q changeQuery) []changeItemDTO {
 	out := make([]changeItemDTO, 0, len(items))
 	needle := strings.ToLower(q.q)
@@ -339,12 +349,33 @@ func filterChangeItems(items []changeItemDTO, q changeQuery) []changeItemDTO {
 		if q.namespace != "" && it.Namespace != q.namespace {
 			continue
 		}
+		if q.objectKind != "" && it.ObjectKind != q.objectKind {
+			continue
+		}
+		if q.reason != "" && it.Reason != q.reason {
+			continue
+		}
+		if q.level != "" && !changeLevelMatches(it.Level, q.level) {
+			continue
+		}
 		if needle != "" && !changeMatchesQuery(it, needle) {
 			continue
 		}
 		out = append(out, it)
 	}
 	return out
+}
+
+// changeLevelMatches reports whether a record's raw details.level satisfies the
+// requested level filter. Records carrying no level are advertised by
+// changeStats under the "unknown" bucket, so that same key is accepted here —
+// otherwise the option the endpoint itself publishes would always come back
+// empty. Any other value that no record carries simply matches nothing.
+func changeLevelMatches(level, want string) bool {
+	if strings.TrimSpace(level) == "" {
+		level = "unknown"
+	}
+	return level == want
 }
 
 func changeMatchesQuery(it changeItemDTO, needle string) bool {
@@ -418,10 +449,14 @@ func dedupeChanges(items []changeItemDTO) []changeItemDTO {
 }
 
 // changeStats aggregates window-wide statistics over the FULL source result
-// (before any filter, grouping or page), so the console cards and type tabs
-// stay honest and stable while the user filters.
+// (before any filter, grouping or page), so the console cards, type tabs and
+// the object-kind/reason facets stay honest and stable while the user filters.
+// The two facets carry only values a record actually has, so every entry can be
+// turned into a filter that matches at least one record.
 func changeStats(items []changeItemDTO) map[string]interface{} {
 	byKind := map[string]int{}
+	byObjectKind := map[string]int{}
+	byReason := map[string]int{}
 	services := map[string]int{}
 	systems := map[string]int{}
 	namespaces := map[string]int{}
@@ -432,6 +467,15 @@ func changeStats(items []changeItemDTO) map[string]interface{} {
 			kind = "unknown"
 		}
 		byKind[kind]++
+		// object_kind/reason have no honest placeholder for a missing value
+		// (a chip for it would filter nothing), so records without one are
+		// left out of the facet instead of being bucketed.
+		if it.ObjectKind != "" {
+			byObjectKind[it.ObjectKind]++
+		}
+		if it.Reason != "" {
+			byReason[it.Reason]++
+		}
 		if it.Service != "" {
 			services[it.Service]++
 		}
@@ -449,13 +493,15 @@ func changeStats(items []changeItemDTO) map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total":        len(items),
-		"by_kind":      byKind,
-		"services":     len(services),
-		"top_services": topNames(services, 3),
-		"systems":      sortedNames(systems),
-		"namespaces":   sortedNames(namespaces),
-		"level_counts": levelCounts,
+		"total":          len(items),
+		"by_kind":        byKind,
+		"by_object_kind": byObjectKind,
+		"by_reason":      byReason,
+		"services":       len(services),
+		"top_services":   topNames(services, 3),
+		"systems":        sortedNames(systems),
+		"namespaces":     sortedNames(namespaces),
+		"level_counts":   levelCounts,
 	}
 }
 
