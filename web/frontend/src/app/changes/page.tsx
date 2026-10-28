@@ -114,17 +114,12 @@ export default function ChangesPage() {
       serviceCount = services.size
       serviceNames = [...services].sort()
     }
-    const knownKinds = ["deployment", "config", "scale"]
-    const other = Object.entries(byKind)
-      .filter(([kind]) => !knownKinds.includes(kind))
-      .reduce((sum, [, count]) => sum + count, 0)
+    const kindCounts = Object.entries(byKind)
+      .filter(([, count]) => count > 0)
+      .sort((a, b) => b[1] - a[1])
     return {
       total,
-      deployment: byKind["deployment"] ?? 0,
-      config: byKind["config"] ?? 0,
-      scale: byKind["scale"] ?? 0,
-      other,
-      kindsCovered: Object.values(byKind).filter((count) => count > 0).length,
+      kindCounts,
       services: serviceCount,
       serviceNames,
     }
@@ -231,16 +226,17 @@ export default function ChangesPage() {
                   类型分布
                 </div>
                 <div className="mt-1 text-2xl font-bold">
-                  {stats.kindsCovered}
+                  {stats.kindCounts.length}
                   <span className="ml-1 text-xs font-normal text-muted-foreground">
                     种类型
                   </span>
                 </div>
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                  <span>部署 {stats.deployment}</span>
-                  <span>配置 {stats.config}</span>
-                  <span>扩缩容 {stats.scale}</span>
-                  {stats.other > 0 && <span>其他 {stats.other}</span>}
+                  {stats.kindCounts.map(([kind, count]) => (
+                    <span key={kind}>
+                      {kindLabel(kind)} {count}
+                    </span>
+                  ))}
                 </div>
               </CardContent>
             </Card>
