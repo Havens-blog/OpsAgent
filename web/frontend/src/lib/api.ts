@@ -331,16 +331,50 @@ export interface ServiceGraph {
   edges: ServiceEdge[]
 }
 
-export interface DeploymentEvent {
+/* ---------- Changes (real change source) ---------- */
+
+/** One real change record from GET /api/v1/changes — a projection of
+ * models.Change. No fabricated author/status/correlation fields. */
+export interface ChangeItem {
   id: string
-  cicd_system: string
-  project: string
-  environment: string
+  /** Change kind: deployment | config | scale | k8s_event | ... */
+  kind: string
+  /** Originating system, e.g. "kubernetes". */
+  system: string
   service: string
-  commit_sha: string
-  commit_message: string
-  started_at: string
-  status: string
+  message: string
+  /** RFC3339 timestamp. */
+  time: string
+  details?: Record<string, string>
+}
+
+/** Change-source metadata. real=false means no real source is configured and
+ * the endpoint returned an honest empty list (hint explains what to set). */
+export interface ChangesSourceInfo {
+  real: boolean
+  type: string
+  hint?: string
+}
+
+/** Window-wide statistics computed server-side over the FULL source result
+ * (before payload truncation), so the console stats stay honest. */
+export interface ChangesStats {
+  total: number
+  by_kind: Record<string, number>
+  services: number
+  top_services: string[]
+}
+
+export interface ChangesResponse {
+  changes: ChangeItem[]
+  count: number
+  /** Total records the source returned for the window (may exceed count). */
+  total?: number
+  /** True when the payload was truncated to `limit` for render safety. */
+  truncated?: boolean
+  stats?: ChangesStats
+  source: ChangesSourceInfo
+  window?: { start: string; end: string }
 }
 
 /* ---------- RCA types ---------- */
@@ -725,6 +759,12 @@ export const api = {
 
   getTopology: () =>
     request<{ status: string; topology: ServiceGraph }>("/api/v1/topology"),
+
+  /** Real change events from the configured change source (hours window, default 24, backend caps at 168). */
+  getChanges: (hours?: number) =>
+    request<ChangesResponse>(
+      `/api/v1/changes${hours != null ? `?hours=${encodeURIComponent(hours)}` : ""}`
+    ),
 
   chat: (messages: ChatMessage[]) =>
     request<ChatResponse>("/api/v1/chat", {
