@@ -68,15 +68,59 @@ const KIND_LABELS: Record<string, string> = {
 /** Type-tab ordering; unknown kinds are appended alphabetically. */
 const KIND_ORDER = ["deployment", "config", "scale", "k8s_event"]
 
-const KIND_BADGE: Record<string, string> = {
-  deployment:
-    "border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-500/30 dark:bg-indigo-500/15 dark:text-indigo-300",
-  config:
-    "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-300",
-  scale:
-    "border-orange-200 bg-orange-50 text-orange-700 dark:border-orange-500/30 dark:bg-orange-500/15 dark:text-orange-300",
-  k8s_event:
-    "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/15 dark:text-sky-300",
+/** 类型徽标统一中性灰：变更类型不是状态，不参与配色。 */
+const KIND_BADGE = "border-border bg-subtle text-muted-foreground"
+
+/** 中性标签（命名空间、对象类型、过程类原因）共用的一套灰。 */
+const NEUTRAL_TAG = "border-border bg-subtle text-muted-foreground"
+
+/**
+ * 原因分色：只有失败/异常才上色。
+ * danger = 容器/调度层面的确定性故障；warning = 重试、探针、拉取类异常；
+ * 其余（过程、成功、信息）一律中性灰。
+ */
+const DANGER_REASONS = new Set([
+  "OOMKilling",
+  "Evicted",
+  "CrashLoopBackOff",
+  "FailedScheduling",
+])
+
+const WARNING_REASONS = new Set([
+  "BackOff",
+  "Unhealthy",
+  "ErrImagePull",
+  "ImagePullBackOff",
+  "SyncLoadBalancerFailed",
+  "ReconcileALBInstanceFailed",
+])
+
+type ReasonTone = "danger" | "warning" | "neutral"
+
+function reasonTone(reason?: string): ReasonTone {
+  if (!reason) return "neutral"
+  if (DANGER_REASONS.has(reason)) return "danger"
+  if (WARNING_REASONS.has(reason) || reason.startsWith("Failed")) return "warning"
+  return "neutral"
+}
+
+const REASON_BADGE: Record<ReasonTone, string> = {
+  danger: "border-danger/40 bg-danger-soft text-danger",
+  warning: "border-warning-border bg-warning-soft text-warning",
+  neutral: NEUTRAL_TAG,
+}
+
+/** 详情警示条：与原因徽标同色系，中性原因不冒充告警。 */
+const REASON_BANNER: Record<ReasonTone, string> = {
+  danger: "border-danger/40 bg-danger-soft",
+  warning: "border-warning-border bg-warning-soft",
+  neutral: "border-border bg-subtle",
+}
+
+const REASON_ACCENT: Record<ReasonTone, string> = {
+  danger: "text-danger",
+  warning: "text-warning",
+  neutral: "text-foreground",
 }
 
 // Curated Chinese labels for well-known Kubernetes event reasons. Display-only
@@ -252,16 +296,19 @@ function fmtDateTime(iso?: string): string {
   return date.toLocaleString("zh-CN", { hour12: false })
 }
 
-/** Severity icon: warning = orange, info = blue, anything else = neutral. */
+/** 级别图标：warning = 警告色，error = 危险色，info = 中性三级文字。 */
 function LevelIcon({ level, className }: { level?: string; className?: string }) {
   const normalized = (level ?? "").toLowerCase()
   if (normalized === "warning") {
     return (
-      <CircleAlert className={cn("h-4 w-4 text-orange-500", className)} />
+      <CircleAlert className={cn("h-4 w-4 text-warning", className)} />
     )
   }
+  if (normalized === "error") {
+    return <CircleAlert className={cn("h-4 w-4 text-danger", className)} />
+  }
   if (normalized === "info") {
-    return <Info className={cn("h-4 w-4 text-sky-500", className)} />
+    return <Info className={cn("h-4 w-4 text-tertiary", className)} />
   }
   return <Circle className={cn("h-4 w-4 text-muted-foreground", className)} />
 }
@@ -339,7 +386,7 @@ function Switch({
       className={cn(
         "inline-flex items-center gap-2 rounded-md px-1.5 py-1 text-xs transition-colors",
         checked ? "text-foreground" : "text-muted-foreground",
-        "hover:bg-accent"
+        "hover:bg-subtle"
       )}
     >
       <span
@@ -350,7 +397,7 @@ function Switch({
       >
         <span
           className={cn(
-            "inline-block h-3 w-3 rounded-full bg-white shadow transition-transform",
+            "inline-block h-3 w-3 rounded-full bg-primary-foreground shadow transition-transform",
             checked ? "translate-x-3.5" : "translate-x-0.5"
           )}
         />
@@ -480,6 +527,8 @@ export default function ChangesPage() {
     () => changes.find((item) => item.id === selectedId) ?? null,
     [changes, selectedId]
   )
+
+  const selectedReasonTone = reasonTone(selected?.reason)
 
   const windowMeta = WINDOWS.find((w) => w.hours === hours) ?? WINDOWS[2]
   const days = useMemo(() => groupByDay(changes), [changes])
@@ -747,7 +796,7 @@ export default function ChangesPage() {
           <button
             type="button"
             onClick={() => void loadChanges()}
-            className="inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium hover:bg-accent"
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-surface px-3 text-sm font-medium hover:bg-subtle"
           >
             <RefreshCw className={cn("h-4 w-4", refreshing && "animate-spin")} />
             刷新
@@ -756,7 +805,7 @@ export default function ChangesPage() {
             type="button"
             onClick={() => void handleExport()}
             disabled={exportState.status === "busy"}
-            className="inline-flex h-9 items-center gap-2 rounded-md border px-3 text-sm font-medium hover:bg-accent disabled:opacity-50"
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-surface px-3 text-sm font-medium hover:bg-subtle disabled:opacity-50"
           >
             {exportState.status === "busy" ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -773,8 +822,8 @@ export default function ChangesPage() {
           className={cn(
             "flex items-start gap-2 rounded-md border px-3 py-2 text-xs",
             exportState.status === "error"
-              ? "border-destructive/30 bg-destructive/10 text-destructive"
-              : "border-border bg-accent/40 text-muted-foreground"
+              ? "border-danger/30 bg-danger-soft text-danger"
+              : "border-border bg-subtle text-muted-foreground"
           )}
         >
           {exportState.status === "done" && (
@@ -957,7 +1006,7 @@ export default function ChangesPage() {
               <button
                 type="button"
                 onClick={clearFilters}
-                className="inline-flex items-center gap-1 rounded-md border px-2 py-1 font-medium text-foreground hover:bg-accent"
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-surface px-2 py-1 font-medium text-foreground hover:bg-subtle"
               >
                 <RotateCcw className="h-3 w-3" />
                 重置
@@ -1006,7 +1055,7 @@ export default function ChangesPage() {
           </div>
 
           {showObjectKinds && (
-            <div className="rounded-lg border bg-accent/20 px-3 py-2.5">
+            <div className="rounded-lg border border-border bg-subtle px-3 py-2.5">
               <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                 <span className="text-xs font-semibold text-foreground">
                   对象类型
@@ -1027,7 +1076,7 @@ export default function ChangesPage() {
                     "inline-flex max-w-full items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
                     objectKind === ""
                       ? "border-transparent bg-primary text-primary-foreground"
-                      : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                      : "border-border bg-surface text-muted-foreground hover:bg-subtle hover:text-foreground"
                   )}
                 >
                   <span className="truncate">全部对象</span>
@@ -1048,7 +1097,7 @@ export default function ChangesPage() {
                       "inline-flex max-w-full items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
                       objectKind === name
                         ? "border-transparent bg-primary text-primary-foreground"
-                        : "border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground"
+                        : "border-border bg-surface text-muted-foreground hover:bg-subtle hover:text-foreground"
                     )}
                   >
                     <span className="truncate">{name}</span>
@@ -1135,7 +1184,7 @@ export default function ChangesPage() {
 
               {status === "error" && (
                 <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
-                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-destructive/10 text-destructive">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-danger-soft text-danger">
                     <AlertTriangle className="h-6 w-6" />
                   </span>
                   <div>
@@ -1147,7 +1196,7 @@ export default function ChangesPage() {
                   <button
                     type="button"
                     onClick={() => void loadChanges()}
-                    className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                    className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground hover:bg-primary-hover"
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
                     重试
@@ -1157,7 +1206,7 @@ export default function ChangesPage() {
 
               {status !== "error" && !showingSkeleton && !sourceReal && (
                 <div className="flex flex-col items-center justify-center gap-3 px-6 py-12 text-center">
-                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-600 dark:text-amber-300">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-warning-soft text-warning">
                     <AlertTriangle className="h-6 w-6" />
                   </span>
                   <div>
@@ -1214,8 +1263,8 @@ export default function ChangesPage() {
                               className={cn(
                                 "flex w-full items-start gap-3 rounded-md border px-3 py-3 text-left transition-colors",
                                 isSelected
-                                  ? "border-sky-500 bg-sky-50 dark:border-sky-500/70 dark:bg-sky-500/10"
-                                  : "border-transparent hover:bg-accent/40"
+                                  ? "border-primary-border bg-primary-soft"
+                                  : "border-transparent hover:bg-subtle"
                               )}
                             >
                               <span className="w-16 shrink-0 pt-0.5 font-mono text-xs text-muted-foreground">
@@ -1227,7 +1276,7 @@ export default function ChangesPage() {
                                 <span
                                   className={cn(
                                     "relative mt-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-background",
-                                    isSelected ? "bg-sky-500" : "bg-muted-foreground/50"
+                                    isSelected ? "bg-primary" : "bg-muted-foreground/50"
                                   )}
                                 />
                               </span>
@@ -1240,28 +1289,33 @@ export default function ChangesPage() {
                                     {resourceName(item)}
                                   </span>
                                   {item.namespace && (
-                                    <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                    <span className={cn("rounded border px-1.5 py-0.5 font-mono text-[10px]", NEUTRAL_TAG)}>
                                       {item.namespace}
                                     </span>
                                   )}
                                   {item.object_kind && (
-                                    <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                                    <span className={cn("rounded border px-1.5 py-0.5 font-mono text-[10px]", NEUTRAL_TAG)}>
                                       {item.object_kind}
                                     </span>
                                   )}
                                   <span
                                     className={cn(
-                                      "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold",
-                                      KIND_BADGE[item.kind] ??
-                                        "border-transparent bg-secondary text-secondary-foreground"
+                                      "inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold",
+                                      KIND_BADGE
                                     )}
                                   >
                                     <Icon className="h-3 w-3" />
                                     {kindLabel(item.kind)}
                                   </span>
                                   {item.reason && (
-                                    <span className="inline-flex items-center rounded border border-orange-200 bg-orange-50 px-1.5 py-0.5 font-mono text-[10px] font-medium text-orange-700 dark:border-orange-500/30 dark:bg-orange-500/15 dark:text-orange-300">
-                                      {item.reason}
+                                    <span
+                                      title={item.reason}
+                                      className={cn(
+                                        "inline-block max-w-[16rem] truncate rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium",
+                                        REASON_BADGE[reasonTone(item.reason)]
+                                      )}
+                                    >
+                                      {reasonLabel(item.reason) || item.reason}
                                     </span>
                                   )}
                                   {dedupe && (item.occurrences ?? 1) > 1 && (
@@ -1278,7 +1332,7 @@ export default function ChangesPage() {
                               <ChevronRight
                                 className={cn(
                                   "mt-1 h-4 w-4 shrink-0 text-muted-foreground",
-                                  isSelected && "text-sky-500"
+                                  isSelected && "text-primary"
                                 )}
                               />
                             </button>
@@ -1304,7 +1358,7 @@ export default function ChangesPage() {
                         aria-label="上一页"
                         disabled={page <= 1}
                         onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-                        className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-surface hover:bg-subtle disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         <ChevronLeft className="h-4 w-4" />
                       </button>
@@ -1324,8 +1378,8 @@ export default function ChangesPage() {
                             className={cn(
                               "h-8 min-w-8 rounded-md border px-2 text-xs font-medium",
                               item === page
-                                ? "border-primary bg-primary/10 text-foreground"
-                                : "hover:bg-accent"
+                                ? "border-primary-border bg-primary-soft text-primary"
+                                : "border-border bg-surface hover:bg-subtle"
                             )}
                           >
                             {item}
@@ -1337,7 +1391,7 @@ export default function ChangesPage() {
                         aria-label="下一页"
                         disabled={!hasMore}
                         onClick={() => setPage((prev) => prev + 1)}
-                        className="flex h-8 w-8 items-center justify-center rounded-md border hover:bg-accent disabled:cursor-not-allowed disabled:opacity-40"
+                        className="flex h-8 w-8 items-center justify-center rounded-md border border-border bg-surface hover:bg-subtle disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         <ChevronRight className="h-4 w-4" />
                       </button>
@@ -1377,24 +1431,45 @@ export default function ChangesPage() {
                   type="button"
                   aria-label="关闭详情"
                   onClick={() => setSelectedId(null)}
-                  className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                  className="rounded-md p-1 text-muted-foreground hover:bg-subtle hover:text-foreground"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="flex items-start gap-2 rounded-md border border-orange-200 bg-orange-50 px-3 py-2.5 dark:border-orange-500/30 dark:bg-orange-500/10">
-                  <CircleAlert className="mt-0.5 h-4 w-4 shrink-0 text-orange-500" />
+                <div
+                  className={cn(
+                    "flex items-start gap-2 rounded-md border px-3 py-2.5",
+                    REASON_BANNER[selectedReasonTone]
+                  )}
+                >
+                  <CircleAlert
+                    className={cn(
+                      "mt-0.5 h-4 w-4 shrink-0",
+                      REASON_ACCENT[selectedReasonTone]
+                    )}
+                  />
                   <div className="min-w-0 space-y-1.5">
-                    <p className="break-words text-xs font-semibold text-orange-800 dark:text-orange-200">
+                    <p
+                      className={cn(
+                        "break-words text-xs font-semibold",
+                        REASON_ACCENT[selectedReasonTone]
+                      )}
+                    >
                       {reasonLabel(selected.reason) || levelLabel(selected.level)}
                     </p>
                     {selected.reason && (
-                      <span className="inline-flex max-w-full items-center truncate rounded border border-orange-300 bg-white/70 px-1.5 py-0.5 font-mono text-[10px] font-medium text-orange-700 dark:border-orange-500/40 dark:bg-orange-500/10 dark:text-orange-300">
+                      <span
+                        title={selected.reason}
+                        className={cn(
+                          "inline-block max-w-full truncate rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium",
+                          REASON_BADGE[selectedReasonTone]
+                        )}
+                      >
                         {selected.reason}
                       </span>
                     )}
-                    <p className="break-words text-[11px] text-orange-700/90 dark:text-orange-200/80">
+                    <p className="break-words text-[11px] text-muted-foreground">
                       {kindLabel(selected.kind)} · {levelLabel(selected.level)}
                     </p>
                   </div>
@@ -1430,7 +1505,7 @@ export default function ChangesPage() {
                     <dd className="mt-0.5 flex flex-wrap items-center gap-2 font-medium">
                       <span className="break-all">{resourceName(selected)}</span>
                       {selected.object_kind && (
-                        <span className="rounded border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+                        <span className={cn("rounded border px-1.5 py-0.5 font-mono text-[10px]", NEUTRAL_TAG)}>
                           {selected.object_kind}
                         </span>
                       )}
@@ -1459,7 +1534,7 @@ export default function ChangesPage() {
                           "已复制原始事件内容"
                         )
                       }
-                      className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] hover:bg-accent"
+                      className="inline-flex items-center gap-1 rounded-md border border-border bg-surface px-2 py-1 text-[11px] hover:bg-subtle"
                     >
                       <Copy className="h-3 w-3" />
                       复制
@@ -1473,7 +1548,7 @@ export default function ChangesPage() {
                   </p>
                 </div>
 
-                <div className="space-y-1 rounded-md border bg-accent/20 p-3">
+                <div className="space-y-1 rounded-md border border-border bg-subtle p-3">
                   <div className="text-xs font-semibold">关联服务</div>
                   <p className="break-words text-xs font-medium">
                     {selected.service || "—"}
@@ -1495,7 +1570,7 @@ export default function ChangesPage() {
                     onClick={() =>
                       void copyText(recordSummary(selected), "已复制记录 JSON 摘要")
                     }
-                    className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md border px-3 text-xs font-medium hover:bg-accent"
+                    className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md border border-border bg-surface px-3 text-xs font-medium hover:bg-subtle"
                   >
                     <Copy className="h-3.5 w-3.5" />
                     复制记录
@@ -1503,7 +1578,7 @@ export default function ChangesPage() {
                   <button
                     type="button"
                     onClick={() => startRca(selected)}
-                    className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground hover:bg-primary/90"
+                    className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded-md bg-primary px-3 text-xs font-semibold text-primary-foreground hover:bg-primary-hover"
                   >
                     发起 RCA 分析
                   </button>
