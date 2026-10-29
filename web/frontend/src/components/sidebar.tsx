@@ -5,9 +5,9 @@
 //   top     : Xirang logo + tenant selector (glass button, accent-blue icon)
 //   divider : gradient hairline
 //   middle  : grouped nav — uppercase 11px group titles; 38px items; the selected
-//             item wears the 135° #7170ff→#5e6ad2 gradient with white bold text;
-//             hover = faint indigo wash + 6px slide + accent-blue text
-//   bottom  : user (gradient avatar + username → popover: 个人信息 / 退出登录)
+//             item = solid bg-primary + text-primary-foreground, semibold, shadow-sm;
+//             hover = bg-subtle wash + 6px slide + text-foreground
+//   bottom  : user (primary avatar + username → popover: 个人信息 / 退出登录)
 //             + theme toggle (Sun in dark / Moon in light, hc_theme contract)
 //
 // There is deliberately NO top header — watch-alert has none; breadcrumb lives
@@ -149,14 +149,14 @@ function SidebarBottom({ profile, failed }: { profile: EiamProfile | null; faile
       ref={rootRef}
       className="relative flex items-center justify-between gap-2 border-t border-border bg-elevated px-3 py-3"
     >
-      {/* User: gradient avatar (first letter) + username → popover menu */}
+      {/* User: primary avatar (first letter) + username → popover menu */}
       <button
         type="button"
         data-testid="user-trigger"
         onClick={() => setMenuOpen((v) => !v)}
         className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg p-1.5 text-left hover:bg-bg-hover"
       >
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] text-sm font-bold text-white">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-bold text-primary-foreground">
           {username ? username.charAt(0).toUpperCase() : "·"}
         </span>
         <span className="min-w-0 truncate text-[13px] text-foreground">
@@ -208,7 +208,7 @@ export function Sidebar() {
   const { profile, failed } = useEiamProfile()
 
   return (
-    <aside className="flex h-full w-[210px] shrink-0 flex-col overflow-hidden rounded-xl bg-elevated shadow-[0_2px_8px_rgba(0,0,0,0.06)]">
+    <aside className="flex h-full w-[210px] shrink-0 flex-col overflow-hidden rounded-xl bg-elevated shadow-sm">
       {/* Top: logo + tenant selector (sticky) */}
       <div className="sticky top-0 z-10 bg-elevated px-3 pt-4">
         <div className="mb-4 flex justify-center text-foreground">
@@ -257,8 +257,8 @@ export function Sidebar() {
                     className={cn(
                       "mx-2 flex h-[38px] items-center gap-3 rounded-lg px-4 text-[13px] transition-all duration-300",
                       active
-                        ? "bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] font-semibold text-white shadow-[0_4px_12px_rgba(94,106,210,0.3)]"
-                        : "text-text-secondary hover:translate-x-1.5 hover:bg-[rgba(94,106,210,0.12)] hover:text-[#7170ff]",
+                        ? "bg-primary font-semibold text-primary-foreground shadow-sm"
+                        : "text-text-secondary hover:translate-x-1.5 hover:bg-subtle hover:text-foreground",
                     )}
                   >
                     <Icon className="h-4 w-4 shrink-0" />

@@ -485,7 +485,7 @@ export default function ChatPage() {
               <User className="h-3 w-3" />
               <span>我</span>
             </div>
-            <div className="rounded-lg bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] px-4 py-2 text-sm text-white">
+            <div className="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground">
               {msg.content}
             </div>
           </div>
@@ -509,9 +509,9 @@ export default function ChatPage() {
                 <span
                   className={cn(
                     "rounded-full px-2 py-0.5 text-[10px]",
-                    tc.status === "running" && "bg-accent text-muted-foreground",
-                    tc.status === "success" && "bg-emerald-500/10 text-emerald-600",
-                    tc.status === "failed" && "bg-destructive/10 text-destructive"
+                    tc.status === "running" && "bg-subtle text-muted-foreground",
+                    tc.status === "success" && "bg-success-soft text-success",
+                    tc.status === "failed" && "bg-danger-soft text-danger"
                   )}
                 >
                   {tc.status === "running" ? "运行中" : tc.status === "success" ? "成功" : "失败"}
@@ -526,15 +526,15 @@ export default function ChatPage() {
                 </div>
               )}
               {tc.status === "failed" && tc.error && (
-                <div className="mt-1 text-destructive">{tc.error}</div>
+                <div className="mt-1 text-danger">{tc.error}</div>
               )}
             </div>
           ))}
 
           {msg.approval && (
-            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+            <div className="rounded-md border border-warning-border bg-warning-soft px-3 py-2 text-xs">
               <div className="flex items-center gap-2">
-                <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
+                <ShieldAlert className="h-3.5 w-3.5 text-warning" />
                 <span className="font-medium">需要审批：{msg.approval.toolName}</span>
               </div>
               {msg.approval.reason && (
@@ -551,14 +551,14 @@ export default function ChatPage() {
                 <div className="mt-2 flex gap-2">
                   <button
                     onClick={() => void handleApproval(msg.id, "approve")}
-                    className="flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white transition-opacity hover:opacity-90"
+                    className="flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary-hover"
                   >
                     <Check className="h-3.5 w-3.5" />
                     批准
                   </button>
                   <button
                     onClick={() => void handleApproval(msg.id, "reject")}
-                    className="flex items-center gap-1 rounded-md border border-destructive/40 px-2.5 py-1 text-xs text-destructive transition-colors hover:bg-destructive/10"
+                    className="flex items-center gap-1 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-subtle"
                   >
                     <X className="h-3.5 w-3.5" />
                     拒绝
@@ -607,7 +607,7 @@ export default function ChatPage() {
           <div className="border-b p-3">
             <button
               onClick={() => void newConversation()}
-              className="flex w-full items-center justify-center gap-2 rounded-md bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] px-3 py-2 text-sm font-semibold text-white transition-opacity hover:opacity-90"
+              className="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary-hover"
             >
               <Plus className="h-4 w-4" />
               新建对话
@@ -647,7 +647,7 @@ export default function ChatPage() {
                               }
                             }}
                             aria-label="重命名会话"
-                            className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[#7170ff] focus:ring-1 focus:ring-[#7170ff]"
+                            className="min-w-0 flex-1 rounded-md border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary"
                           />
                         </div>
                       ) : (
@@ -655,7 +655,7 @@ export default function ChatPage() {
                           className={cn(
                             "group flex items-center gap-1 rounded-md transition-colors",
                             active
-                              ? "bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] text-white"
+                              ? "border border-primary-border bg-primary-soft text-foreground"
                               : "hover:bg-accent"
                           )}
                         >
@@ -669,7 +669,7 @@ export default function ChatPage() {
                             <span
                               className={cn(
                                 "block truncate text-xs",
-                                active ? "text-white/70" : "text-muted-foreground"
+                                "text-muted-foreground"
                               )}
                             >
                               {formatTime(c.updated_at)}
@@ -681,7 +681,7 @@ export default function ChatPage() {
                             className={cn(
                               "rounded-md p-1.5 opacity-0 transition-opacity group-hover:opacity-100",
                               active
-                                ? "text-white hover:bg-white/20"
+                                ? "text-muted-foreground hover:bg-subtle hover:text-foreground"
                                 : "text-muted-foreground hover:bg-accent hover:text-foreground"
                             )}
                           >
@@ -693,7 +693,7 @@ export default function ChatPage() {
                             className={cn(
                               "mr-1 rounded-md p-1.5 opacity-0 transition-opacity group-hover:opacity-100",
                               active
-                                ? "text-white hover:bg-white/20"
+                                ? "text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                                 : "text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                             )}
                           >
@@ -751,7 +751,7 @@ export default function ChatPage() {
                         setInput(prompt)
                         textareaRef.current?.focus()
                       }}
-                      className="rounded-full border px-3 py-1 text-xs text-muted-foreground transition-colors hover:border-[#7170ff] hover:text-foreground"
+                      className="rounded-full border px-3 py-1 text-xs text-muted-foreground transition-colors hover:border-primary hover:text-foreground"
                     >
                       {prompt}
                     </button>
@@ -773,7 +773,7 @@ export default function ChatPage() {
                 onKeyDown={handleKeyDown}
                 placeholder="输入问题，按 Enter 发送，Shift+Enter 换行…"
                 rows={2}
-                className="w-full resize-none rounded-md border bg-background px-3 py-2 text-sm outline-none focus:border-[#7170ff] focus:ring-1 focus:ring-[#7170ff] disabled:opacity-50"
+                className="w-full resize-none rounded-md border bg-background px-3 py-2 text-sm outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:opacity-50"
                 style={{ minHeight: "44px", maxHeight: "140px" }}
               />
               {sending ? (
@@ -789,7 +789,7 @@ export default function ChatPage() {
                   onClick={() => void send()}
                   disabled={!input.trim()}
                   aria-label="发送"
-                  className="rounded-md bg-gradient-to-br from-[#7170ff] to-[#5e6ad2] p-2 text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                  className="rounded-md bg-primary p-2 text-primary-foreground transition-colors hover:bg-primary-hover disabled:opacity-50"
                 >
                   <Send className="h-4 w-4" />
                 </button>
