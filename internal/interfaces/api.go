@@ -574,6 +574,18 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 	// or the report would be stored under the wrong (default) tenant.
 	tid := tenant.IDFrom(r.Context())
 
+	// Persist a minimal running report synchronously so the incident is
+	// immediately visible to Get/List and has a record to flip to failed if the
+	// background analysis (or its store step) later errors.
+	running := &models.RCAReport{
+		Incident:   incident,
+		Candidates: []models.ScoredHypothesis{},
+	}
+	if err := s.rcaStore.Store(r.Context(), running); err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to store initial RCA report", err.Error())
+		return
+	}
+
 	// Run RCA analysis in background
 	go func() {
 		ctx := tenant.WithID(context.Background(), tid)
@@ -595,6 +607,10 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 				observability.String("incident_id", req.IncidentID),
 				observability.Err(err),
 			)
+			// The running report is already persisted, so this status update
+			// lands and makes the store failure visible instead of leaving the
+			// incident stuck in running.
+			_ = s.rcaStore.UpdateStatus(ctx, req.IncidentID, "failed")
 			return
 		}
 
