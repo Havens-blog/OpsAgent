@@ -30,11 +30,11 @@ const severities: Array<"P0" | "P1" | "P2" | "P3" | "P4"> = ["P0", "P1", "P2", "
 
 function PlatformHeader({ platform }: { platform: string }) {
   const colors: Record<string, string> = {
-    dingtalk: "bg-blue-500",
-    wecom: "bg-green-500",
-    feishu: "bg-blue-600",
+    dingtalk: "bg-border",
+    wecom: "bg-border",
+    feishu: "bg-border",
   }
-  return <div className={`h-1 w-full rounded-t-lg ${colors[platform] || "bg-gray-500"}`} />
+  return <div className={`h-1 w-full rounded-t-lg ${colors[platform] || "bg-border"}`} />
 }
 
 type Severity = "P0" | "P1" | "P2" | "P3" | "P4"
@@ -267,7 +267,7 @@ export default function IMSettingsPage() {
                 (saveMsg.startsWith("✓")
                   ? "text-status-healthy"
                   : saveMsg.startsWith("⚠")
-                    ? "text-amber-500"
+                    ? "text-warning"
                     : "text-destructive")
               }
             >

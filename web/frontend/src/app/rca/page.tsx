@@ -91,7 +91,7 @@ export default function RCAListPage() {
       </header>
 
       {error && (
-        <p className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-600 dark:text-red-400">
+        <p className="rounded-md border border-danger/40 bg-danger-soft px-3 py-2 text-sm text-danger">
           {error}
         </p>
       )}
@@ -241,11 +241,11 @@ function StatCard({
 }) {
   const toneCls =
     tone === "success"
-      ? "text-emerald-500"
+      ? "text-success"
       : tone === "danger"
-        ? "text-red-500"
+        ? "text-danger"
         : tone === "default"
-          ? "text-blue-500"
+          ? "text-muted-foreground"
           : "text-foreground"
   return (
     <Card>
