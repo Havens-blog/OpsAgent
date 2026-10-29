@@ -81,6 +81,13 @@ const config: Config = {
           DEFAULT: 'hsl(var(--danger))',
           soft: 'hsl(var(--danger-soft))',
         },
+        // Category colors: node type only, never state.
+        cat: {
+          application: 'hsl(var(--cat-application))',
+          database: 'hsl(var(--cat-database))',
+          cache: 'hsl(var(--cat-cache))',
+          queue: 'hsl(var(--cat-queue))',
+        },
         // Severity colors for incidents
         severity: {
           p0: 'hsl(0, 84%, 60%)',    // Red

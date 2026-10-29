@@ -49,6 +49,12 @@
     --danger: 0 84% 62%;
     --danger-soft: 0 40% 14%;
 
+    /* 分类色：只表达节点类型，不表达状态 */
+    --cat-application: 198 93% 60%;  /* #38BDF8 */
+    --cat-database: 255 92% 76%;     /* #A78BFA */
+    --cat-cache: 188 86% 53%;        /* #22D3EE */
+    --cat-queue: 27 96% 61%;         /* #FB923C */
+
     --destructive: 0 84% 62%;
     --destructive-foreground: 0 0% 100%;
 
@@ -110,6 +116,11 @@
     --warning-border: 32 98% 83%;  /* #FED7AA */
     --danger: 0 72% 51%;           /* #DC2626 */
     --danger-soft: 0 86% 97%;      /* #FEF2F2 */
+
+    --cat-application: 200 98% 39%;  /* #0284C7 */
+    --cat-database: 258 90% 66%;     /* #8B5CF6 */
+    --cat-cache: 192 91% 36%;        /* #0891B2 */
+    --cat-queue: 21 90% 48%;         /* #EA580C */
 
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;

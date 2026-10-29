@@ -58,6 +58,7 @@ interface Connection {
   id: string
   path: string
   color: string
+  tone: GroupTone
   count: number
   labelX: number
   labelY: number
@@ -65,13 +66,13 @@ interface Connection {
 }
 
 const TONE_COLOR: Record<GroupTone, string> = {
-  critical: "#6366f1",
-  abnormal: "#d97706",
-  application: "#0284c7",
-  database: "#8b5cf6",
-  cache: "#0891b2",
-  queue: "#ea580c",
-  default: "#64748b",
+  critical: "hsl(var(--primary))",
+  abnormal: "hsl(var(--warning))",
+  application: "hsl(var(--cat-application))",
+  database: "hsl(var(--cat-database))",
+  cache: "hsl(var(--cat-cache))",
+  queue: "hsl(var(--cat-queue))",
+  default: "hsl(var(--muted-foreground))",
 }
 
 export function formatThroughput(value: number): string {
@@ -95,9 +96,9 @@ export function healthLabel(health: string): string {
 }
 
 export function healthContrastClass(health: string): string {
-  if (health === "healthy") return "text-emerald-800 dark:text-emerald-200"
-  if (health === "degraded") return "text-amber-800 dark:text-amber-200"
-  if (health === "unhealthy") return "text-red-700 dark:text-red-300"
+  if (health === "healthy") return "text-success"
+  if (health === "degraded") return "text-warning"
+  if (health === "unhealthy") return "text-danger"
   return ""
 }
 
@@ -203,6 +204,7 @@ export function TopologyGraph({
         id: group.id,
         path: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`,
         color: TONE_COLOR[group.tone],
+        tone: group.tone,
         count: group.nodes.length,
         labelX: (x1 + x2) / 2,
         labelY: (y1 + y2) / 2 - 8,
@@ -262,7 +264,7 @@ export function TopologyGraph({
   const scaledHeight = sceneHeight * zoom
   const stageWidth = Math.max(viewportSize.width, scaledWidth)
   const stageHeight = Math.max(viewportSize.height, scaledHeight)
-  const colors = [...new Set(connections.map((connection) => connection.color))]
+  const tones = [...new Set(connections.map((connection) => connection.tone))]
 
   return (
     <div
@@ -308,7 +310,7 @@ export function TopologyGraph({
       </div>
 
       {fullscreenError && (
-        <p className="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-300">
+        <p className="shrink-0 border-b border-warning-border bg-warning-soft px-4 py-2 text-xs text-warning">
           {fullscreenError}
         </p>
       )}
@@ -344,10 +346,10 @@ export function TopologyGraph({
               aria-hidden="true"
             >
               <defs>
-                {colors.map((color) => (
+                {tones.map((tone) => (
                   <marker
-                    key={color}
-                    id={`topology-arrow-${color.slice(1)}`}
+                    key={tone}
+                    id={`topology-arrow-${tone}`}
                     viewBox="0 0 10 10"
                     refX="9"
                     refY="5"
@@ -355,7 +357,7 @@ export function TopologyGraph({
                     markerHeight="5"
                     orient="auto-start-reverse"
                   >
-                    <path d="M 0 0 L 10 5 L 0 10 z" fill={color} />
+                    <path d="M 0 0 L 10 5 L 0 10 z" style={{ fill: TONE_COLOR[tone] }} />
                   </marker>
                 ))}
               </defs>
@@ -364,9 +366,9 @@ export function TopologyGraph({
                   <path
                     d={connection.path}
                     fill="none"
-                    stroke={connection.color}
+                    style={{ stroke: connection.color }}
                     strokeWidth={connection.selected ? 2.6 : 1.7}
-                    markerEnd={`url(#topology-arrow-${connection.color.slice(1)})`}
+                    markerEnd={`url(#topology-arrow-${connection.tone})`}
                   />
                   <g transform={`translate(${connection.labelX} ${connection.labelY})`}>
                     <rect
@@ -376,7 +378,7 @@ export function TopologyGraph({
                       height="16"
                       rx="8"
                       fill="hsl(var(--card))"
-                      stroke={connection.color}
+                      style={{ stroke: connection.color }}
                       strokeOpacity="0.45"
                     />
                     <text
@@ -415,12 +417,12 @@ export function TopologyGraph({
                 <div
                   ref={focusRef}
                   className={cn(
-                    "w-full max-w-[250px] rounded-2xl border-2 border-indigo-500/75 bg-card shadow-[0_12px_36px_rgba(79,70,229,0.14)]",
+                    "w-full max-w-[250px] rounded-2xl border-2 border-primary bg-card shadow-md",
                     compact ? "p-2.5" : "p-4",
                   )}
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-500/10 text-indigo-600 dark:text-indigo-300">
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary-soft text-primary">
                       <Server className="h-4 w-4" />
                     </span>
                     <Badge
@@ -430,7 +432,7 @@ export function TopologyGraph({
                       {healthLabel(focusNode.health)}
                     </Badge>
                   </div>
-                  <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-indigo-600 dark:text-indigo-300">
+                  <p className="mt-3 text-[10px] font-medium uppercase tracking-wider text-primary">
                     核心服务
                   </p>
                   <h3
@@ -453,7 +455,7 @@ export function TopologyGraph({
                           "mt-0.5 font-mono font-semibold",
                           compact ? "text-[10px]" : "text-xs",
                           focusNode.error_rate > 0.01
-                            ? "text-red-600 dark:text-red-400"
+                            ? "text-danger"
                             : "text-foreground",
                         )}
                       >
@@ -480,13 +482,13 @@ export function TopologyGraph({
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-2.5">
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-emerald-500" />健康
+            <span className="h-2 w-2 rounded-full bg-success" />健康
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-amber-500" />降级
+            <span className="h-2 w-2 rounded-full bg-warning" />降级
           </span>
           <span className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-slate-400" />无流量
+            <span className="h-2 w-2 rounded-full bg-tertiary" />无流量
           </span>
         </div>
         <div className="flex items-center gap-1">
@@ -560,10 +562,10 @@ function GroupColumn({
             aria-pressed={selected}
             onClick={() => onSelectGroup(group)}
             className={cn(
-              "flex w-full shrink-0 items-center gap-2 rounded-xl border bg-card text-left shadow-sm transition-all hover:-translate-y-0.5 hover:border-indigo-400/70 hover:shadow-md",
+              "flex w-full shrink-0 items-center gap-2 rounded-xl border bg-card text-left shadow-sm transition-all hover:-translate-y-0.5 hover:border-primary/70 hover:shadow-md",
               compact ? "h-[78px] p-2" : "h-[82px] p-3",
               selected
-                ? "border-indigo-500 ring-2 ring-indigo-500/20"
+                ? "border-primary ring-2 ring-primary/20"
                 : "border-border",
             )}
           >
@@ -572,7 +574,7 @@ function GroupColumn({
                 "flex shrink-0 items-center justify-center rounded-lg",
                 compact ? "h-7 w-7" : "h-9 w-9",
               )}
-              style={{ color, backgroundColor: `${color}16` }}
+              style={{ color, backgroundColor: `color-mix(in srgb, ${color} 9%, transparent)` }}
             >
               <GroupIcon tone={group.tone} className="h-4 w-4" />
             </span>
@@ -587,7 +589,7 @@ function GroupColumn({
             <ChevronRight
               className={cn(
                 "h-3.5 w-3.5 shrink-0",
-                selected ? "text-indigo-500" : "text-muted-foreground",
+                selected ? "text-primary" : "text-muted-foreground",
               )}
             />
           </button>
