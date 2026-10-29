@@ -201,7 +201,7 @@ export default function SecuritySettingsPage() {
                 (saveMsg.startsWith("✓")
                   ? "text-status-healthy"
                   : saveMsg.startsWith("⚠")
-                    ? "text-amber-500"
+                    ? "text-warning"
                     : "text-destructive")
               }
             >

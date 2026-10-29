@@ -419,7 +419,7 @@ export default function ModelSettingsPage() {
               (saveMsg.startsWith("✓")
                 ? "text-status-healthy"
                 : saveMsg.startsWith("⚠")
-                  ? "text-amber-500"
+                  ? "text-warning"
                   : "text-destructive")
             }
           >
@@ -444,7 +444,7 @@ function SummaryItem({
     tone === "ok"
       ? "text-status-healthy"
       : tone === "warn"
-        ? "text-amber-500"
+        ? "text-warning"
         : "text-foreground"
   return (
     <div>
