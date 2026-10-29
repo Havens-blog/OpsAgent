@@ -50,6 +50,10 @@ When performing inspections:
 		return nil, err
 	}
 
+	if err := base.Initialize(CreateInspectorTools()); err != nil {
+		return nil, err
+	}
+
 	return &InspectorAgent{
 		BaseAgent: base,
 	}, nil
