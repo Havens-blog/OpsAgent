@@ -58,14 +58,16 @@ func main() {
 	server := mcp.NewServer(reg)
 
 	// Wire the RCA data sources exactly like the REST API does: build the source
-	// set from the environment ONCE and inject the topology, metric and log
-	// dimensions together with whether each is real. Without this the tools have
-	// no data source and must report that honestly instead of inventing results.
+	// set from the environment ONCE and inject the topology, metric, log and
+	// change dimensions together with whether each is real. Without this the
+	// tools have no data source and must report that honestly instead of
+	// inventing results.
 	dsCfg := agent.NewDataSourceConfigFromEnv()
 	rcaSources, dsActive := agent.CreateRCASourcesWithFallback(dsCfg)
 	server.SetTopologySource(rcaSources.TopologySource, dsActive["topology"])
 	server.SetMetricSource(rcaSources.MetricSource, dsActive["metrics"])
 	server.SetLogSource(rcaSources.LogSource, dsActive["logs"])
+	server.SetChangeSource(rcaSources.ChangeSource, dsActive["changes"])
 	log.Printf("RCA sources real: metrics=%v logs=%v topology=%v changes=%v",
 		dsActive["metrics"], dsActive["logs"], dsActive["topology"], dsActive["changes"])
 
