@@ -87,30 +87,30 @@ function XirangWordmark() {
       <title>息壤 Xirang</title>
       <defs>
         <linearGradient id="hsh-top" x1="8" y1="22" x2="56" y2="46" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#7170ff" />
-          <stop offset="1" stopColor="#5e6ad2" />
+          <stop offset="0" style={{ stopColor: "hsl(var(--primary))" }} />
+          <stop offset="1" style={{ stopColor: "hsl(var(--primary-hover))" }} />
         </linearGradient>
         <linearGradient id="hsh-sprout" x1="32" y1="34" x2="32" y2="6" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#7170ff" />
-          <stop offset="1" stopColor="#a5b4fc" />
+          <stop offset="0" style={{ stopColor: "hsl(var(--primary))" }} />
+          <stop offset="1" style={{ stopColor: "hsl(var(--primary-border))" }} />
         </linearGradient>
       </defs>
       <g transform="translate(0,2) scale(0.92)">
-        <path d="M8 46 L32 58 L56 46" fill="none" stroke="#5e6ad2" strokeOpacity="0.45" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
-        <path d="M8 40 L32 52 L56 40" fill="none" stroke="#5e6ad2" strokeOpacity="0.75" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M8 46 L32 58 L56 46" fill="none" className="stroke-primary" strokeOpacity="0.45" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M8 40 L32 52 L56 40" fill="none" className="stroke-primary" strokeOpacity="0.75" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
         <path d="M32 22 L56 34 L32 46 L8 34 Z" fill="url(#hsh-top)" />
         <g stroke="url(#hsh-sprout)" strokeWidth="3" strokeLinecap="round" fill="none">
           <path d="M32 34 V14" />
           <path d="M32 24 L22 17" />
           <path d="M32 24 L42 17" />
         </g>
-        <circle cx="32" cy="34" r="3.2" fill="#ffffff" />
-        <circle cx="32" cy="11" r="3.6" fill="#a5b4fc" />
-        <circle cx="20" cy="15.5" r="3" fill="#8b93ff" />
-        <circle cx="44" cy="15.5" r="3" fill="#8b93ff" />
+        <circle cx="32" cy="34" r="3.2" className="fill-primary-foreground" />
+        <circle cx="32" cy="11" r="3.6" className="fill-primary-border" />
+        <circle cx="20" cy="15.5" r="3" className="fill-primary" />
+        <circle cx="44" cy="15.5" r="3" className="fill-primary" />
       </g>
       <text x="72" y="42" fontSize="26" fontWeight="700" fill="currentColor" fontFamily="Inter, system-ui, sans-serif">息壤</text>
-      <text x="130" y="42" fontSize="15" fontWeight="500" fill="#8a8f98" fontFamily="Inter, system-ui, sans-serif" letterSpacing="2">XIRANG</text>
+      <text x="130" y="42" fontSize="15" fontWeight="500" className="fill-muted-foreground" fontFamily="Inter, system-ui, sans-serif" letterSpacing="2">XIRANG</text>
     </svg>
   )
 }

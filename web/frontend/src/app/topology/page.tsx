@@ -54,7 +54,7 @@ const DEPENDENCY_PAGE_SIZE = 8
 const TABLE_PAGE_SIZE = 8
 
 const CONTROL_CLASS =
-  "h-9 min-w-0 rounded-md border border-border bg-background px-2.5 text-xs text-foreground outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15"
+  "h-9 min-w-0 rounded-md border border-border bg-background px-2.5 text-xs text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/15"
 
 type LoadStatus = "loading" | "error" | "ready"
 type DirectorySort = "throughput" | "error" | "name"
@@ -91,10 +91,10 @@ function sortDependencies(nodes: ServiceNode[], sort: DependencySort): ServiceNo
 }
 
 function healthDotClass(health: string): string {
-  if (health === "healthy") return "bg-emerald-500"
-  if (health === "degraded") return "bg-amber-500"
-  if (health === "unhealthy") return "bg-red-500"
-  return "bg-slate-400"
+  if (health === "healthy") return "bg-success"
+  if (health === "degraded") return "bg-warning"
+  if (health === "unhealthy") return "bg-danger"
+  return "bg-tertiary"
 }
 
 function downstreamTone(type: string): GroupTone {
@@ -440,18 +440,18 @@ export default function TopologyPage() {
 
       {status === "ready" && graph && (
         <section aria-label="拓扑统计" className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-          <StatCard label="节点总数" value={stats.total} icon={Network} iconClass="bg-indigo-500/10 text-indigo-600 dark:text-indigo-300" />
-          <StatCard label="应用服务" value={stats.applications} icon={Boxes} iconClass="bg-sky-500/10 text-sky-600 dark:text-sky-300" />
-          <StatCard label="健康" value={stats.healthy} icon={CheckCircle2} iconClass="bg-emerald-500/10 text-emerald-600 dark:text-emerald-300" />
-          <StatCard label="降级" value={stats.degraded} icon={CircleGauge} iconClass="bg-amber-500/10 text-amber-600 dark:text-amber-300" />
-          <StatCard label="数据库" value={stats.database} icon={Database} iconClass="bg-violet-500/10 text-violet-600 dark:text-violet-300" />
-          <StatCard label="缓存队列" value={stats.cacheAndQueue} icon={Layers3} iconClass="bg-cyan-500/10 text-cyan-600 dark:text-cyan-300" />
+          <StatCard label="节点总数" value={stats.total} icon={Network} iconClass="bg-primary-soft text-primary" />
+          <StatCard label="应用服务" value={stats.applications} icon={Boxes} iconClass="bg-cat-application/10 text-cat-application" />
+          <StatCard label="健康" value={stats.healthy} icon={CheckCircle2} iconClass="bg-success-soft text-success" />
+          <StatCard label="降级" value={stats.degraded} icon={CircleGauge} iconClass="bg-warning-soft text-warning" />
+          <StatCard label="数据库" value={stats.database} icon={Database} iconClass="bg-cat-database/10 text-cat-database" />
+          <StatCard label="缓存队列" value={stats.cacheAndQueue} icon={Layers3} iconClass="bg-cat-cache/10 text-cat-cache" />
         </section>
       )}
 
       {status === "loading" && (
         <Card className="flex h-[430px] flex-col items-center justify-center gap-3 text-center">
-          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-500/10 text-indigo-500">
+          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary-soft text-primary">
             <Loader2 className="h-6 w-6 animate-spin" />
           </span>
           <div>
@@ -463,7 +463,7 @@ export default function TopologyPage() {
 
       {status === "error" && (
         <Card className="flex h-[430px] flex-col items-center justify-center gap-4 px-6 text-center">
-          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/10 text-red-500">
+          <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-danger-soft text-danger">
             <AlertTriangle className="h-6 w-6" />
           </span>
           <div>
@@ -475,7 +475,7 @@ export default function TopologyPage() {
           <button
             type="button"
             onClick={() => void loadTopology()}
-            className="inline-flex h-9 items-center gap-2 rounded-md bg-indigo-600 px-4 text-xs font-medium text-white hover:bg-indigo-500"
+            className="inline-flex h-9 items-center gap-2 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground hover:bg-primary-hover"
           >
             <RefreshCw className="h-3.5 w-3.5" />
             重新加载
@@ -491,7 +491,7 @@ export default function TopologyPage() {
                 <h2 className="text-sm font-semibold text-foreground">服务目录</h2>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">选择服务探索一跳依赖</p>
               </div>
-              <span className="shrink-0 rounded-full bg-indigo-500/10 px-2 py-1 text-[10px] font-medium text-indigo-700 dark:text-indigo-300">
+              <span className="shrink-0 rounded-full bg-primary-soft px-2 py-1 text-[10px] font-medium text-primary">
                 {directoryMatches.length} 个结果
               </span>
             </div>
@@ -568,7 +568,7 @@ export default function TopologyPage() {
                       setEnvFilter("all")
                       setHealthFilter("all")
                     }}
-                    className="mt-3 text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-300"
+                    className="mt-3 text-xs font-medium text-primary hover:underline"
                   >
                     清除搜索与筛选
                   </button>
@@ -586,7 +586,7 @@ export default function TopologyPage() {
                           className={cn(
                             "flex w-full items-center gap-2 border-b border-border/60 px-3 py-3 text-left transition-colors",
                             active
-                              ? "bg-indigo-500/10 text-indigo-800 dark:text-indigo-200"
+                              ? "bg-primary-soft text-foreground"
                               : "text-foreground hover:bg-accent",
                           )}
                         >
@@ -607,7 +607,7 @@ export default function TopologyPage() {
                           <ChevronRight
                             className={cn(
                               "h-3.5 w-3.5 shrink-0",
-                              active ? "text-indigo-500" : "text-muted-foreground",
+                              active ? "text-primary" : "text-muted-foreground",
                             )}
                           />
                         </button>
@@ -636,7 +636,7 @@ export default function TopologyPage() {
                 className={cn(
                   "flex h-9 items-center justify-center gap-2 rounded-lg text-xs font-medium transition",
                   viewMode === "aggregate"
-                    ? "bg-indigo-600 text-white shadow-sm"
+                    ? "bg-primary text-primary-foreground shadow-sm"
                     : "text-muted-foreground hover:bg-accent hover:text-foreground",
                 )}
               >
@@ -650,7 +650,7 @@ export default function TopologyPage() {
                 className={cn(
                   "flex h-9 items-center justify-center gap-2 rounded-lg text-xs font-medium transition",
                   viewMode === "table"
-                    ? "bg-indigo-600 text-white shadow-sm"
+                    ? "bg-primary text-primary-foreground shadow-sm"
                     : "text-muted-foreground hover:bg-accent hover:text-foreground",
                 )}
               >
@@ -758,7 +758,7 @@ export default function TopologyPage() {
                             <td
                               className={cn(
                                 "px-2 py-3 text-right font-mono text-[10px]",
-                                node.error_rate > 0.01 ? "text-red-600 dark:text-red-400" : "text-foreground",
+                                node.error_rate > 0.01 ? "text-danger" : "text-foreground",
                               )}
                             >
                               {formatErrorRate(node.error_rate)}
@@ -790,7 +790,7 @@ export default function TopologyPage() {
           <Card className="min-w-0 overflow-hidden">
             {!focusNode ? (
               <div className="flex min-h-[360px] flex-col items-center justify-center px-7 text-center">
-                <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-sky-500/10 text-sky-600 dark:text-sky-300">
+                <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary-soft text-primary">
                   <Server className="h-6 w-6" />
                 </span>
                 <h2 className="mt-4 text-sm font-semibold text-foreground">服务详情</h2>
@@ -843,8 +843,8 @@ export default function TopologyPage() {
                 </div>
 
                 {abnormalUpstreamCount > 0 && (
-                  <div className="m-3 mb-0 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs leading-5 text-amber-800 dark:text-amber-200">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-300" />
+                  <div className="m-3 mb-0 flex items-start gap-2 rounded-lg border border-warning-border bg-warning-soft p-3 text-xs leading-5 text-warning">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
                     发现 {abnormalUpstreamCount} 个异常上游，建议优先排查
                   </div>
                 )}
@@ -858,14 +858,14 @@ export default function TopologyPage() {
                   />
 
                   {selectedGroup?.direction === detailDirection && (
-                    <div className="mt-3 flex items-center justify-between gap-2 rounded-md border border-indigo-500/25 bg-indigo-500/10 px-2.5 py-2 text-[11px] text-indigo-800 dark:text-indigo-200">
+                    <div className="mt-3 flex items-center justify-between gap-2 rounded-md border border-primary-border bg-primary-soft px-2.5 py-2 text-[11px] text-foreground">
                       <span className="truncate">分组：{selectedGroup.title} · {selectedGroup.nodes.length}</span>
                       <button
                         type="button"
                         aria-label="清除分组筛选"
                         title="清除分组筛选"
                         onClick={() => setSelectedGroupId(null)}
-                        className="shrink-0 rounded p-0.5 hover:bg-indigo-500/15"
+                        className="shrink-0 rounded p-0.5 hover:bg-primary/15"
                       >
                         <X className="h-3.5 w-3.5" />
                       </button>
@@ -958,7 +958,7 @@ export default function TopologyPage() {
                               <span
                                 className={cn(
                                   "mt-1 block font-mono text-[10px]",
-                                  node.error_rate > 0.01 ? "text-red-600 dark:text-red-400" : "text-muted-foreground",
+                                  node.error_rate > 0.01 ? "text-danger" : "text-muted-foreground",
                                 )}
                               >
                                 {formatErrorRate(node.error_rate)}
@@ -1021,9 +1021,9 @@ function StatCard({
 function FocusEmptyState() {
   return (
     <Card className="relative flex h-[560px] min-w-0 flex-col items-center justify-center overflow-hidden px-6 text-center">
-      <div className="absolute h-64 w-64 rounded-full border border-indigo-500/10" />
-      <div className="absolute h-44 w-44 rounded-full border border-dashed border-indigo-500/20" />
-      <span className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-indigo-500/25 bg-indigo-500/10 text-indigo-600 shadow-[0_12px_40px_rgba(79,70,229,0.15)] dark:text-indigo-300">
+      <div className="absolute h-64 w-64 rounded-full border border-primary/10" />
+      <div className="absolute h-44 w-44 rounded-full border border-dashed border-primary/20" />
+      <span className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-primary-border bg-primary-soft text-primary shadow-md">
         <Network className="h-8 w-8" />
       </span>
       <h2 className="relative mt-5 text-base font-semibold text-foreground">选择一个核心服务</h2>
@@ -1075,7 +1075,7 @@ function MetricBlock({ label, value, danger = false }: { label: string; value: s
       <p
         className={cn(
           "mt-1.5 truncate font-mono text-[11px] font-semibold",
-          danger ? "text-red-600 dark:text-red-400" : "text-foreground",
+          danger ? "text-danger" : "text-foreground",
         )}
         title={value}
       >
@@ -1150,7 +1150,7 @@ function Pagination({
             className={cn(
               "h-7 min-w-7 rounded-md border px-1 font-mono text-[10px]",
               pageNumber === page
-                ? "border-indigo-600 bg-indigo-600 text-white"
+                ? "border-primary bg-primary text-primary-foreground"
                 : "border-border text-foreground hover:bg-accent",
             )}
           >
