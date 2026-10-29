@@ -127,3 +127,9 @@ var (
 	_ MetricSource   = (*EmptyMetricSource)(nil)
 	_ TopologySource = (*EmptyTopologySource)(nil)
 )
+
+// QueryMetricRange returns an honest empty slice: no real metric backend is
+// configured, so there is nothing to query and no series to fabricate.
+func (EmptyMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	return []models.MetricSeries{}, nil
+}

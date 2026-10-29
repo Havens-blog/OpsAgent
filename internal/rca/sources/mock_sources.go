@@ -458,3 +458,9 @@ var _ MetricSource = (*MockMetricSource)(nil)
 var _ TraceSource = (*MockTraceSource)(nil)
 var _ TopologySource = (*MockTopologySource)(nil)
 var _ ChangeSource = (*MockChangeSource)(nil)
+
+// QueryMetricRange returns the same fabricated series as QueryAnomalies.
+// TEST-ONLY: it does not contact a real backend and ignores the query/step.
+func (m *MockMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	return m.QueryAnomalies(ctx, start, end)
+}

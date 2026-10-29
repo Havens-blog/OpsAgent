@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Havens-blog/OpsAgent/internal/datasource/core"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 )
 
@@ -54,6 +55,13 @@ func (m *MockMetricSourceForTest) GetAlerts(ctx context.Context) ([]Alert, error
 	}, nil
 }
 
+func (m *MockMetricSourceForTest) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	return []models.MetricSeries{
+		{Name: "http_errors", Labels: map[string]string{"status": "5xx"}},
+		{Name: "http_errors", Labels: map[string]string{"status": "4xx"}},
+	}, nil
+}
+
 // TestMetricSourceInterface tests metric source interface compliance.
 func TestMetricSourceInterface(t *testing.T) {
 	ctx := context.Background()
@@ -91,5 +99,100 @@ func TestMetricSourceInterface(t *testing.T) {
 	}
 	if len(alerts) == 0 {
 		t.Error("Expected at least one alert")
+	}
+}
+
+// TestMetricSourceQueryMetricRange pins the multi-series contract of the range
+// extension: it must return every series, never just the first one.
+func TestMetricSourceQueryMetricRange(t *testing.T) {
+	ctx := context.Background()
+	start := time.Now().Add(-1 * time.Hour)
+	end := time.Now()
+	mock := &MockMetricSourceForTest{}
+
+	series, err := mock.QueryMetricRange(ctx, "http_errors", start, end, "1m")
+	if err != nil {
+		t.Fatalf("QueryMetricRange failed: %v", err)
+	}
+	if len(series) != 2 {
+		t.Fatalf("QueryMetricRange returned %d series, want 2", len(series))
+	}
+}
+
+// TestParseStepDuration pins the step parsing used to forward step into the
+// underlying core.MetricsQueryRequest.
+func TestParseStepDuration(t *testing.T) {
+	tests := []struct {
+		in   string
+		want time.Duration
+	}{
+		{in: "", want: time.Minute},
+		{in: "5m", want: 5 * time.Minute},
+		{in: "1h", want: time.Hour},
+		{in: "30s", want: 30 * time.Second},
+		{in: "not-a-duration", want: time.Minute},
+	}
+	for _, tc := range tests {
+		if got := parseStepDuration(tc.in); got != tc.want {
+			t.Errorf("parseStepDuration(%q) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
+// fakeMetricsDataSource is a minimal core.MetricsDataSource for proving that
+// DSMetricSource.QueryMetricRange forwards the parsed step and returns every
+// core series converted to models.MetricSeries.
+type fakeMetricsDataSource struct {
+	gotStep  time.Duration
+	gotQuery string
+	series   []core.MetricSeries
+}
+
+func (f *fakeMetricsDataSource) QueryMetrics(_ context.Context, req *core.MetricsQueryRequest) (*core.MetricsQueryResponse, error) {
+	f.gotStep = req.Step
+	f.gotQuery = req.Query
+	return &core.MetricsQueryResponse{Series: f.series}, nil
+}
+
+func (f *fakeMetricsDataSource) Connect(context.Context) error { return nil }
+func (f *fakeMetricsDataSource) Close() error                  { return nil }
+func (f *fakeMetricsDataSource) Ping(context.Context) error    { return nil }
+func (f *fakeMetricsDataSource) Health(context.Context) (*core.HealthInfo, error) {
+	return nil, nil
+}
+func (f *fakeMetricsDataSource) Type() core.DataSourceType { return core.DataSourceTypePrometheus }
+func (f *fakeMetricsDataSource) Name() string              { return "fake" }
+
+// TestDSMetricSourceQueryMetricRangeForwardsStepAndAllSeries verifies the real
+// source path end to end at the core-boundary level.
+func TestDSMetricSourceQueryMetricRangeForwardsStepAndAllSeries(t *testing.T) {
+	fake := &fakeMetricsDataSource{
+		series: []core.MetricSeries{
+			{
+				Labels:     map[string]string{"service": "checkout-api", "cloud": "arms"},
+				DataPoints: []core.DataPoint{{Timestamp: time.Now(), Value: 1.5}},
+			},
+			{
+				Labels:     map[string]string{"service": "ledger-db", "cloud": "arms"},
+				DataPoints: []core.DataPoint{{Timestamp: time.Now(), Value: 2.5}},
+			},
+		},
+	}
+	src := NewDSMetricSource(fake)
+
+	start := time.Now().Add(-1 * time.Hour)
+	end := time.Now()
+	series, err := src.QueryMetricRange(context.Background(), `arms_app_errors_per_sec{cloud="arms"}`, start, end, "5m")
+	if err != nil {
+		t.Fatalf("QueryMetricRange failed: %v", err)
+	}
+	if len(series) != 2 {
+		t.Fatalf("QueryMetricRange returned %d series, want 2", len(series))
+	}
+	if fake.gotStep != 5*time.Minute {
+		t.Errorf("step forwarded to core = %s, want 5m", fake.gotStep)
+	}
+	if fake.gotQuery != `arms_app_errors_per_sec{cloud="arms"}` {
+		t.Errorf("query forwarded to core = %q", fake.gotQuery)
 	}
 }
