@@ -28,6 +28,9 @@ type PendingApproval struct {
 	ExpiresAt      time.Time                `json:"expires_at"`
 	Status         string                   `json:"status"`
 	CreatedAt      time.Time                `json:"created_at"`
+	// ClientMessageID is the client id of the user message that triggered
+	// the approval, so a restored page can retry with the same id.
+	ClientMessageID string `json:"client_message_id,omitempty"`
 }
 
 // PendingApprovalStore keeps in-memory pending approvals for the HTTP layer.
@@ -82,6 +85,33 @@ func (s *PendingApprovalStore) ListPending(tenantID int64) []*PendingApproval {
 			return out[i].ApprovalID < out[j].ApprovalID
 		}
 		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
+}
+
+// ListPendingForConversation returns a user's pending, unexpired approvals for
+// one conversation, oldest first. It never returns nil.
+func (s *PendingApprovalStore) ListPendingForConversation(tenantID, userID int64, conversationID string) []*PendingApproval {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	out := make([]*PendingApproval, 0)
+	for _, p := range s.items {
+		if p.TenantID != tenantID || p.UserID != userID || p.ConversationID != conversationID ||
+			p.Status != "pending" || now.After(p.ExpiresAt) {
+			continue
+		}
+		// Copy so the response is serialized outside the lock without racing SetStatus.
+		cp := *p
+		out = append(out, &cp)
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ApprovalID < out[j].ApprovalID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
 	return out
 }

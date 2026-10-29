@@ -164,9 +164,12 @@ func (s *APIServer) getConversationHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	pending := s.pendingApprovals.ListPendingForConversation(EIAMTenantID(r.Context()), EIAMUID(r.Context()), id)
+
 	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
-		"conversation": conv,
-		"messages":     messages,
+		"conversation":      conv,
+		"messages":          messages,
+		"pending_approvals": pending,
 	})
 }
 
@@ -285,6 +288,8 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	ctx := withSessionID(r.Context(), id)
+	// The approval callback's parameter shadows req; keep the client id here.
+	clientMessageID := req.ClientMessageID
 
 	handler := chat.StreamHandler{
 		OnDelta: func(delta string) error {
@@ -322,19 +327,20 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 			now := time.Now()
 
 			pending := &PendingApproval{
-				ApprovalID:     approvalID,
-				ToolName:       req.ToolName,
-				Params:         req.Params,
-				Reason:         req.Reason,
-				ConversationID: id,
-				TenantID:       EIAMTenantID(ctx),
-				UserID:         EIAMUID(ctx),
-				ParamHash:      guardrails.ParamHash(req.Params),
-				Scope:          scope,
-				ExpirySeconds:  expiry,
-				ExpiresAt:      now.Add(time.Duration(expiry) * time.Second),
-				Status:         "pending",
-				CreatedAt:      now,
+				ApprovalID:      approvalID,
+				ToolName:        req.ToolName,
+				Params:          req.Params,
+				Reason:          req.Reason,
+				ConversationID:  id,
+				TenantID:        EIAMTenantID(ctx),
+				UserID:          EIAMUID(ctx),
+				ParamHash:       guardrails.ParamHash(req.Params),
+				Scope:           scope,
+				ExpirySeconds:   expiry,
+				ExpiresAt:       now.Add(time.Duration(expiry) * time.Second),
+				Status:          "pending",
+				CreatedAt:       now,
+				ClientMessageID: clientMessageID,
 			}
 			if err := s.pendingApprovals.Create(pending); err != nil {
 				return err

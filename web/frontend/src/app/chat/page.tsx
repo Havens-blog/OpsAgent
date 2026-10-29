@@ -20,6 +20,8 @@ import {
 import { cn } from "@/lib/utils"
 import {
   api,
+  ApiError,
+  type Approval,
   type Conversation,
   type ConversationMessage,
 } from "@/lib/api"
@@ -41,12 +43,18 @@ interface ApprovalState {
   content: string
   clientMessageId?: string
   decision?: "approved" | "rejected"
+  // 批准/拒绝请求进行中
+  submitting?: boolean
+  // 后端返回 409/410，审批已不可操作
+  invalid?: boolean
+  error?: string
 }
 
 interface UiMessage {
   id: string
   role: "user" | "assistant"
   content: string
+  clientMessageId?: string
   streaming?: boolean
   error?: string
   toolCalls?: ToolCall[]
@@ -70,6 +78,58 @@ function isAbortError(err: unknown): boolean {
     "name" in err &&
     (err as { name?: string }).name === "AbortError"
   )
+}
+
+/**
+ * 把历史消息和未决审批合并成 UI 消息列表：
+ * 审批卡片插在 client_message_id 匹配的用户消息之后，匹配不到时追加到末尾。
+ */
+function buildUiMessages(
+  history: ConversationMessage[],
+  pendingApprovals: Approval[]
+): UiMessage[] {
+  const result: UiMessage[] = history.map((m) => ({
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    clientMessageId: m.client_message_id,
+  }))
+
+  for (const a of pendingApprovals) {
+    const userIdx = a.client_message_id
+      ? result.findIndex(
+          (m) => m.role === "user" && m.clientMessageId === a.client_message_id
+        )
+      : -1
+    const card: UiMessage = {
+      id: `approval-${a.approval_id}`,
+      role: "assistant",
+      content: "",
+      approval: {
+        id: a.approval_id,
+        toolName: a.tool_name,
+        params: a.params ?? {},
+        reason: a.reason,
+        content: userIdx >= 0 ? result[userIdx].content : "",
+        clientMessageId: a.client_message_id,
+      },
+    }
+    if (userIdx < 0) {
+      result.push(card)
+      continue
+    }
+    // 同一条用户消息触发多条审批时，按 created_at 顺序排在已插入的卡片之后
+    let insertAt = userIdx + 1
+    while (
+      insertAt < result.length &&
+      result[insertAt].approval?.clientMessageId === a.client_message_id &&
+      result[insertAt].id.startsWith("approval-")
+    ) {
+      insertAt++
+    }
+    result.splice(insertAt, 0, card)
+  }
+  return result
 }
 
 function formatTime(iso: string): string {
@@ -97,6 +157,9 @@ export default function ChatPage() {
 
   const abortRef = useRef<AbortController | null>(null)
   const renamingRef = useRef(false)
+  const activeIdRef = useRef<string | null>(null)
+  // 正在提交批准/拒绝的审批 id
+  const approvalInFlightRef = useRef<Set<string>>(new Set())
   const streamIdRef = useRef<string>("")
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -141,14 +204,8 @@ export default function ChatPage() {
     setLoadingMessages(true)
     setError(null)
     try {
-      const { messages } = await api.getConversation(id)
-      setMessages(
-        messages.map((m: ConversationMessage) => ({
-          id: m.id,
-          role: m.role,
-          content: m.content,
-        }))
-      )
+      const { messages, pending_approvals } = await api.getConversation(id)
+      setMessages(buildUiMessages(messages, pending_approvals ?? []))
     } catch (err) {
       setError(toMessage(err))
       setMessages([])
@@ -401,40 +458,61 @@ export default function ChatPage() {
     await runStream(content)
   }
 
+  function patchApproval(messageId: string, patch: Partial<ApprovalState>) {
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === messageId && m.approval
+          ? { ...m, approval: { ...m.approval, ...patch } }
+          : m
+      )
+    )
+  }
+
+  /**
+   * 批准或拒绝审批。同一审批的请求进行中时忽略重复点击；
+   * 失败时不标记决策，409/410 标为失效，其余错误恢复按钮可用。
+   */
   async function handleApproval(messageId: string, action: "approve" | "reject") {
     const target = messages.find((m) => m.id === messageId)
     const approval = target?.approval
-    if (!approval) return
+    if (!approval || approval.decision || approval.invalid) return
+    // 状态更新是异步的，用 ref 同步拦截连续点击
+    if (approvalInFlightRef.current.has(approval.id)) return
+    approvalInFlightRef.current.add(approval.id)
+
+    const conversationId = activeId
+    patchApproval(messageId, { submitting: true, error: undefined })
 
     try {
       if (action === "approve") await api.approveApproval(approval.id)
       else await api.rejectApproval(approval.id)
     } catch (err) {
-      setError(toMessage(err))
+      const msg = toMessage(err)
+      const gone = err instanceof ApiError && (err.status === 409 || err.status === 410)
+      patchApproval(messageId, { submitting: false, invalid: gone, error: msg })
+      setError(msg)
       return
+    } finally {
+      approvalInFlightRef.current.delete(approval.id)
     }
 
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === messageId && m.approval
-          ? {
-              ...m,
-              approval: {
-                ...m.approval,
-                decision: action === "approve" ? "approved" : "rejected",
-              },
-            }
-          : m
-      )
-    )
+    patchApproval(messageId, {
+      submitting: false,
+      decision: action === "approve" ? "approved" : "rejected",
+    })
 
-    if (action === "approve") {
-      await runStream(approval.content, {
-        skipUserEcho: true,
-        clientMessageId: approval.clientMessageId,
-      })
-    }
+    // 请求期间已切换会话时，不在新会话里重试
+    if (action !== "approve" || activeIdRef.current !== conversationId) return
+    if (!approval.content) return
+    await runStream(approval.content, {
+      skipUserEcho: true,
+      clientMessageId: approval.clientMessageId,
+    })
   }
+
+  useEffect(() => {
+    activeIdRef.current = activeId
+  }, [activeId])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -532,7 +610,11 @@ export default function ChatPage() {
           ))}
 
           {msg.approval && (
-            <div className="rounded-md border border-warning-border bg-warning-soft px-3 py-2 text-xs">
+            <div
+              role="group"
+              aria-label={`待审批操作：${msg.approval.toolName}`}
+              className="rounded-md border border-warning-border bg-warning-soft px-3 py-2 text-xs"
+            >
               <div className="flex items-center gap-2">
                 <ShieldAlert className="h-3.5 w-3.5 text-warning" />
                 <span className="font-medium">需要审批：{msg.approval.toolName}</span>
@@ -544,26 +626,51 @@ export default function ChatPage() {
                 {JSON.stringify(msg.approval.params, null, 2)}
               </pre>
               {msg.approval.decision ? (
-                <div className="mt-2 text-xs text-muted-foreground">
-                  {msg.approval.decision === "approved" ? "已批准，正在执行…" : "已拒绝"}
+                <div className="mt-2 text-xs text-muted-foreground" role="status">
+                  {msg.approval.decision === "rejected"
+                    ? "已拒绝"
+                    : msg.approval.content
+                      ? "已批准"
+                      : "已批准，请重新发送指令以执行"}
+                </div>
+              ) : msg.approval.invalid ? (
+                <div className="mt-2 text-xs text-danger" role="status">
+                  审批已失效：{msg.approval.error}
                 </div>
               ) : (
-                <div className="mt-2 flex gap-2">
-                  <button
-                    onClick={() => void handleApproval(msg.id, "approve")}
-                    className="flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary-hover"
-                  >
-                    <Check className="h-3.5 w-3.5" />
-                    批准
-                  </button>
-                  <button
-                    onClick={() => void handleApproval(msg.id, "reject")}
-                    className="flex items-center gap-1 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-subtle"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                    拒绝
-                  </button>
-                </div>
+                <>
+                  <div className="mt-2 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleApproval(msg.id, "approve")}
+                      disabled={msg.approval.submitting}
+                      aria-disabled={msg.approval.submitting}
+                      className="flex items-center gap-1 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-primary"
+                    >
+                      {msg.approval.submitting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Check className="h-3.5 w-3.5" />
+                      )}
+                      批准
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleApproval(msg.id, "reject")}
+                      disabled={msg.approval.submitting}
+                      aria-disabled={msg.approval.submitting}
+                      className="flex items-center gap-1 rounded-md border border-border bg-surface px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-subtle disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-surface"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      拒绝
+                    </button>
+                  </div>
+                  {msg.approval.error && (
+                    <div className="mt-1 text-xs text-danger" role="alert">
+                      操作失败：{msg.approval.error}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}
