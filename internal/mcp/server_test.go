@@ -1233,3 +1233,467 @@ func TestToolDescriptionsAndNamesUnchanged(t *testing.T) {
 		t.Errorf("tool count = %d, want 5 (no tool may be added or removed)", len(tools))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// opsagent_changes_list
+// ---------------------------------------------------------------------------
+
+// fakeChangePhrases are the hard-coded sample rows and fake counters the old
+// changes handler emitted. No call on any code path may ever produce them
+// again: the tool either lists real records or honestly reports it has none.
+var fakeChangePhrases = []string{
+	"Changes found",
+	"Changes found: 0",
+	"09:15",
+	"order-service deployment v2.3.1",
+	"postgres-order config update",
+	"api-gateway",
+}
+
+// fakeChangeSource is a test double for sources.ChangeSource. It returns
+// exactly what the test hands it and records WHICH method was used, so a test
+// can prove that the unconfigured path never touched the source at all.
+type fakeChangeSource struct {
+	changes []models.Change
+	err     error
+
+	calls           int
+	callsByService  int
+	callsLastChange int
+	gotService      string
+	gotStart        time.Time
+	gotEnd          time.Time
+}
+
+var _ sources.ChangeSource = (*fakeChangeSource)(nil)
+
+func (f *fakeChangeSource) QueryChanges(_ context.Context, start, end time.Time) ([]models.Change, error) {
+	f.calls++
+	f.gotStart, f.gotEnd = start, end
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.changes, nil
+}
+
+func (f *fakeChangeSource) QueryChangesByService(_ context.Context, service string, start, end time.Time) ([]models.Change, error) {
+	f.callsByService++
+	f.gotService, f.gotStart, f.gotEnd = service, start, end
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.changes, nil
+}
+
+func (f *fakeChangeSource) GetLastChange(_ context.Context, service string) (*models.Change, error) {
+	f.callsLastChange++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return nil, nil
+}
+
+// totalCalls spans every interface entry point, so "the source was never
+// queried" is asserted across all three methods, not just one.
+func (f *fakeChangeSource) totalCalls() int {
+	return f.calls + f.callsByService + f.callsLastChange
+}
+
+// testChanges is a small, unordered, real-shaped change batch.
+func testChanges() []models.Change {
+	return []models.Change{
+		{
+			ID:          "chg-2",
+			Timestamp:   testStart.Add(3 * time.Minute),
+			Service:     "checkout-api",
+			Type:        "config",
+			Description: "configmap checkout-api retry policy updated",
+		},
+		{
+			ID:          "chg-1",
+			Timestamp:   testStart.Add(time.Minute),
+			Service:     "checkout-api",
+			Type:        "deployment",
+			Description: "deploy checkout-api v9.9.9",
+		},
+		{
+			ID:          "chg-3",
+			Timestamp:   testStart.Add(2 * time.Minute),
+			Service:     "ledger-db",
+			Type:        "scale",
+			Description: "ledger-db replicas 2 -> 4",
+		},
+	}
+}
+
+func TestHandleChangesList(t *testing.T) {
+	changeErr := errors.New("K8s deployments request failed: connection refused")
+
+	tests := []struct {
+		name        string
+		src         func() *fakeChangeSource
+		real        bool
+		args        map[string]interface{}
+		want        []string
+		notWant     []string
+		isError     bool
+		wantCalls   int
+		wantBySvc   int
+		wantService string
+	}{
+		{
+			name:      "real source, no service lists the whole window newest first",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{changes: testChanges()} },
+			real:      true,
+			args:      windowArgs(nil),
+			wantCalls: 1,
+			want: []string{
+				"变更查询结果（数据源：已配置的真实变更源）",
+				"时间窗: 2026-01-02T03:04:05Z ~ 2026-01-02T04:04:05Z",
+				"范围: 全部服务（QueryChanges，未按服务过滤）",
+				"变更源返回条目数: 3",
+				"去重后条目数: 3",
+				"[1] 2026-01-02T03:07:05Z | checkout-api | config | configmap checkout-api retry policy updated",
+				"[3] 2026-01-02T03:05:05Z | checkout-api | deployment | deploy checkout-api v9.9.9",
+			},
+		},
+		{
+			name:        "real source, service filter uses QueryChangesByService",
+			src:         func() *fakeChangeSource { return &fakeChangeSource{changes: testChanges()} },
+			real:        true,
+			args:        windowArgs(map[string]interface{}{"service": "ledger-db"}),
+			wantCalls:   0,
+			wantBySvc:   1,
+			wantService: "ledger-db",
+			want: []string{
+				"范围: 按服务过滤 service=ledger-db（QueryChangesByService）",
+				"变更源返回条目数: 3",
+				"ledger-db",
+			},
+		},
+		{
+			name:      "real source, empty result is honest and is not an error",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{} },
+			real:      true,
+			args:      windowArgs(nil),
+			wantCalls: 1,
+			want: []string{
+				"变更源返回条目数: 0",
+				"去重后条目数: 0",
+				"返回了 0 条变更记录（真实返回结果，不是省略显示、也不是查询失败）",
+			},
+			notWant: []string{"其余", "单次展示上限"},
+		},
+		{
+			name: "no source injected is reported as unconfigured and never queried",
+			src:  nil,
+			args: windowArgs(map[string]interface{}{"service": "checkout-api"}),
+			want: []string{
+				"变更源未配置",
+				"K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE",
+				"GET /api/v1/changes",
+				"不会查询任何源",
+			},
+			notWant: []string{"变更源返回条目数", "去重后条目数"},
+		},
+		{
+			name:      "empty fallback source (real=false) is unconfigured and never queried",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{changes: testChanges()} },
+			real:      false,
+			args:      windowArgs(nil),
+			wantCalls: 0,
+			want: []string{
+				"变更源未配置",
+				"不会编造任何变更条目或条数",
+			},
+			notWant: []string{"变更源返回条目数", "deploy checkout-api v9.9.9"}, // the records must not leak
+		},
+		{
+			name:      "source error is surfaced honestly, with no fabricated records",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{err: changeErr} },
+			real:      true,
+			args:      windowArgs(nil),
+			wantCalls: 1,
+			want:      []string{"变更查询失败", "未返回任何变更记录", changeErr.Error()},
+			notWant:   []string{"变更源返回条目数", "deploy checkout-api v9.9.9"},
+			isError:   true,
+		},
+		{
+			name:      "malformed start_time is refused without querying",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{changes: testChanges()} },
+			real:      true,
+			args:      map[string]interface{}{"start_time": "2026-01-02 03:04:05", "end_time": testEnd.Format(time.RFC3339)},
+			wantCalls: 0,
+			want:      []string{"start_time=\"2026-01-02 03:04:05\" 不是合法 RFC3339", "未查询任何变更源"},
+			notWant:   []string{"变更源返回条目数"},
+			isError:   true,
+		},
+		{
+			name:      "malformed end_time is refused without querying",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{changes: testChanges()} },
+			real:      true,
+			args:      map[string]interface{}{"start_time": testStart.Format(time.RFC3339), "end_time": "not-a-time"},
+			wantCalls: 0,
+			want:      []string{"end_time=\"not-a-time\" 不是合法 RFC3339", "未查询任何变更源"},
+			notWant:   []string{"变更源返回条目数"},
+			isError:   true,
+		},
+		{
+			name:      "inverted window is refused without querying",
+			src:       func() *fakeChangeSource { return &fakeChangeSource{changes: testChanges()} },
+			real:      true,
+			args:      map[string]interface{}{"start_time": testEnd.Format(time.RFC3339), "end_time": testStart.Format(time.RFC3339)},
+			wantCalls: 0,
+			want:      []string{"时间窗非法", "未查询任何变更源"},
+			notWant:   []string{"变更源返回条目数"},
+			isError:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &Server{}
+			var fake *fakeChangeSource
+			if tc.src != nil {
+				fake = tc.src()
+				srv.SetChangeSource(fake, tc.real)
+			}
+
+			resp, err := srv.CallTool(context.Background(), ToolCall{
+				Name:      "opsagent_changes_list",
+				Arguments: tc.args,
+			})
+			if err != nil {
+				t.Fatalf("CallTool returned error: %v", err)
+			}
+			if resp.IsError != tc.isError {
+				t.Errorf("IsError = %v, want %v", resp.IsError, tc.isError)
+			}
+
+			text := responseText(t, resp)
+			for _, want := range tc.want {
+				if !strings.Contains(text, want) {
+					t.Errorf("output missing %q:\n%s", want, text)
+				}
+			}
+			notWant := append(append([]string{}, tc.notWant...), fakeChangePhrases...)
+			for _, nw := range notWant {
+				if strings.Contains(text, nw) {
+					t.Errorf("output must not contain %q:\n%s", nw, text)
+				}
+			}
+			assertNoFabricatedData(t, text)
+
+			if fake != nil {
+				if fake.calls != tc.wantCalls {
+					t.Errorf("QueryChanges calls = %d, want %d", fake.calls, tc.wantCalls)
+				}
+				if fake.callsByService != tc.wantBySvc {
+					t.Errorf("QueryChangesByService calls = %d, want %d", fake.callsByService, tc.wantBySvc)
+				}
+				if tc.wantService != "" && fake.gotService != tc.wantService {
+					t.Errorf("service passed to source = %q, want %q", fake.gotService, tc.wantService)
+				}
+				if tc.wantCalls > 0 || tc.wantBySvc > 0 {
+					if !fake.gotStart.Equal(testStart) || !fake.gotEnd.Equal(testEnd) {
+						t.Errorf("source window = %s ~ %s, want %s ~ %s",
+							fake.gotStart.Format(time.RFC3339), fake.gotEnd.Format(time.RFC3339),
+							testStart.Format(time.RFC3339), testEnd.Format(time.RFC3339))
+					}
+				}
+				if fake.callsLastChange != 0 {
+					t.Errorf("GetLastChange was called %d times; the tool must not use it", fake.callsLastChange)
+				}
+			}
+		})
+	}
+}
+
+// TestHandleChangesListUnconfiguredNeverQueries proves the hard contract: with
+// no real source the source is not touched AT ALL, on any interface method.
+func TestHandleChangesListUnconfiguredNeverQueries(t *testing.T) {
+	cases := []struct {
+		name string
+		wire func(srv *Server, fake *fakeChangeSource)
+	}{
+		{
+			name: "nil source",
+			wire: func(_ *Server, _ *fakeChangeSource) {},
+		},
+		{
+			name: "injected source flagged as not real",
+			wire: func(srv *Server, fake *fakeChangeSource) { srv.SetChangeSource(fake, false) },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeChangeSource{changes: testChanges()}
+			srv := &Server{}
+			tc.wire(srv, fake)
+
+			for _, args := range []map[string]interface{}{
+				windowArgs(nil),
+				windowArgs(map[string]interface{}{"service": "checkout-api"}),
+				{}, // even a bad/absent window must not reach the source
+			} {
+				resp, err := srv.CallTool(context.Background(), ToolCall{
+					Name:      "opsagent_changes_list",
+					Arguments: args,
+				})
+				if err != nil {
+					t.Fatalf("CallTool returned error: %v", err)
+				}
+				if resp.IsError {
+					t.Errorf("unconfigured change source must not be an error:\n%s", responseText(t, resp))
+				}
+				text := responseText(t, resp)
+				if !strings.Contains(text, "变更源未配置") {
+					t.Errorf("expected the honest unconfigured text:\n%s", text)
+				}
+				for _, nw := range fakeChangePhrases {
+					if strings.Contains(text, nw) {
+						t.Errorf("output must not contain %q:\n%s", nw, text)
+					}
+				}
+				assertNoFabricatedData(t, text)
+			}
+
+			if got := fake.totalCalls(); got != 0 {
+				t.Errorf("change source was queried %d times while unconfigured, want 0", got)
+			}
+		})
+	}
+}
+
+// TestHandleChangesListDefaultsWindowWhenAbsent pins the documented default:
+// the shared lookback window, echoed in the output, really handed to the source.
+func TestHandleChangesListDefaultsWindowWhenAbsent(t *testing.T) {
+	fake := &fakeChangeSource{changes: testChanges()}
+	srv := &Server{}
+	srv.SetChangeSource(fake, true)
+
+	before := time.Now()
+	resp, err := srv.CallTool(context.Background(), ToolCall{
+		Name:      "opsagent_changes_list",
+		Arguments: map[string]interface{}{},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned error: %v", err)
+	}
+	after := time.Now()
+
+	text := responseText(t, resp)
+	if !strings.Contains(text, "start_time 未提供") || !strings.Contains(text, "end_time 未提供") {
+		t.Errorf("the applied defaults must be reported:\n%s", text)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("QueryChanges calls = %d, want 1", fake.calls)
+	}
+	if slack := 5 * time.Second; fake.gotStart.Before(before.Add(-defaultLookback).Add(-slack)) ||
+		fake.gotStart.After(after.Add(-defaultLookback).Add(slack)) {
+		t.Errorf("defaulted start = %s, want ~%s", fake.gotStart.Format(time.RFC3339), before.Add(-defaultLookback).Format(time.RFC3339))
+	}
+	if fake.gotEnd.Before(before.Add(-5*time.Second)) || fake.gotEnd.After(after.Add(5*time.Second)) {
+		t.Errorf("defaulted end = %s, want the call time", fake.gotEnd.Format(time.RFC3339))
+	}
+}
+
+// TestHandleChangesListOrderingDedupAndBound pins the deterministic newest-first
+// order, the exact-duplicate removal and the display cap — and that every count
+// in the output comes from the records the source really returned.
+func TestHandleChangesListOrderingDedupAndBound(t *testing.T) {
+	base := make([]models.Change, 0, 25)
+	for i := 0; i < 25; i++ {
+		base = append(base, models.Change{
+			ID:          fmt.Sprintf("chg-%02d", i),
+			Timestamp:   testStart.Add(time.Duration(i) * time.Minute),
+			Service:     "checkout-api",
+			Type:        "deployment",
+			Description: fmt.Sprintf("change-%02d", i),
+		})
+	}
+	// Exact duplicates are handed in at the FRONT of the batch too, so a
+	// deduplicator that only looks at adjacent pairs after sorting still works.
+	returned := append([]models.Change{}, base[7], base[0], base[7])
+	returned = append(returned, base...)
+
+	srv := &Server{}
+	srv.SetChangeSource(&fakeChangeSource{changes: returned}, true)
+
+	call := func() string {
+		t.Helper()
+		resp, err := srv.CallTool(context.Background(), ToolCall{
+			Name:      "opsagent_changes_list",
+			Arguments: windowArgs(nil),
+		})
+		if err != nil {
+			t.Fatalf("CallTool returned error: %v", err)
+		}
+		return responseText(t, resp)
+	}
+
+	text := call()
+	assertNoFabricatedData(t, text)
+
+	if !strings.Contains(text, fmt.Sprintf("变更源返回条目数: %d", len(returned))) {
+		t.Fatalf("expected the real returned count %d:\n%s", len(returned), text)
+	}
+	if !strings.Contains(text, "去重后条目数: 25") {
+		t.Fatalf("expected the real deduplicated count:\n%s", text)
+	}
+	if !strings.Contains(text, fmt.Sprintf("... 其余 %d 条已省略", 25-maxChangesShown)) {
+		t.Fatalf("expected a truncation notice:\n%s", text)
+	}
+	if got := strings.Count(text, "\n  ["); got != maxChangesShown {
+		t.Fatalf("rendered %d entries, want %d:\n%s", got, maxChangesShown, text)
+	}
+
+	// change-24 is the newest and change-05 the oldest still shown; change-04
+	// fell past the cap.
+	newest, lastShown, omitted := strings.Index(text, "change-24"),
+		strings.Index(text, "change-05"), strings.Index(text, "change-04")
+	if newest < 0 || lastShown < 0 {
+		t.Fatalf("expected the 20 newest records to be rendered:\n%s", text)
+	}
+	if newest > lastShown {
+		t.Errorf("records are not in newest-first order:\n%s", text)
+	}
+	if omitted >= 0 {
+		t.Errorf("record past the display cap must not be rendered:\n%s", text)
+	}
+
+	// Deterministic: the same real records must render byte-identically.
+	if again := call(); again != text {
+		t.Errorf("output is not deterministic\n--- first ---\n%s\n--- second ---\n%s", text, again)
+	}
+}
+
+// TestFormatChangesResultGolden pins the exact rendered text of a real batch,
+// so the documented sample output cannot drift silently.
+func TestFormatChangesResultGolden(t *testing.T) {
+	srv := &Server{}
+	srv.SetChangeSource(&fakeChangeSource{changes: testChanges()}, true)
+
+	resp, err := srv.CallTool(context.Background(), ToolCall{
+		Name:      "opsagent_changes_list",
+		Arguments: windowArgs(nil),
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned error: %v", err)
+	}
+
+	want := "变更查询结果（数据源：已配置的真实变更源）\n" +
+		"时间窗: 2026-01-02T03:04:05Z ~ 2026-01-02T04:04:05Z\n" +
+		"范围: 全部服务（QueryChanges，未按服务过滤）\n" +
+		"变更源返回条目数: 3\n" +
+		"去重后条目数: 3\n" +
+		"展示前 3 条（按时间倒序，格式：时间 | service | 类型 | 描述）:\n" +
+		"  [1] 2026-01-02T03:07:05Z | checkout-api | config | configmap checkout-api retry policy updated\n" +
+		"  [2] 2026-01-02T03:06:05Z | ledger-db | scale | ledger-db replicas 2 -> 4\n" +
+		"  [3] 2026-01-02T03:05:05Z | checkout-api | deployment | deploy checkout-api v9.9.9"
+
+	if got := responseText(t, resp); got != want {
+		t.Errorf("changes list output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}

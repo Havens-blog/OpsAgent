@@ -53,6 +53,14 @@ type Server struct {
 
 	logSource sources.LogSource
 	logsReal  bool
+
+	// changeSource is the SAME source /api/v1/changes serves from (built by
+	// agent.CreateRCASourcesWithFallback). changesReal mirrors
+	// active["changes"]: when false the dimension is backed by the honest empty
+	// source, and the tool MUST report that instead of querying it or counting
+	// anything — an unconfigured dimension has no records to count.
+	changeSource sources.ChangeSource
+	changesReal  bool
 }
 
 // NewServer creates a new MCP server.
@@ -95,6 +103,15 @@ func (s *Server) SetLogSource(src sources.LogSource, real bool) {
 func (s *Server) SetTopologySource(src sources.TopologySource, real bool) {
 	s.topologySource = src
 	s.topologyReal = real
+}
+
+// SetChangeSource injects the change source and whether it is backed by a real
+// backend. Callers pass rcaSources.ChangeSource together with
+// active["changes"] from agent.CreateRCASourcesWithFallback, so this tool lists
+// exactly the change records REST GET /api/v1/changes lists.
+func (s *Server) SetChangeSource(src sources.ChangeSource, real bool) {
+	s.changeSource = src
+	s.changesReal = real
 }
 
 // ToolCall represents a tool call request.
@@ -1111,41 +1128,185 @@ func joinOrNone(lines []string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// handleChangesList handles change list requests. The MCP server has no real
-// change source wired (Server carries only a datasource registry), so it
-// reports that honestly instead of fabricating records. Real change data is
-// served by the REST API (GET /api/v1/changes) from the configured
-// Kubernetes / platform-event source.
+// maxChangesShown caps how many real change records one call renders, so a busy
+// cluster cannot dump its whole history into the tool result.
+const maxChangesShown = 20
+
+// changesUnconfiguredText is the honest answer when no real change source is
+// configured (nil source, or the dimension fell back to the honest empty
+// source). It reports ZERO records and no count of anything, because an
+// unconfigured source was never queried and has no records to report.
+const changesUnconfiguredText = "变更源未配置，无法返回真实变更记录。\n" +
+	"本工具只在配置了真实变更源（K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE 或平台事件源）时返回数据，未配置期间不会查询任何源，也不会编造任何变更条目或条数。\n" +
+	"配置上述环境变量后重启 MCP 服务重试；也可直接调用 REST 接口 GET /api/v1/changes 查看当前变更源返回的内容。"
+
+// handleChangesList lists REAL change events from the configured change source
+// (K8s deployment records / platform events) — the same source REST
+// GET /api/v1/changes serves from.
+//
+// Hard contract, matching that REST handler: when no real source is wired
+// (nil source or changesReal=false) the tool says so and NEVER queries the
+// mock/empty fallback; a real query failure is returned as an error with the
+// upstream text, never papered over with fabricated records or a fake count.
 func (s *Server) handleChangesList(ctx context.Context, args map[string]interface{}) (*ToolResponse, error) {
-	// Parse arguments
-	startTimeStr, _ := args["start_time"].(string)
-	endTimeStr, _ := args["end_time"].(string)
-	service, _ := args["service"].(string)
+	service := strings.TrimSpace(stringArg(args, "service"))
 
-	// Parse time strings
-	startTime, err := time.Parse(time.RFC3339, startTimeStr)
-	if err != nil {
-		startTime = time.Now().Add(-24 * time.Hour)
-	}
-	endTime, err := time.Parse(time.RFC3339, endTimeStr)
-	if err != nil {
-		endTime = time.Now()
+	src := s.changeSource
+	if src == nil || !s.changesReal {
+		return textResponse(changesUnconfiguredText), nil
 	}
 
-	text := fmt.Sprintf("Recent Changes:\nTime: %s to %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	startTime, endTime, notes, bad := changeWindow(args)
+	if bad != "" {
+		return errorResponse("变更查询失败：" + bad + "，未查询任何变更源。"), nil
+	}
+	if msg, inverted := windowProblem(startTime, endTime); inverted {
+		return errorResponse("变更查询失败：" + msg + "，未查询任何变更源。"), nil
+	}
+
+	var (
+		changes []models.Change
+		err     error
+	)
 	if service != "" {
-		text += fmt.Sprintf("Service: %s\n", service)
+		changes, err = src.QueryChangesByService(ctx, service, startTime, endTime)
+	} else {
+		changes, err = src.QueryChanges(ctx, startTime, endTime)
 	}
-	text += "\nChanges found: 0\n变更源未配置或不可用，暂无真实变更记录。\n请配置 K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE 或平台事件源后，通过 REST API GET /api/v1/changes 查询真实变更数据。"
-
-	content := []interface{}{
-		map[string]interface{}{
-			"type": "text",
-			"text": text,
-		},
+	if err != nil {
+		return errorResponse(fmt.Sprintf(
+			"变更查询失败，未返回任何变更记录。\n时间窗: %s ~ %s\n原因: %v\n请检查变更源（K8S_ENDPOINT/K8S_TOKEN/K8S_NAMESPACE 或平台事件源）的配置与后端连通性，或用 REST 接口 GET /api/v1/changes 复核。",
+			startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), err)), nil
 	}
 
-	return &ToolResponse{Content: content}, nil
+	return textResponse(formatChangesResult(service, startTime, endTime, notes, changes)), nil
+}
+
+// changeWindow resolves the time window of the change tool. Unlike
+// parseWindow it REFUSES a malformed timestamp instead of silently substituting
+// the default: a rendered change list looks like an answer to the window the
+// caller asked for, so quietly answering a different one would be a lie. An
+// absent value still defaults to the shared lookback and is reported in notes.
+func changeWindow(args map[string]interface{}) (time.Time, time.Time, []string, string) {
+	now := time.Now()
+	startTime := now.Add(-defaultLookback)
+	endTime := now
+
+	var notes []string
+
+	rawStart := strings.TrimSpace(stringArg(args, "start_time"))
+	switch {
+	case rawStart == "":
+		notes = append(notes, fmt.Sprintf("start_time 未提供，已默认使用 %s（本次调用时间前 %s）", startTime.Format(time.RFC3339), defaultLookback))
+	default:
+		if t, err := time.Parse(time.RFC3339, rawStart); err != nil {
+			return time.Time{}, time.Time{}, nil, fmt.Sprintf("start_time=%q 不是合法 RFC3339", rawStart)
+		} else {
+			startTime = t
+		}
+	}
+
+	rawEnd := strings.TrimSpace(stringArg(args, "end_time"))
+	switch {
+	case rawEnd == "":
+		notes = append(notes, fmt.Sprintf("end_time 未提供，已默认使用 %s（本次调用时间）", endTime.Format(time.RFC3339)))
+	default:
+		if t, err := time.Parse(time.RFC3339, rawEnd); err != nil {
+			return time.Time{}, time.Time{}, nil, fmt.Sprintf("end_time=%q 不是合法 RFC3339", rawEnd)
+		} else {
+			endTime = t
+		}
+	}
+
+	return startTime, endTime, notes, ""
+}
+
+// formatChangesResult renders the records the change source actually returned.
+// Every number in it is a real result count: the source's own return count, the
+// count after exact-duplicate removal, and how many entries the display cap
+// left out. It never invents a record, a count or a success claim.
+func formatChangesResult(service string, startTime, endTime time.Time, notes []string, returned []models.Change) string {
+	var b strings.Builder
+	b.WriteString("变更查询结果（数据源：已配置的真实变更源）\n")
+	fmt.Fprintf(&b, "时间窗: %s ~ %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
+	if service != "" {
+		fmt.Fprintf(&b, "范围: 按服务过滤 service=%s（QueryChangesByService）\n", service)
+	} else {
+		b.WriteString("范围: 全部服务（QueryChanges，未按服务过滤）\n")
+	}
+	writeParamNotes(&b, notes)
+
+	changes := sortedChanges(returned)
+	fmt.Fprintf(&b, "变更源返回条目数: %d\n", len(returned))
+	fmt.Fprintf(&b, "去重后条目数: %d\n", len(changes))
+
+	if len(changes) == 0 {
+		b.WriteString("未显示任何条目：变更源在该时间窗内返回了 0 条变更记录（真实返回结果，不是省略显示、也不是查询失败）。\n")
+		return strings.TrimRight(b.String(), "\n")
+	}
+
+	shown := changes
+	if len(shown) > maxChangesShown {
+		shown = shown[:maxChangesShown]
+	}
+	fmt.Fprintf(&b, "展示前 %d 条（按时间倒序，格式：时间 | service | 类型 | 描述）:\n", len(shown))
+	for i, c := range shown {
+		fmt.Fprintf(&b, "  [%d] %s | %s | %s | %s\n",
+			i+1, c.Timestamp.Format(time.RFC3339), changeFieldOrUnknown(c.Service),
+			changeFieldOrUnknown(c.Type), changeFieldOrUnknown(c.Description))
+	}
+	if omitted := len(changes) - len(shown); omitted > 0 {
+		fmt.Fprintf(&b, "  ... 其余 %d 条已省略（单次展示上限 = %d）。\n", omitted, maxChangesShown)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// sortedChanges orders the records newest-first and drops exact duplicates, so
+// the rendered list and its counts are deterministic across calls. Records that
+// compare equal on timestamp are ordered by their remaining fields, which also
+// makes the duplicate removal stable.
+func sortedChanges(changes []models.Change) []models.Change {
+	out := make([]models.Change, 0, len(changes))
+	out = append(out, changes...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].Timestamp.Equal(out[j].Timestamp) {
+			return out[i].Timestamp.After(out[j].Timestamp)
+		}
+		return changeIdentity(out[i]) < changeIdentity(out[j])
+	})
+
+	seen := make(map[string]struct{}, len(out))
+	deduped := out[:0]
+	for _, c := range out {
+		key := changeIdentity(c)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, c)
+	}
+	return deduped
+}
+
+// changeIdentity is the full identity of a change record: two records are the
+// same record only when every displayed field matches.
+func changeIdentity(c models.Change) string {
+	return strings.Join([]string{
+		c.Timestamp.UTC().Format(time.RFC3339Nano),
+		c.ID,
+		c.Service,
+		c.Type,
+		c.Description,
+	}, "\x1f")
+}
+
+// changeFieldOrUnknown keeps an absent service/type/description explicit
+// instead of rendering an empty column.
+func changeFieldOrUnknown(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "unknown"
+	}
+	return v
 }
 
 // Start starts the MCP HTTP server.
