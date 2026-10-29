@@ -378,3 +378,88 @@ func getMetricName(labels map[string]string) string {
 	}
 	return "unknown_metric"
 }
+
+// QueryMetricRange executes an arbitrary PromQL range query with the given
+// step and returns every matching series. It is the multi-series counterpart
+// to QueryMetric and honours the caller's step instead of a fixed 15s.
+func (p *PrometheusMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	if step == "" {
+		step = "60"
+	}
+
+	u, _ := url.Parse(p.queryRangeAPI)
+	q := u.Query()
+	q.Set("query", query)
+	q.Set("start", strconv.FormatInt(start.Unix(), 10))
+	q.Set("end", strconv.FormatInt(end.Unix(), 10))
+	q.Set("step", step)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	p.setAuth(req)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("prometheus query failed: %s", string(body))
+	}
+
+	var result struct {
+		Data struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]string `json:"metric"`
+				Values [][]interface{}   `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	series := make([]models.MetricSeries, 0, len(result.Data.Result))
+	for _, r := range result.Data.Result {
+		metricName := getMetricName(r.Metric)
+		dataPoints := make([]models.DataPoint, 0, len(r.Values))
+		for _, v := range r.Values {
+			if len(v) < 2 {
+				continue
+			}
+			ts, ok := v[0].(float64)
+			if !ok {
+				continue
+			}
+			val, ok := v[1].(string)
+			if !ok {
+				continue
+			}
+			fval, err := strconv.ParseFloat(val, 64)
+			if err != nil {
+				continue
+			}
+			if math.IsInf(fval, 0) || math.IsNaN(fval) {
+				continue
+			}
+			dataPoints = append(dataPoints, models.DataPoint{
+				Timestamp: time.Unix(int64(ts), 0),
+				Value:     fval,
+			})
+		}
+		series = append(series, models.MetricSeries{
+			Name:       metricName,
+			Labels:     r.Metric,
+			DataPoints: dataPoints,
+		})
+	}
+
+	return series, nil
+}

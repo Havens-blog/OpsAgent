@@ -349,27 +349,42 @@ var (
 	testEnd   = testStart.Add(time.Hour)
 )
 
-// fakeMetricSource is a test double for sources.MetricSource. It records the
-// expression it was handed, so a test can PROVE the PromQL really reached the
-// source (and that unconfigured paths never call it).
+// fakeMetricSource is a test double for sources.MetricSource and
+// sources.MetricRangeSource. It records the expression and step it was handed,
+// so a test can PROVE the PromQL and step really reached the source (and that
+// unconfigured paths never call it).
 type fakeMetricSource struct {
-	series *models.MetricSeries
+	series []models.MetricSeries
 	err    error
 
 	calls     int
 	gotQuery  string
 	gotStart  time.Time
 	gotEnd    time.Time
+	gotStep   string
 	gotFilter map[string]string
 }
 
-func (f *fakeMetricSource) QueryMetric(ctx context.Context, metricName string, start, end time.Time, filters map[string]string) (*models.MetricSeries, error) {
+func (f *fakeMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
 	f.calls++
-	f.gotQuery, f.gotStart, f.gotEnd, f.gotFilter = metricName, start, end, filters
+	f.gotQuery, f.gotStart, f.gotEnd, f.gotStep = query, start, end, step
 	if f.err != nil {
 		return nil, f.err
 	}
 	return f.series, nil
+}
+
+// QueryMetric remains to satisfy MetricSource; the metrics tool must never
+// call it, so it only records the filter and returns the first series.
+func (f *fakeMetricSource) QueryMetric(ctx context.Context, metricName string, start, end time.Time, filters map[string]string) (*models.MetricSeries, error) {
+	f.gotFilter = filters
+	if f.err != nil {
+		return nil, f.err
+	}
+	if len(f.series) == 0 {
+		return nil, nil
+	}
+	return &f.series[0], nil
 }
 
 // The remaining MetricSource methods exist only to satisfy the interface; the
@@ -439,9 +454,10 @@ func (f *fakeRCAEngine) Analyze(ctx context.Context, incident *models.Incident) 
 
 // The doubles must satisfy the exact interfaces the server injects.
 var (
-	_ sources.MetricSource = (*fakeMetricSource)(nil)
-	_ sources.LogSource    = (*fakeLogSource)(nil)
-	_ rcaAnalyzer          = (*fakeRCAEngine)(nil)
+	_ sources.MetricSource      = (*fakeMetricSource)(nil)
+	_ sources.MetricRangeSource = (*fakeMetricSource)(nil)
+	_ sources.LogSource         = (*fakeLogSource)(nil)
+	_ rcaAnalyzer               = (*fakeRCAEngine)(nil)
 )
 
 // windowArgs returns tool arguments carrying the fixed test window.
@@ -456,17 +472,28 @@ func windowArgs(extra map[string]interface{}) map[string]interface{} {
 	return args
 }
 
-// testMetricSeries is a real-shaped series: unordered data points, so the
-// "latest value" rendering has to pick the newest one itself.
-func testMetricSeries() *models.MetricSeries {
-	return &models.MetricSeries{
-		Name:   "arms_app_errors_per_sec",
-		Labels: map[string]string{"service": "checkout-api", "cloud": "arms"},
-		Unit:   "unknown",
-		DataPoints: []models.DataPoint{
-			{Timestamp: testStart.Add(2 * time.Minute), Value: 4.5},
-			{Timestamp: testStart.Add(3 * time.Minute), Value: 9.75},
-			{Timestamp: testStart.Add(time.Minute), Value: 1.25},
+// testMetricSeries is a small, real-shaped multi-series batch with unordered
+// data points (so "latest value" must pick the newest point) and two distinct
+// names (so the deterministic name sort is exercised).
+func testMetricSeries() []models.MetricSeries {
+	return []models.MetricSeries{
+		{
+			Name:   "arms_app_errors_per_sec",
+			Labels: map[string]string{"service": "checkout-api", "cloud": "arms"},
+			Unit:   "unknown",
+			DataPoints: []models.DataPoint{
+				{Timestamp: testStart.Add(2 * time.Minute), Value: 4.5},
+				{Timestamp: testStart.Add(3 * time.Minute), Value: 9.75},
+				{Timestamp: testStart.Add(time.Minute), Value: 1.25},
+			},
+		},
+		{
+			Name:   "arms_app_latency_ms",
+			Labels: map[string]string{"service": "checkout-api", "cloud": "arms"},
+			Unit:   "unknown",
+			DataPoints: []models.DataPoint{
+				{Timestamp: testStart.Add(time.Minute), Value: 120.0},
+			},
 		},
 	}
 }
@@ -560,27 +587,28 @@ func TestHandleMetricsQuery(t *testing.T) {
 		// wantCalls pins whether the injected source was really queried.
 		wantCalls int
 		wantQuery string
+		wantStep  string
 	}{
 		{
-			name:      "real source executes the PromQL and renders the returned series",
+			name:      "real source executes the PromQL and renders every returned series",
 			src:       func() *fakeMetricSource { return &fakeMetricSource{series: testMetricSeries()} },
 			real:      true,
 			args:      windowArgs(map[string]interface{}{"query": promQL, "step": "2m"}),
 			wantCalls: 1,
 			wantQuery: promQL,
+			wantStep:  "2m",
 			want: []string{
 				"指标查询结果（数据源：已配置的真实指标源）",
 				"PromQL: " + promQL,
 				"时间窗: 2026-01-02T03:04:05Z ~ 2026-01-02T04:04:05Z",
 				"step 参数: 2m",
-				"序列数: 1",
-				"name=arms_app_errors_per_sec",
-				"标签={cloud=arms, service=checkout-api}",
-				"点数=3",
-				"最新值=9.75 @ 2026-01-02T03:07:05Z",
-				"若表达式命中多条序列，其余序列本接口无法返回",
+				"step 已作为底层范围查询的采样间隔真实下发",
+				"指标源返回序列数: 2",
+				"展示前 2 条（按 name 确定性排序）:",
+				"[1] name=arms_app_errors_per_sec 标签={cloud=arms, service=checkout-api} 点数=3 最新值=9.75 @ 2026-01-02T03:07:05Z",
+				"[2] name=arms_app_latency_ms 标签={cloud=arms, service=checkout-api} 点数=1 最新值=120 @ 2026-01-02T03:05:05Z",
 			},
-			notWant: []string{"executed successfully", "Query executed"},
+			notWant: []string{"executed successfully", "Query executed", "序列数: 1", "只返回"},
 		},
 		{
 			name:      "real source, empty result is reported as zero series",
@@ -589,8 +617,9 @@ func TestHandleMetricsQuery(t *testing.T) {
 			args:      windowArgs(map[string]interface{}{"query": promQL}),
 			wantCalls: 1,
 			wantQuery: promQL,
-			want:      []string{"序列数: 0", "空序列"},
-			notWant:   []string{"executed successfully"},
+			wantStep:  "1m",
+			want:      []string{"指标源返回序列数: 0", "返回了 0 条序列"},
+			notWant:   []string{"executed successfully", "序列数: 1"},
 		},
 		{
 			name:    "no source injected is reported as unconfigured",
@@ -598,7 +627,7 @@ func TestHandleMetricsQuery(t *testing.T) {
 			real:    false,
 			args:    windowArgs(map[string]interface{}{"query": promQL}),
 			want:    []string{"指标源未配置", "PROMETHEUS_ENDPOINT", "ARMS_PROMETHEUS_BEARER_TOKEN", "ARMS APM"},
-			notWant: []string{"序列数", "executed successfully"},
+			notWant: []string{"指标源返回序列数", "executed successfully"},
 		},
 		{
 			name:      "empty fallback source (real=false) is reported as unconfigured and never queried",
@@ -607,7 +636,7 @@ func TestHandleMetricsQuery(t *testing.T) {
 			args:      windowArgs(map[string]interface{}{"query": promQL}),
 			wantCalls: 0,
 			want:      []string{"指标源未配置", "不会编造任何指标序列"},
-			notWant:   []string{"序列数", "arms_app_errors_per_sec"},
+			notWant:   []string{"指标源返回序列数", "arms_app_errors_per_sec"},
 		},
 		{
 			name:      "source error is surfaced honestly",
@@ -616,8 +645,9 @@ func TestHandleMetricsQuery(t *testing.T) {
 			args:      windowArgs(map[string]interface{}{"query": promQL}),
 			wantCalls: 1,
 			wantQuery: promQL,
+			wantStep:  "1m",
 			want:      []string{"指标查询失败", metricErr.Error(), "也可能是查询结果为空"},
-			notWant:   []string{"序列数", "executed successfully"},
+			notWant:   []string{"指标源返回序列数", "executed successfully"},
 			isError:   true,
 		},
 		{
@@ -636,6 +666,7 @@ func TestHandleMetricsQuery(t *testing.T) {
 			args:      map[string]interface{}{"query": promQL},
 			wantCalls: 1,
 			wantQuery: promQL,
+			wantStep:  "1m",
 			want:      []string{"start_time 未提供", "end_time 未提供", "请求参数说明"},
 		},
 		{
@@ -701,11 +732,92 @@ func TestHandleMetricsQuery(t *testing.T) {
 						fake.gotStart.Format(time.RFC3339), fake.gotEnd.Format(time.RFC3339),
 						testStart.Format(time.RFC3339), testEnd.Format(time.RFC3339))
 				}
-				if len(fake.gotFilter) != 0 {
-					t.Errorf("source filters = %v, want none (the PromQL must pass through unchanged)", fake.gotFilter)
-				}
+			}
+			if tc.wantStep != "" && fake.gotStep != tc.wantStep {
+				t.Errorf("source was handed step %q, want %q", fake.gotStep, tc.wantStep)
 			}
 		})
+	}
+}
+
+// TestHandleMetricsQueryOrderingAndBound pins the deterministic name sort and
+// the display cap, so a high-cardinality query cannot dump every series.
+func TestHandleMetricsQueryOrderingAndBound(t *testing.T) {
+	series := make([]models.MetricSeries, 0, 60)
+	for i := 0; i < 60; i++ {
+		series = append(series, models.MetricSeries{
+			Name:   fmt.Sprintf("metric-%02d", 59-i),
+			Labels: map[string]string{"service": "checkout-api"},
+			Unit:   "count",
+			DataPoints: []models.DataPoint{
+				{Timestamp: testStart.Add(time.Duration(i) * time.Second), Value: float64(i)},
+			},
+		})
+	}
+
+	srv := &Server{}
+	srv.SetMetricSource(&fakeMetricSource{series: series}, true)
+
+	resp, err := srv.CallTool(context.Background(), ToolCall{
+		Name:      "opsagent_metrics_query",
+		Arguments: windowArgs(map[string]interface{}{"query": "metric"}),
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned error: %v", err)
+	}
+	text := responseText(t, resp)
+	assertNoFabricatedData(t, text)
+
+	if !strings.Contains(text, "指标源返回序列数: 60") {
+		t.Fatalf("expected the real returned count:\n%s", text)
+	}
+	if !strings.Contains(text, "... 其余 40 条已省略") {
+		t.Fatalf("expected a truncation notice:\n%s", text)
+	}
+	if got := strings.Count(text, "\n  ["); got != maxMetricSeriesShown {
+		t.Fatalf("rendered %d series, want %d:\n%s", got, maxMetricSeriesShown, text)
+	}
+	pos00 := strings.Index(text, "[1] name=metric-00")
+	pos19 := strings.Index(text, "name=metric-19")
+	if pos00 < 0 || pos19 < 0 || pos00 > pos19 {
+		t.Fatalf("series are not deterministically sorted by name:\n%s", text)
+	}
+	if strings.Contains(text, "name=metric-20") {
+		t.Fatalf("the 21st series must be omitted by the display cap:\n%s", text)
+	}
+}
+
+// TestHandleMetricsQueryGolden pins the exact rendered text of a multi-series
+// result, so the documented sample output cannot drift silently.
+func TestHandleMetricsQueryGolden(t *testing.T) {
+	srv := &Server{}
+	srv.SetMetricSource(&fakeMetricSource{series: testMetricSeries()}, true)
+
+	resp, err := srv.CallTool(context.Background(), ToolCall{
+		Name: "opsagent_metrics_query",
+		Arguments: windowArgs(map[string]interface{}{
+			"query": "topk(2, arms_app_errors_per_sec)",
+			"step":  "1m",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned error: %v", err)
+	}
+
+	want := "指标查询结果（数据源：已配置的真实指标源）\n" +
+		"PromQL: topk(2, arms_app_errors_per_sec)\n" +
+		"时间窗: 2026-01-02T03:04:05Z ~ 2026-01-02T04:04:05Z\n" +
+		"step 参数: 1m\n" +
+		"说明：step 已作为底层范围查询的采样间隔真实下发（不再只是记录文案）。\n" +
+		"指标源返回序列数: 2\n" +
+		"展示前 2 条（按 name 确定性排序）:\n" +
+		"  [1] name=arms_app_errors_per_sec 标签={cloud=arms, service=checkout-api} 点数=3 最新值=9.75 @ 2026-01-02T03:07:05Z\n" +
+		"      单位: unknown\n" +
+		"  [2] name=arms_app_latency_ms 标签={cloud=arms, service=checkout-api} 点数=1 最新值=120 @ 2026-01-02T03:05:05Z\n" +
+		"      单位: unknown"
+
+	if got := responseText(t, resp); got != want {
+		t.Errorf("metrics query output mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
 

@@ -458,16 +458,20 @@ func (s *Server) handleMetricsQuery(ctx context.Context, args map[string]interfa
 		return errorResponse("指标查询失败：" + msg + "，未查询任何指标源。"), nil
 	}
 
-	// sources.MetricSource has no "run this PromQL, give me every series"
-	// method: QueryMetric(metricName, filters=nil) passes the expression
-	// through to the backend unchanged (both real implementations build the
-	// query as metricName when filters are empty), which is the only honest way
-	// to execute the caller's PromQL through this interface.
-	series, err := src.QueryMetric(ctx, query, startTime, endTime, nil)
+	// The metrics tool wants EVERY series the PromQL matches, and it wants the
+	// caller's step to actually reach the backend. QueryMetric returns only the
+	// first series and has no step parameter, so use the optional
+	// MetricRangeSource extension when the injected source supports it.
+	rangeSrc, ok := src.(sources.MetricRangeSource)
+	if !ok {
+		return errorResponse("指标查询失败：已配置的指标源不支持范围查询（未实现 MetricRangeSource），无法返回多序列。\n请检查注入的 MetricSource 是否为真实实现（DSMetricSource / PrometheusMetricSource）。"), nil
+	}
+
+	series, err := rangeSrc.QueryMetricRange(ctx, query, startTime, endTime, step)
 	if err != nil {
 		return errorResponse(fmt.Sprintf(
-			"指标查询失败，未返回任何指标数据。\nPromQL: %s\n时间窗: %s ~ %s\n原因: %v\n说明：真实指标源在“该 PromQL 在时间窗内无匹配序列”时同样返回 error，因此这个错误也可能是查询结果为空。",
-			query, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), err)), nil
+			"指标查询失败，未返回任何指标数据。\nPromQL: %s\n时间窗: %s ~ %s\nstep: %s\n原因: %v\n说明：真实指标源在“该 PromQL 在时间窗内无匹配序列”时同样返回 error，因此这个错误也可能是查询结果为空。",
+			query, startTime.Format(time.RFC3339), endTime.Format(time.RFC3339), step, err)), nil
 	}
 
 	return textResponse(formatMetricsResult(query, step, startTime, endTime, notes, series)), nil
@@ -487,6 +491,10 @@ const defaultLogLimit = 100
 
 // maxLogMessageChars truncates a single (possibly huge) log message.
 const maxLogMessageChars = 300
+
+// maxMetricSeriesShown caps how many metric series the metrics tool renders,
+// so a high-cardinality query cannot dump thousands of series into the result.
+const maxMetricSeriesShown = 20
 
 // maxRCACandidatesShown caps how many scored hypotheses the RCA tool renders.
 const maxRCACandidatesShown = 10
@@ -619,30 +627,55 @@ func writeParamNotes(b *strings.Builder, notes []string) {
 	}
 }
 
-// formatMetricsResult renders the series the metric source actually returned.
+// formatMetricsResult renders every series the metric source actually returned.
 // It never invents a series, a data point or a success claim.
-func formatMetricsResult(query, step string, startTime, endTime time.Time, notes []string, series *models.MetricSeries) string {
+func formatMetricsResult(query, step string, startTime, endTime time.Time, notes []string, series []models.MetricSeries) string {
 	var b strings.Builder
 	b.WriteString("指标查询结果（数据源：已配置的真实指标源）\n")
 	fmt.Fprintf(&b, "PromQL: %s\n", query)
 	fmt.Fprintf(&b, "时间窗: %s ~ %s\n", startTime.Format(time.RFC3339), endTime.Format(time.RFC3339))
 	fmt.Fprintf(&b, "step 参数: %s\n", step)
-	b.WriteString("说明：step 只记录调用方请求值，未被底层查询使用（真实实现固定按 15s 或 1m 采样）。\n")
+	b.WriteString("说明：step 已作为底层范围查询的采样间隔真实下发（不再只是记录文案）。\n")
 	writeParamNotes(&b, notes)
 
-	if series == nil {
-		b.WriteString("序列数: 0\n指标源返回了空序列（nil，err=nil），没有任何可展示的数据点。\n")
+	sorted := sortedMetricSeries(series)
+	fmt.Fprintf(&b, "指标源返回序列数: %d\n", len(series))
+
+	if len(sorted) == 0 {
+		b.WriteString("未显示任何序列：指标源返回了 0 条序列（真实返回结果，不是省略显示、也不是查询失败）。\n")
 		return strings.TrimRight(b.String(), "\n")
 	}
 
-	fmt.Fprintf(&b, "序列数: 1\n  [1] name=%s 标签=%s 点数=%d 最新值=%s\n",
-		metricNameOrUnknown(series.Name), formatLabels(series.Labels), len(series.DataPoints), latestValue(series.DataPoints))
-	if series.Unit != "" {
-		fmt.Fprintf(&b, "      单位: %s\n", series.Unit)
+	shown := sorted
+	if len(shown) > maxMetricSeriesShown {
+		shown = shown[:maxMetricSeriesShown]
 	}
-	b.WriteString("说明：sources.MetricSource 接口用 QueryMetric 执行该 PromQL，只返回后端命中的第一条序列；" +
-		"若表达式命中多条序列，其余序列本接口无法返回——需要全部序列时请用顶部聚合/过滤（如 topk(1, ...)）收窄表达式，或直接调用指标后端的查询接口。\n")
+	fmt.Fprintf(&b, "展示前 %d 条（按 name 确定性排序）:\n", len(shown))
+	for i, s := range shown {
+		fmt.Fprintf(&b, "  [%d] name=%s 标签=%s 点数=%d 最新值=%s\n",
+			i+1, metricNameOrUnknown(s.Name), formatLabels(s.Labels), len(s.DataPoints), latestValue(s.DataPoints))
+		if s.Unit != "" {
+			fmt.Fprintf(&b, "      单位: %s\n", s.Unit)
+		}
+	}
+	if omitted := len(sorted) - len(shown); omitted > 0 {
+		fmt.Fprintf(&b, "  ... 其余 %d 条已省略（单次展示上限 = %d）。\n", omitted, maxMetricSeriesShown)
+	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// sortedMetricSeries orders the returned series by name (then label set) so the
+// rendered output is deterministic across repeated calls.
+func sortedMetricSeries(series []models.MetricSeries) []models.MetricSeries {
+	out := make([]models.MetricSeries, 0, len(series))
+	out = append(out, series...)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return formatLabels(out[i].Labels) < formatLabels(out[j].Labels)
+	})
+	return out
 }
 
 // metricNameOrUnknown keeps an unnamed series explicit instead of blank.
