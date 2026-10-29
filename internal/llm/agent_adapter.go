@@ -13,7 +13,9 @@ import (
 // of being hard-wired to Anthropic.
 type AgentLLM interface {
 	Chat(ctx context.Context, messages []ClaudeMessage) (string, error)
-	ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, error)
+	// ChatWithTools returns the final text and the names of tools actually
+	// executed during this call, in first-execution order with duplicates removed.
+	ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, []string, error)
 }
 
 // Compile-time checks that both clients satisfy the interface.
@@ -60,9 +62,13 @@ func (a *OpenAIAgentClient) Chat(ctx context.Context, messages []ClaudeMessage) 
 
 // ChatWithTools runs the OpenAI tool-calling loop until the model returns a
 // final text response or maxIterations is reached.
-func (a *OpenAIAgentClient) ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, error) {
+func (a *OpenAIAgentClient) ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, []string, error) {
 	if len(tools) == 0 {
-		return a.Chat(ctx, messages)
+		text, err := a.Chat(ctx, messages)
+		if err != nil {
+			return "", nil, err
+		}
+		return text, nil, nil
 	}
 
 	convo := toOpenAIMessages(messages)
@@ -81,13 +87,15 @@ func (a *OpenAIAgentClient) ChatWithTools(ctx context.Context, messages []Claude
 	}
 
 	var finalText string
+	var toolNames []string
+	seen := make(map[string]struct{})
 	for i := 0; i < a.maxIterations; i++ {
 		resp, err := a.client.ChatWithTools(ctx, convo, openAITools)
 		if err != nil {
-			return "", err
+			return "", toolNames, err
 		}
 		if len(resp.Choices) == 0 {
-			return finalText, nil
+			return finalText, toolNames, nil
 		}
 		msg := resp.Choices[0].Message
 		if msg.Content != "" {
@@ -95,7 +103,7 @@ func (a *OpenAIAgentClient) ChatWithTools(ctx context.Context, messages []Claude
 		}
 		// No tool calls -> this is the final answer.
 		if len(msg.ToolCalls) == 0 {
-			return finalText, nil
+			return finalText, toolNames, nil
 		}
 
 		// Append the assistant message carrying the tool-call requests.
@@ -112,6 +120,10 @@ func (a *OpenAIAgentClient) ChatWithTools(ctx context.Context, messages []Claude
 			if handler == nil {
 				result = fmt.Sprintf("Error: no handler registered for tool %s", tc.Function.Name)
 			} else {
+				if _, ok := seen[tc.Function.Name]; !ok {
+					seen[tc.Function.Name] = struct{}{}
+					toolNames = append(toolNames, tc.Function.Name)
+				}
 				var input map[string]interface{}
 				if tc.Function.Arguments != "" {
 					if err := json.Unmarshal([]byte(tc.Function.Arguments), &input); err != nil {
@@ -132,7 +144,7 @@ func (a *OpenAIAgentClient) ChatWithTools(ctx context.Context, messages []Claude
 			})
 		}
 	}
-	return finalText, nil
+	return finalText, toolNames, nil
 }
 
 // toOpenAIMessages converts agent-layer ClaudeMessages to OpenAI messages.
