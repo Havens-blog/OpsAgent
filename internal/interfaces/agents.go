@@ -97,13 +97,13 @@ func (s *APIServer) initAgents() {
 	if cErr == nil {
 		// Register specialists for delegation (best-effort).
 		if logAnalyst != nil {
-			_ = coordinator.RegisterAgent("log_analyst", logAnalyst.BaseAgent)
+			_ = coordinator.RegisterAgent("log_analyst", logAnalyst)
 		}
 		if monitor != nil {
-			_ = coordinator.RegisterAgent("monitor", monitor.BaseAgent)
+			_ = coordinator.RegisterAgent("monitor", monitor)
 		}
 		if inspector != nil {
-			_ = coordinator.RegisterAgent("inspector", inspector.BaseAgent)
+			_ = coordinator.RegisterAgent("inspector", inspector)
 		}
 	}
 	register("coordinator", "Coordinator", "coordinator",
