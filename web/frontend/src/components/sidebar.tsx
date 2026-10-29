@@ -147,7 +147,7 @@ function SidebarBottom({ profile, failed }: { profile: EiamProfile | null; faile
   return (
     <div
       ref={rootRef}
-      className="relative flex items-center justify-between gap-2 border-t border-border bg-elevated px-3 py-3"
+      className="relative flex items-center justify-between gap-2 border-t border-border bg-surface px-3 py-3"
     >
       {/* User: primary avatar (first letter) + username → popover menu */}
       <button
@@ -208,9 +208,9 @@ export function Sidebar() {
   const { profile, failed } = useEiamProfile()
 
   return (
-    <aside className="flex h-full w-[210px] shrink-0 flex-col overflow-hidden rounded-xl bg-elevated shadow-sm">
+    <aside className="flex h-full w-[210px] shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-surface shadow-sm">
       {/* Top: logo + tenant selector (sticky) */}
-      <div className="sticky top-0 z-10 bg-elevated px-3 pt-4">
+      <div className="sticky top-0 z-10 bg-surface px-3 pt-4">
         <div className="mb-4 flex justify-center text-foreground">
           <XirangWordmark />
         </div>
