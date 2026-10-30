@@ -164,15 +164,15 @@ func (s *PendingApprovalStore) Get(id string) (*PendingApproval, error) {
 	return p, nil
 }
 
-// ListPending returns a tenant's pending, unexpired approvals newest first.
-func (s *PendingApprovalStore) ListPending(tenantID int64) []*PendingApproval {
+// ListPending returns a user's pending, unexpired approvals newest first.
+func (s *PendingApprovalStore) ListPending(tenantID, userID int64) []*PendingApproval {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	now := time.Now()
 	out := make([]*PendingApproval, 0)
 	for _, p := range s.items {
-		if p.TenantID != tenantID || p.Status != "pending" || now.After(p.ExpiresAt) {
+		if p.TenantID != tenantID || p.UserID != userID || p.Status != "pending" || now.After(p.ExpiresAt) {
 			continue
 		}
 		out = append(out, p)
@@ -238,7 +238,7 @@ func (s *APIServer) approvalsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := s.pendingApprovals.ListPending(EIAMTenantID(r.Context()))
+	items := s.pendingApprovals.ListPending(EIAMTenantID(r.Context()), EIAMUID(r.Context()))
 	s.writeJSONResponse(w, http.StatusOK, map[string]interface{}{
 		"approvals": items,
 		"count":     len(items),
