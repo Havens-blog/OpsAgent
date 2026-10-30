@@ -114,6 +114,7 @@ type ChatChunk struct {
 	Created int64    `json:"created"`
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
+	Usage   Usage    `json:"usage"`
 }
 
 // Config represents the LLM client configuration.
@@ -178,7 +179,7 @@ func (c *Client) ChatWithTools(ctx context.Context, messages []Message, tools []
 }
 
 // ChatStream sends a streaming chat completion request.
-func (c *Client) ChatStream(ctx context.Context, messages []Message, handler func(ChatChunk)) error {
+func (c *Client) ChatStream(ctx context.Context, messages []Message, handler func(ChatChunk)) (*ChatResponse, error) {
 	req := &ChatRequest{
 		Model:       c.config.Model,
 		Messages:    messages,
@@ -187,8 +188,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, handler fun
 		Stream:      true,
 	}
 
-	_, err := c.doChat(ctx, req, handler)
-	return err
+	return c.doChat(ctx, req, handler)
 }
 
 // doChat performs the actual chat request.
@@ -295,6 +295,7 @@ func (c *Client) handleStream(resp *http.Response, handler func(ChatChunk)) (*Ch
 			Created: lastChunk.Created,
 			Model:   lastChunk.Model,
 			Choices: lastChunk.Choices,
+			Usage:   lastChunk.Usage,
 		}, nil
 	}
 	return &ChatResponse{}, nil

@@ -46,16 +46,16 @@ func (c *toolCallingClient) ChatWithTools(ctx context.Context, messages []llm.Me
 	}, nil
 }
 
-func (c *toolCallingClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
+func (c *toolCallingClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
 	for _, ch := range c.chunks {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
 		handler(ch)
 	}
-	return nil
+	return &llm.ChatResponse{}, nil
 }
 
 func newToolServer(t *testing.T, client chat.ChatClient) *APIServer {

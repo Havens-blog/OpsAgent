@@ -28,19 +28,19 @@ func (f *fakeChatClient) ChatWithTools(ctx context.Context, messages []llm.Messa
 	return &llm.ChatResponse{}, nil
 }
 
-func (f *fakeChatClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
+func (f *fakeChatClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
 	if f.err != nil {
-		return f.err
+		return nil, f.err
 	}
 	for _, c := range f.chunks {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
 		handler(c)
 	}
-	return nil
+	return &llm.ChatResponse{}, nil
 }
 
 type blockingChatClient struct{}
@@ -53,9 +53,9 @@ func (b *blockingChatClient) ChatWithTools(ctx context.Context, messages []llm.M
 	return nil, nil
 }
 
-func (b *blockingChatClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
+func (b *blockingChatClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
 	<-ctx.Done()
-	return ctx.Err()
+	return nil, ctx.Err()
 }
 
 func newConversationServer(t *testing.T, client chat.ChatClient) *APIServer {
