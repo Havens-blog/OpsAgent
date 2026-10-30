@@ -34,6 +34,8 @@ const (
 	EventDataSourceQuery AuditEventType = "datasource_query"
 	// EventConfigChange represents a configuration change event
 	EventConfigChange AuditEventType = "config_change"
+	// EventToolExecution represents a chat-stream tool execution event
+	EventToolExecution AuditEventType = "tool_execution"
 )
 
 // AuditEvent represents an audit log entry.

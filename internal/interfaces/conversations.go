@@ -374,6 +374,12 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 
+	for _, ev := range evidence {
+		// Carry the session id in the request context so the audit record can
+		// attribute the tool execution to this conversation.
+		s.recordToolExecution(r.WithContext(ctx), ev)
+	}
+
 	assistantMsg := &chat.Message{
 		ID:        uuid.New().String(),
 		Role:      "assistant",

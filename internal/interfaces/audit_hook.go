@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 )
 
@@ -63,6 +64,18 @@ func (l *recentAuditLog) recent(n int) []auditEntry {
 	return out
 }
 
+// auditUser resolves the acting username using the same rules as the EIAM
+// auth path: "local" when EIAM is disabled, otherwise the authenticated name.
+func (s *APIServer) auditUser(r *http.Request) string {
+	if s.eiamSessionKey == "" {
+		return "local"
+	}
+	if user := EIAMUsername(r.Context()); user != "" {
+		return user
+	}
+	return "unknown"
+}
+
 // recordConfigChange records a config mutation: in-memory ring (read back by
 // the security page) plus JSONL file append when audit_log_path is configured.
 // Gated on security.enable_audit_log read at call time. Callers apply the
@@ -74,13 +87,7 @@ func (s *APIServer) recordConfigChange(r *http.Request, operation string, opErr 
 		return
 	}
 
-	user := "local"
-	if s.eiamSessionKey != "" {
-		user = EIAMUsername(r.Context())
-		if user == "" {
-			user = "unknown"
-		}
-	}
+	user := s.auditUser(r)
 
 	entry := auditEntry{
 		Time:      time.Now(),
@@ -115,6 +122,63 @@ func (s *APIServer) recordConfigChange(r *http.Request, operation string, opErr 
 		Result:    entry.Result,
 		Error:     entry.Detail,
 		Metadata:  map[string]interface{}{"user": entry.User, "ip": entry.IP},
+	})
+}
+
+// recordToolExecution records one chat-stream tool execution: in-memory ring
+// plus JSONL file append when audit_log_path is configured. It is gated on
+// security.enable_audit_log and never includes tool params (they may carry
+// sensitive data).
+func (s *APIServer) recordToolExecution(r *http.Request, ev chat.ToolEvidence) {
+	sec := s.settings.ToSecurityConfig()
+	if !sec.EnableAuditLog {
+		return
+	}
+
+	result := "failed"
+	if ev.Status == "success" {
+		result = "success"
+	}
+	detail := "source=" + ev.Source
+	if ev.Error != "" {
+		detail += ", error=" + ev.Error
+	}
+
+	user := s.auditUser(r)
+	ip := clientIP(r)
+	entry := auditEntry{
+		Time:      time.Now(),
+		User:      user,
+		Operation: "tool:" + ev.ToolName,
+		IP:        ip,
+		Result:    result,
+		Detail:    detail,
+	}
+	s.auditLog.add(entry)
+
+	if sec.AuditLogPath == "" {
+		return
+	}
+	w, err := observability.NewFileAuditWriter(sec.AuditLogPath)
+	if err != nil {
+		s.logger.Warn("audit file writer unavailable",
+			observability.String("path", sec.AuditLogPath), observability.Err(err))
+		return
+	}
+	defer w.Close()
+	_ = w.Write(&observability.AuditEvent{
+		Timestamp: entry.Time,
+		EventType: observability.EventToolExecution,
+		Action:    ev.ToolName,
+		Result:    result,
+		Error:     ev.Error,
+		Metadata: map[string]interface{}{
+			"user":            user,
+			"ip":              ip,
+			"source":          ev.Source,
+			"conversation_id": sessionIDFromCtx(r.Context()),
+			"evidence_id":     ev.EvidenceID,
+		},
 	})
 }
 
