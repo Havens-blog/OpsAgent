@@ -36,6 +36,7 @@ import {
   type ConversationMessage,
   type ToolEvidence,
 } from "@/lib/api"
+import { Markdown } from "@/components/markdown"
 
 interface ToolCall {
   callId: string
@@ -1124,7 +1125,7 @@ export default function ChatPage() {
 
           {msg.content && (
             <div className="whitespace-pre-wrap text-sm leading-relaxed text-text-regular">
-              {msg.content}
+              <Markdown content={msg.content} />
               {msg.streaming && (
                 <span className="ml-0.5 inline-block h-4 w-2 animate-pulse bg-current align-middle" />
               )}
