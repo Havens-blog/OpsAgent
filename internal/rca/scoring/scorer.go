@@ -40,6 +40,7 @@ func (s *MultiDimensionalScorer) Score(ctx context.Context, hypothesis *models.H
 		MetricSeverity:  s.scoreMetricSeverity(hypothesis, signals, incident),
 		ErrorFrequency:  s.scoreErrorFrequency(hypothesis, signals, incident),
 		TraceEvidence:   s.scoreTraceEvidence(hypothesis, signals, incident),
+		AlarmEvidence:   s.scoreAlarmEvidence(hypothesis, signals, incident),
 	}
 
 	// Calculate weighted sum
@@ -48,7 +49,8 @@ func (s *MultiDimensionalScorer) Score(ctx context.Context, hypothesis *models.H
 		breakdown.ChangeProximity*s.weights.ChangeProximity +
 		breakdown.MetricSeverity*s.weights.MetricSeverity +
 		breakdown.ErrorFrequency*s.weights.ErrorFrequency +
-		breakdown.TraceEvidence*s.weights.TraceEvidence
+		breakdown.TraceEvidence*s.weights.TraceEvidence +
+		breakdown.AlarmEvidence*s.weights.AlarmEvidence
 
 	// Normalize to confidence 0-1
 	confidence := s.normalizeConfidence(total)
@@ -63,6 +65,40 @@ func (s *MultiDimensionalScorer) Score(ctx context.Context, hypothesis *models.H
 // scoreTimeCorrelation evaluates if the hypothesis timing matches the incident.
 func (s *MultiDimensionalScorer) scoreTimeCorrelation(hypothesis *models.Hypothesis, signals *models.NormalizedSignals, incident *models.Incident) float64 {
 	score := 0.0
+
+	// A confirmed WAF attack in the alarm window IS the alarmed phenomenon —
+	// the facts were queried for exactly this window, so time alignment holds
+	// by construction.
+	if hypothesis.Type == models.HypothesisTypeWAFAttack {
+		return 1.0
+	}
+
+	// A confirmed WAF attack anchors the alarm on edge disposition (a block or
+	// JS challenge failing the probe). Backend hypotheses — k8s failures,
+	// unrelated service error spikes — cannot be linked to that host, so their
+	// time alignment is fresh-but-irrelevant noise. Zero it so they fall below
+	// the confidence floor instead of surfacing as competing false root causes.
+	if signals.WAFFacts != nil && signals.WAFFacts.Total > 0 {
+		return 0.0
+	}
+
+	// A k8s resource failure that occurred inside the incident window is itself
+	// the time-alignment signal — the change-proximity dimension alone (weight
+	// 0.15) can never carry it past the confidence floor. Check it first.
+	if hypothesis.Type == models.HypothesisTypeResource && hypothesis.ChangeID != "" {
+		for _, change := range signals.Changes {
+			if change.ID != hypothesis.ChangeID {
+				continue
+			}
+			if !change.Timestamp.Before(incident.StartTime) && !change.Timestamp.After(incident.EndTime) {
+				score = 1.0
+			}
+			break
+		}
+		if score == 1.0 {
+			return score
+		}
+	}
 
 	// Check if logs spike during incident window.计数按假设的服务过滤:
 	// 归因对象是该服务,用全局窗口计数会把别的服务的流量算进该假设的
@@ -154,7 +190,7 @@ func (s *MultiDimensionalScorer) scoreTopology(hypothesis *models.Hypothesis, si
 
 // scoreChangeProximity evaluates if a recent change is related to the hypothesis.
 func (s *MultiDimensionalScorer) scoreChangeProximity(hypothesis *models.Hypothesis, signals *models.NormalizedSignals, incident *models.Incident) float64 {
-	if hypothesis.Type != models.HypothesisTypeChange {
+	if hypothesis.Type != models.HypothesisTypeChange && hypothesis.Type != models.HypothesisTypeResource {
 		return 0.0
 	}
 
@@ -248,6 +284,23 @@ func (s *MultiDimensionalScorer) scoreErrorFrequency(hypothesis *models.Hypothes
 	}
 
 	return ratio
+}
+
+// scoreAlarmEvidence scores hypotheses that directly explain the alarm
+// itself. Currently one producer: WAF attack facts observed in the alarm
+// window for the alarmed domain. Additive dimension — every other hypothesis
+// type scores zero here, so legacy confidences are untouched.
+func (s *MultiDimensionalScorer) scoreAlarmEvidence(hypothesis *models.Hypothesis, signals *models.NormalizedSignals, incident *models.Incident) float64 {
+	if hypothesis.Type != models.HypothesisTypeWAFAttack {
+		return 0.0
+	}
+	if signals.WAFFacts == nil || signals.WAFFacts.Total == 0 {
+		return 0.0
+	}
+	if signals.WAFFacts.Domain != hypothesis.Service {
+		return 0.0
+	}
+	return 1.0
 }
 
 // scoreTraceEvidence evaluates if traces support the hypothesis.

@@ -35,6 +35,20 @@ func (m *mockLogSource) QueryErrors(ctx context.Context, start, end time.Time) (
 	return m.logs, nil
 }
 
+func (m *mockLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	if m.delay > 0 {
+		select {
+		case <-time.After(m.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.logs, nil
+}
+
 func (m *mockLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	if m.err != nil {
 		return nil, m.err
@@ -583,6 +597,20 @@ func TestGenerateHypotheses(t *testing.T) {
 		},
 	}
 
+	// signals carries the raw metric series so describeMetricAnomaly can join
+	// window averages into the evidence lines.
+	signals := &models.Signals{
+		Metrics: []models.MetricSeries{
+			{
+				Name: "http_errors",
+				Unit: "count",
+				DataPoints: []models.DataPoint{
+					{Timestamp: incident.StartTime.Add(time.Minute), Value: 42},
+				},
+			},
+		},
+	}
+
 	tests := []struct {
 		name          string
 		normalized    *models.NormalizedSignals
@@ -641,7 +669,7 @@ func TestGenerateHypotheses(t *testing.T) {
 				WithMetricSource(&mockMetricSource{}),
 			)
 
-			candidates := engine.generateHypotheses(context.Background(), tt.normalized, incident)
+			candidates := engine.generateHypotheses(context.Background(), signals, tt.normalized, incident)
 
 			if len(candidates) < tt.minCandidates {
 				t.Errorf("Expected at least %d candidates, got %d", tt.minCandidates, len(candidates))
@@ -713,7 +741,7 @@ func TestErrorSpikeIsPerService(t *testing.T) {
 	}
 
 	engine, _ := NewEngine(WithLogSource(&mockLogSource{}), WithMetricSource(&mockMetricSource{}))
-	candidates := engine.generateHypotheses(context.Background(), normalized, incident)
+	candidates := engine.generateHypotheses(context.Background(), &models.Signals{}, normalized, incident)
 
 	spikes := map[string]int{}
 	for _, c := range candidates {
@@ -786,7 +814,7 @@ func TestRankAndFilter(t *testing.T) {
 				WithMinConfidence(tt.minConfidence),
 			)
 
-			result := engine.rankAndFilter(scored, tt.minConfidence)
+			result := engine.rankAndFilter(scored, tt.minConfidence, &models.Incident{})
 
 			if len(result) != tt.wantCount {
 				t.Errorf("Expected %d candidates, got %d", tt.wantCount, len(result))

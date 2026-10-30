@@ -23,6 +23,12 @@ type Weights struct {
 
 	// TraceEvidence: Do traces support this hypothesis? (2%)
 	TraceEvidence float64
+
+	// AlarmEvidence: Does the hypothesis directly explain the alarm itself
+	// (e.g. WAF attack facts observed in the alarm window)? Additive
+	// dimension — zero for every legacy hypothesis type, so the base six
+	// keep their ~1.0 sum and their scores stay unchanged. (25%)
+	AlarmEvidence float64
 }
 
 // DefaultWeights returns the default scoring weights.
@@ -36,6 +42,7 @@ func DefaultWeights() Weights {
 		MetricSeverity:   0.05, // Metrics provide supporting evidence
 		ErrorFrequency:   0.03, // Error frequency is context
 		TraceEvidence:    0.02, // Traces provide granular evidence
+		AlarmEvidence:    0.25, // The alarm's own signal (WAF facts) is near-conclusive
 	}
 }
 
