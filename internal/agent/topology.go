@@ -123,17 +123,17 @@ func (t *TopologyAgent) listInstancesTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
-			"model_uid": {"type": "string", "description": "Model UID, e.g. cdn / host / rds / k8s_deployment"},
-			"asset_name": {"type": "string", "description": "Optional asset name filter (exact)"},
-			"provider": {"type": "string", "description": "Optional cloud provider filter: aliyun / aws / azure / tencent / huawei / volcano (火山云用 volcano)"},
-			"limit": {"type": "integer", "description": "Max instances to return", "default": 50}
+			"model_uid": {"type": "string", "description": "资产模型 UID（必填）。CDN 用 cdn，主机用 host，RDS 用 rds，K8s 用 k8s_deployment，WAF 用 waf"},
+			"asset_name": {"type": "string", "description": "可选：按资产名精确过滤"},
+			"provider": {"type": "string", "description": "可选：云厂商过滤。火山云用 volcano（不是 volcengine，也不是 cloud）"},
+			"limit": {"type": "integer", "description": "最大返回条数，默认 50", "default": 50}
 		},
 		"required": ["model_uid"]
 	}`
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
-			Name:        "list_cmdb_instances",
-			Description: "List CMDB resource instances of a model, optionally filtered by cloud provider (e.g. provider=volcano + model_uid=cdn for 火山云 CDN)",
+			Name: "list_cmdb_instances",
+			Description: "List CMDB resource instances of a model. 查询火山云 CDN 实例的调用示例：{\"model_uid\":\"cdn\",\"provider\":\"volcano\"}。参数名只能用 model_uid/provider/asset_name/limit，不要用 cloud 或 resource_type。",
 			Source:      tool.DataSourceTypeGeneric,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
