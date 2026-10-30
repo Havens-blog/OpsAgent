@@ -30,7 +30,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pageLabel = useCurrentPageLabel(pathname)
 
   return (
-    <div className="flex h-screen overflow-hidden gap-4 bg-page p-4 pb-0">
+    <div className="flex h-screen overflow-hidden gap-3 bg-page p-3 pb-0">
       {/* Sidebar card */}
       <Sidebar />
 
@@ -40,7 +40,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           {/* Breadcrumb row (watch-alert renders page title inside content) */}
           <nav
             aria-label="面包屑"
-            className="flex shrink-0 items-center gap-2 px-5 pb-1 pt-4 text-sm"
+            className="flex shrink-0 items-center gap-2 px-3 pb-1 pt-3 text-sm"
           >
             <Link href="/" className="text-text-secondary hover:text-foreground">
               首页
@@ -52,13 +52,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               {pageLabel}
             </span>
           </nav>
-          <div className="flex-1 overflow-y-auto p-5 pt-3">{children}</div>
+          <div className="flex-1 overflow-y-auto px-3 pb-4 pt-3">{children}</div>
         </main>
 
-        {/* Footer — parity watch-alert bottom bar */}
-        <footer className="shrink-0 border-t border-border py-0.5 text-center text-xs text-text-secondary">
-          <span className="text-primary">息壤</span> 提供智能运维根因分析服务!
-        </footer>
+        {/* Footer — parity watch-alert bottom bar. 对话助手自带「AI 生成内容」免责
+            提示，不再叠加这条全局宣传语。 */}
+        {pathname !== "/chat" && (
+          <footer className="shrink-0 border-t border-border py-0.5 text-center text-xs text-text-secondary">
+            <span className="text-primary">息壤</span> 提供智能运维根因分析服务!
+          </footer>
+        )}
       </div>
     </div>
   )
