@@ -80,9 +80,17 @@ type ExecutionResult struct {
 	Response  string                 `json:"response"`
 	Data      map[string]interface{} `json:"data,omitempty"`
 	ToolsUsed []string               `json:"tools_used,omitempty"`
-	Error     error                  `json:"error,omitempty"`
+	Error     string                 `json:"error,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 	Duration  time.Duration          `json:"duration"`
+}
+
+// errText converts an error to its message, using an empty string for nil.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // AgentConfig holds the configuration for an agent.
@@ -541,7 +549,7 @@ func (a *BaseAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResu
 	if err != nil {
 		return &ExecutionResult{
 			Success:   false,
-			Error:     err,
+			Error:     errText(err),
 			Response:  fmt.Sprintf("LLM call failed: %v", err),
 			Data:      make(map[string]interface{}),
 			ToolsUsed: make([]string, 0),

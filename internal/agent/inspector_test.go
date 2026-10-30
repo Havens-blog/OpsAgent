@@ -137,7 +137,7 @@ func TestInspectorAgentExecute(t *testing.T) {
 		if result.Success {
 			t.Errorf("Expected honest failure without a real backend, got success: %s", result.Response)
 		}
-		if result.Error == nil {
+		if result.Error == "" {
 			t.Error("Expected error to be set on the failed result")
 		}
 	})

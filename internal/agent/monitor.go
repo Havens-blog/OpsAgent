@@ -243,7 +243,7 @@ func (m *MonitorAgent) executeRCATask(ctx context.Context, task *Task) (*Executi
 	if err != nil {
 		return &ExecutionResult{
 			Success:  false,
-			Error:    err,
+			Error:    errText(err),
 			Response: fmt.Sprintf("RCA analysis failed: %v", err),
 		}, nil
 	}

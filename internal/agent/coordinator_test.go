@@ -168,8 +168,8 @@ func TestCoordinatorAgentExecute(t *testing.T) {
 		if result.Success {
 			t.Error("Expected failure for unroutable direct task (no agents, no LLM routing)")
 		}
-		if result.Error == nil {
-			t.Error("Expected a non-nil error explaining the routing failure")
+		if result.Error == "" {
+			t.Error("Expected a non-empty error explaining the routing failure")
 		}
 		if !strings.Contains(result.Response, "无法将任务路由") {
 			t.Errorf("Expected honest routing-failure message, got %q", result.Response)

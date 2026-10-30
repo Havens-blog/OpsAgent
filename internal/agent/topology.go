@@ -272,7 +272,7 @@ func (t *TopologyAgent) Execute(ctx context.Context, task *Task) (*ExecutionResu
 // executeTopologyTask runs a typed resource-topology query.
 func (t *TopologyAgent) executeTopologyTask(ctx context.Context, task *Task) (*ExecutionResult, error) {
 	if !t.available() {
-		return &ExecutionResult{Success: false, Error: fmt.Errorf("CMDB source not configured")}, nil
+		return &ExecutionResult{Success: false, Error: "CMDB source not configured"}, nil
 	}
 
 	if domain := getString(task.Params, "domain"); domain != "" {
@@ -318,7 +318,7 @@ func (t *TopologyAgent) executeTopologyTask(ctx context.Context, task *Task) (*E
 		}
 		instances, total, err := t.cmdb.ListInstances(ctx, t.tenantID, modelUID, getString(task.Params, "asset_name"), getString(task.Params, "provider"), limit)
 		if err != nil {
-			return &ExecutionResult{Success: false, Error: err}, nil
+			return &ExecutionResult{Success: false, Error: errText(err)}, nil
 		}
 		return &ExecutionResult{
 			Success:  true,
@@ -329,7 +329,7 @@ func (t *TopologyAgent) executeTopologyTask(ctx context.Context, task *Task) (*E
 
 	models, err := t.cmdb.ListModels(ctx)
 	if err != nil {
-		return &ExecutionResult{Success: false, Error: err}, nil
+		return &ExecutionResult{Success: false, Error: errText(err)}, nil
 	}
 	return &ExecutionResult{
 		Success:  true,
