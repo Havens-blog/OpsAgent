@@ -475,7 +475,12 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 		}
 		facts, err := e.wafSource.QueryAttackFacts(ctx, domain,
 			incident.StartTime.Add(-30*time.Minute), qEnd)
-		if err == nil {
+		if err != nil {
+			// Surface the failure like the other dimensions: a WAF alarm that
+			// silently loses its WAF facts falls back to an irrelevant metric
+			// hypothesis and looks "successful". The user must see "WAF 查询失败".
+			signals.SourceErrors["waf"] = err.Error()
+		} else {
 			signals.WAFFacts = facts
 		}
 	}()
