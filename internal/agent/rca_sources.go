@@ -367,14 +367,35 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 
 	result.LogSource = buildLogSources(cfg, ecamTP)
 
-	if cfg.PrometheusEndpoint != "" {
-		promSource, err := integrations.NewPrometheusMetricSourceWithToken(cfg.PrometheusEndpoint, cfg.PrometheusToken)
+	// Metrics: fan out across two Prometheus-compatible workspaces when both are
+	// configured. ARMS_APM_ENDPOINT holds the application-level arms_app_* RED
+	// counters (with a service label); PROMETHEUS_ENDPOINT holds the CloudMonitor
+	// infrastructure metrics (AliyunAlb_*/AliyunRds_*/...). Both share the same
+	// source type, so wrapping them in one fanout gives RCA a single metric
+	// source that never loses one workspace's data when the other fails.
+	var metricSources []sources.MetricSource
+	if cfg.ARMSAPMEndpoint != "" {
+		appSource, err := integrations.NewPrometheusMetricSourceWithToken(cfg.ARMSAPMEndpoint, cfg.ARMSAPMToken)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create Prometheus source: %w", err)
+			return nil, fmt.Errorf("failed to create ARMS APM metric source: %w", err)
 		}
-		if pingOK(promSource) {
-			result.MetricSource = promSource
+		if pingOK(appSource) {
+			metricSources = append(metricSources, appSource)
 		}
+	}
+	if cfg.PrometheusEndpoint != "" {
+		infraSource, err := integrations.NewPrometheusMetricSourceWithToken(cfg.PrometheusEndpoint, cfg.PrometheusToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Prometheus metric source: %w", err)
+		}
+		if pingOK(infraSource) {
+			metricSources = append(metricSources, infraSource)
+		}
+	}
+	if len(metricSources) == 1 {
+		result.MetricSource = metricSources[0]
+	} else if len(metricSources) > 1 {
+		result.MetricSource = sources.NewFanoutMetricSource(metricSources...)
 	}
 
 	// Topology: prefer the ARMS APM Prometheus source (bearer token only, no

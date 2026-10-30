@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
 )
 
 // TestCreateMockRCASources tests the mock data source factory.
@@ -314,6 +316,115 @@ func TestCreateRCASourcesPingGate(t *testing.T) {
 		}
 		if result.MetricSource == nil {
 			t.Error("expected fallback mock MetricSource to be present")
+		}
+	})
+}
+
+// TestCreateRCASourcesDualMetricWorkspaces verifies that when both the ARMS APM
+// workspace and the Prometheus/CloudMonitor workspace are reachable, the metric
+// source becomes a fanout combining the two; with only one configured it stays a
+// single source; and with neither it stays nil.
+func TestCreateRCASourcesDualMetricWorkspaces(t *testing.T) {
+	newOKServer := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		}))
+	}
+
+	t.Run("BothWorkspacesBecomeFanout", func(t *testing.T) {
+		srv := newOKServer()
+		defer srv.Close()
+
+		got, err := CreateRCASources(&DataSourceConfig{
+			ARMSAPMEndpoint:    srv.URL,
+			PrometheusEndpoint: srv.URL,
+		})
+		if err != nil {
+			t.Fatalf("CreateRCASources failed: %v", err)
+		}
+		fanout, ok := got.MetricSource.(*sources.FanoutMetricSource)
+		if !ok {
+			t.Fatalf("expected fanout metric source, got %T", got.MetricSource)
+		}
+		if fanout.Count() != 2 {
+			t.Errorf("expected 2 backing sources, got %d", fanout.Count())
+		}
+	})
+
+	t.Run("SingleWorkspaceStaysSingle", func(t *testing.T) {
+		srv := newOKServer()
+		defer srv.Close()
+
+		got, err := CreateRCASources(&DataSourceConfig{PrometheusEndpoint: srv.URL})
+		if err != nil {
+			t.Fatalf("CreateRCASources failed: %v", err)
+		}
+		if _, ok := got.MetricSource.(*sources.FanoutMetricSource); ok {
+			t.Error("expected a single source, got a fanout")
+		}
+		if got.MetricSource == nil {
+			t.Error("expected a non-nil metric source")
+		}
+	})
+}
+
+// TestCreateRCASourcesWithFallbackDualWorkspaces verifies the active[metrics]
+// flag and fallback behaviour for the dual-workspace path.
+func TestCreateRCASourcesWithFallbackDualWorkspaces(t *testing.T) {
+	newOKServer := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`))
+		}))
+	}
+
+	t.Run("BothReachable", func(t *testing.T) {
+		srv := newOKServer()
+		defer srv.Close()
+
+		result, active := CreateRCASourcesWithFallback(&DataSourceConfig{
+			ARMSAPMEndpoint:    srv.URL,
+			PrometheusEndpoint: srv.URL,
+		})
+		if !active["metrics"] {
+			t.Error("expected active[metrics]=true")
+		}
+		if _, ok := result.MetricSource.(*sources.FanoutMetricSource); !ok {
+			t.Errorf("expected fanout metric source, got %T", result.MetricSource)
+		}
+	})
+
+	t.Run("OneReachableOneUnreachableStillActive", func(t *testing.T) {
+		ok := newOKServer()
+		defer ok.Close()
+		bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer bad.Close()
+
+		result, active := CreateRCASourcesWithFallback(&DataSourceConfig{
+			ARMSAPMEndpoint:    ok.URL,
+			PrometheusEndpoint: bad.URL,
+		})
+		if !active["metrics"] {
+			t.Error("expected active[metrics]=true when at least one workspace is reachable")
+		}
+		if result.MetricSource == nil {
+			t.Error("expected a non-nil metric source")
+		}
+		if _, ok := result.MetricSource.(*sources.FanoutMetricSource); ok {
+			t.Error("expected a single source when only one workspace is reachable")
+		}
+	})
+
+	t.Run("NeitherConfigured", func(t *testing.T) {
+		result, active := CreateRCASourcesWithFallback(&DataSourceConfig{})
+		if active["metrics"] {
+			t.Error("expected active[metrics]=false with no workspace")
+		}
+		if _, ok := result.MetricSource.(*sources.EmptyMetricSource); !ok {
+			t.Errorf("expected empty metric source, got %T", result.MetricSource)
 		}
 	})
 }
