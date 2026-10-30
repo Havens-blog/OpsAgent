@@ -97,7 +97,14 @@ async function proxy(request: NextRequest, path: string[]): Promise<Response> {
   }
 
   const resBody = await res.arrayBuffer()
-  return new Response(resBody, { status: res.status, headers: resHeaders })
+  // 204/205/304 are bodiless by spec: the Response constructor rejects ANY body
+  // argument for them (even a zero-length ArrayBuffer). Passing one turned every
+  // successful DELETE (backend replies 204) into a proxied 500.
+  const bodiless = res.status === 204 || res.status === 205 || res.status === 304
+  return new Response(bodiless ? null : resBody, {
+    status: res.status,
+    headers: resHeaders,
+  })
 }
 
 type Ctx = { params: Promise<{ path: string[] }> }
