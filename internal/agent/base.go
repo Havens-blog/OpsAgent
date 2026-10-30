@@ -525,10 +525,11 @@ func (a *BaseAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResu
 
 	// Call Claude with or without tools
 	var responseText string
+	var toolsUsed []string
 	var err error
 
 	if len(tools) > 0 {
-		responseText, err = a.llmClient.ChatWithTools(ctx, messages, tools)
+		responseText, toolsUsed, err = a.llmClient.ChatWithTools(ctx, messages, tools)
 	} else {
 		responseText, err = a.llmClient.Chat(ctx, messages)
 	}
@@ -544,6 +545,10 @@ func (a *BaseAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResu
 		}, nil
 	}
 
+	if toolsUsed == nil {
+		toolsUsed = []string{}
+	}
+
 	return &ExecutionResult{
 		Success:  true,
 		Response: responseText,
@@ -552,7 +557,7 @@ func (a *BaseAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResu
 			"tools_available": len(a.toolRegistry.List()),
 			"provider":        a.settings.LLM.Provider,
 		},
-		ToolsUsed: make([]string, 0), // Will be populated by tool runner
+		ToolsUsed: toolsUsed,
 		Metadata:  make(map[string]interface{}),
 	}, nil
 }

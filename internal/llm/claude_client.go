@@ -67,15 +67,16 @@ func NewClaudeClient(config *Config) (*ClaudeClient, error) {
 
 // Chat sends a chat completion request to Claude.
 func (c *ClaudeClient) Chat(ctx context.Context, messages []ClaudeMessage) (string, error) {
-	return c.ChatWithTools(ctx, messages, nil)
+	text, _, err := c.ChatWithTools(ctx, messages, nil)
+	return text, err
 }
 
 // ChatWithTools sends a chat completion request with tools to Claude.
-func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, error) {
+func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessage, tools []ClaudeTool) (string, []string, error) {
 	// Convert messages to Anthropic format, extracting system prompts
 	anthropicMessages, systemPrompt, err := c.convertMessages(messages)
 	if err != nil {
-		return "", fmt.Errorf("failed to convert messages: %w", err)
+		return "", nil, fmt.Errorf("failed to convert messages: %w", err)
 	}
 
 	// Convert tools to Anthropic format
@@ -105,6 +106,8 @@ func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessa
 	// Tool execution loop
 	currentMessages := anthropicMessages
 	var finalText string
+	var toolNames []string
+	seen := make(map[string]struct{})
 
 	for iteration := 0; iteration < c.maxIterations; iteration++ {
 		// Build message parameters
@@ -131,7 +134,7 @@ func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessa
 		// Send message
 		message, err := c.client.Messages.New(ctx, params)
 		if err != nil {
-			return "", fmt.Errorf("failed to send message: %w", err)
+			return "", toolNames, fmt.Errorf("failed to send message: %w", err)
 		}
 
 		// Extract text and tool use from response
@@ -154,7 +157,7 @@ func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessa
 
 		// No more tool calls, return the response
 		if len(toolUseBlocks) == 0 {
-			return finalText, nil
+			return finalText, toolNames, nil
 		}
 
 		// Execute tools and build results
@@ -189,6 +192,10 @@ func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessa
 			if err != nil {
 				result = fmt.Sprintf("Error: %v", err)
 			}
+			if _, ok := seen[toolBlock.Name]; !ok {
+				seen[toolBlock.Name] = struct{}{}
+				toolNames = append(toolNames, toolBlock.Name)
+			}
 
 			// Create tool result block
 			toolResults = append(toolResults, anthropic.NewToolResultBlock(toolBlock.ID, result, false))
@@ -199,7 +206,7 @@ func (c *ClaudeClient) ChatWithTools(ctx context.Context, messages []ClaudeMessa
 		currentMessages = append(currentMessages, anthropic.NewUserMessage(toolResults...))
 	}
 
-	return finalText, nil
+	return finalText, toolNames, nil
 }
 
 // ChatStream sends a streaming chat completion request.
