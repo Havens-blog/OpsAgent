@@ -146,7 +146,11 @@ func (s *PendingApprovalStore) Create(p *PendingApproval) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items[p.ApprovalID] = p
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		delete(s.items, p.ApprovalID)
+		return err
+	}
+	return nil
 }
 
 // Get returns a pending approval by id.
@@ -218,8 +222,13 @@ func (s *PendingApprovalStore) SetStatus(id, status string) error {
 	if !ok {
 		return fmt.Errorf("approval not found: %s", id)
 	}
+	old := p.Status
 	p.Status = status
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		p.Status = old
+		return err
+	}
+	return nil
 }
 
 // approvalsHandler handles GET /api/v1/approvals.
@@ -293,7 +302,10 @@ func (s *APIServer) approveApprovalHandler(w http.ResponseWriter, r *http.Reques
 		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to grant approval", err.Error())
 		return
 	}
-	_ = s.pendingApprovals.SetStatus(id, "approved")
+	if err := s.pendingApprovals.SetStatus(id, "approved"); err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to persist approval status", err.Error())
+		return
+	}
 
 	// If this approval was created for an async agent task, resume execution.
 	s.maybeReexecuteTask(r.Context(), p)
@@ -313,7 +325,10 @@ func (s *APIServer) rejectApprovalHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	_ = s.approvalMgr.RevokeApprovalWithHash(p.ToolName, p.ConversationID, p.ParamHash)
-	_ = s.pendingApprovals.SetStatus(id, "rejected")
+	if err := s.pendingApprovals.SetStatus(id, "rejected"); err != nil {
+		s.writeErrorResponse(w, http.StatusInternalServerError, "store_error", "Failed to persist approval status", err.Error())
+		return
+	}
 
 	// If this approval was created for an async agent task, mark it rejected.
 	s.maybeRejectTask(r.Context(), p)
