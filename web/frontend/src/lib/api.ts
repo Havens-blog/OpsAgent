@@ -512,6 +512,7 @@ export interface ConversationMessage {
   conversation_id: string
   role: "user" | "assistant"
   content: string
+  client_message_id?: string
   created_at: string
 }
 
@@ -537,6 +538,7 @@ export interface Approval {
   params: Record<string, unknown>
   reason: string
   conversation_id: string
+  client_message_id?: string
   tenant_id: number
   user_id: number
   param_hash: string
@@ -870,9 +872,11 @@ export const api = {
     }),
 
   getConversation: (id: string) =>
-    request<{ conversation: Conversation; messages: ConversationMessage[] }>(
-      `/api/v1/conversations/${id}`
-    ),
+    request<{
+      conversation: Conversation
+      messages: ConversationMessage[]
+      pending_approvals?: Approval[]
+    }>(`/api/v1/conversations/${id}`),
 
   deleteConversation: (id: string) =>
     request<void>(`/api/v1/conversations/${id}`, { method: "DELETE" }),
