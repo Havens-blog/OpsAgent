@@ -149,6 +149,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [input, setInput] = useState("")
   const [sending, setSending] = useState(false)
+  const [creating, setCreating] = useState(false)
   const [loadingList, setLoadingList] = useState(true)
   const [loadingMessages, setLoadingMessages] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -232,6 +233,7 @@ export default function ChatPage() {
 
   async function newConversation() {
     stopStream()
+    setCreating(true)
     try {
       const { conversation } = await api.createConversation()
       setConversations((prev) => [conversation, ...prev])
@@ -241,6 +243,8 @@ export default function ChatPage() {
       textareaRef.current?.focus()
     } catch (err) {
       setError(toMessage(err))
+    } finally {
+      setCreating(false)
     }
   }
 
@@ -454,7 +458,7 @@ export default function ChatPage() {
 
   async function send() {
     const content = input.trim()
-    if (!content || sending) return
+    if (!content || sending || creating) return
     await runStream(content)
   }
 
@@ -894,7 +898,7 @@ export default function ChatPage() {
               ) : (
                 <button
                   onClick={() => void send()}
-                  disabled={!input.trim()}
+                  disabled={!input.trim() || creating}
                   aria-label="发送"
                   className="rounded-md bg-primary p-2 text-primary-foreground transition-colors hover:bg-primary-hover disabled:opacity-50"
                 >
