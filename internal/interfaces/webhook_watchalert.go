@@ -397,7 +397,16 @@ func joinNonEmpty(parts []string, sep string) string {
 // so the engine fetches these facts itself — re-querying here would duplicate
 // both the call and the text on-call has to read.
 func wafNoticeExtra(report *models.RCAReport) string {
-	if report == nil || report.Signals == nil || report.Signals.WAFFacts == nil {
+	if report == nil || report.Signals == nil {
+		return ""
+	}
+	if report.Signals.WAFFacts == nil {
+		// A WAF alarm whose WAF facts are missing can only produce unrelated
+		// cross-dimension hypotheses. Say so plainly instead of letting a weak
+		// metric hypothesis read as the answer.
+		if report.Incident != nil && models.IsWAFAlarm(report.Incident.Description) {
+			return "⚠️ 本告警为 WAF 事件，但未取得 WAF 攻击事实（WAF 数据源未接入或查询失败），以下根因结论不可信，请直接前往 WAF 控制台复核攻击详情。"
+		}
 		return ""
 	}
 	if report.TopCandidate != nil &&
