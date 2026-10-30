@@ -83,16 +83,18 @@ type Signals struct {
 	// SourceErrors records per-source collection failures so the report can
 	// surface them without failing the whole analysis.
 	SourceErrors map[string]string
+	WAFFacts     *WAFAttackFacts
 }
 
 // NormalizedSignals contains time-aligned signals for correlation.
 type NormalizedSignals struct {
-	TimeWindows   []TimeWindow
-	LogByWindow   map[int][]LogEntry
-	MetricTrends  map[string]map[int]Trend
-	TraceByWindow map[int][]TraceSummary
-	Changes       []Change
-	Topology      *Topology
+	TimeWindows    []TimeWindow
+	LogByWindow    map[int][]LogEntry
+	MetricTrends   map[string]map[int]Trend
+	TraceByWindow  map[int][]TraceSummary
+	Changes        []Change
+	Topology       *Topology
+	WAFFacts       *WAFAttackFacts
 }
 
 // LogEntry represents a single log record.

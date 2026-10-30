@@ -48,7 +48,20 @@ func TestRCAReportGetSummary(t *testing.T) {
 					Confidence: 0.35,
 				},
 			},
-			wantStr: "Root cause: Possible memory leak (confidence: 35%)",
+			wantStr: "弱信号(置信度低,仅供排查参考): Possible memory leak (confidence: 35%)",
+		},
+		{
+			name: "report with medium confidence candidate",
+			report: &RCAReport{
+				TopCandidate: &ScoredHypothesis{
+					Hypothesis: Hypothesis{
+						Description: "Fresh pod failures",
+						Evidence:    []string{"OOMKilled at 13:52"},
+					},
+					Confidence: 0.6,
+				},
+			},
+			wantStr: "疑似根因: Fresh pod failures (confidence: 60%)",
 		},
 	}
 

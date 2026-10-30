@@ -16,6 +16,7 @@ const (
 	HypothesisTypeDependency    HypothesisType = "dependency"
 	HypothesisTypeLatency       HypothesisType = "latency"
 	HypothesisTypeResource      HypothesisType = "resource"
+	HypothesisTypeWAFAttack     HypothesisType = "waf_attack"
 )
 
 // Hypothesis represents a potential root cause candidate.
@@ -37,6 +38,7 @@ type ScoreBreakdown struct {
 	MetricSeverity  float64 // Severity of metric anomalies
 	ErrorFrequency  float64 // Frequency of error logs
 	TraceEvidence   float64 // Evidence from traces
+	AlarmEvidence   float64 // Hypothesis directly explains the alarm itself (WAF facts)
 }
 
 // ScoredHypothesis is a hypothesis with its computed score.
@@ -60,17 +62,45 @@ type RCAReport struct {
 
 	// Warnings are human-readable, stable-ordered source errors for the HTTP DTO.
 	Warnings []string
+	// Note is an honest caveat that overrides the candidate ranking — e.g. a
+	// dial-test host that cannot be mapped to a backend service. When set, the
+	// summary leads with it instead of presenting a window-noise candidate as
+	// the root cause.
+	Note string
+	// EdgeFacts carries window-scoped SLB facts for a domain alarm. It is
+	// reference material only (never scored), so a dial-test "unavailable rate"
+	// report can show whether the SLB forwarded 5xx in the window without
+	// crowning the edge as the root cause.
+	EdgeFacts *EdgeFacts
 }
 
-// GetSummary returns a human-readable summary of the RCA report.
+// GetSummary returns a human-readable summary of the RCA report. The headline
+// is confidence-tiered: a weak correlation must not masquerade as a determined
+// root cause — on-call trusts the headline wording.
 func (r *RCAReport) GetSummary() string {
-	if r == nil || r.TopCandidate == nil {
+	if r == nil {
+		return "Unable to determine root cause"
+	}
+	if r.Note != "" {
+		return r.Note
+	}
+	if r.TopCandidate == nil {
 		return "Unable to determine root cause"
 	}
 
-	return fmt.Sprintf("Root cause: %s (confidence: %.0f%%)\n\nEvidence:\n%s",
+	conf := r.TopCandidate.Confidence
+	label := "弱信号(置信度低,仅供排查参考)"
+	switch {
+	case conf >= 0.7:
+		label = "Root cause"
+	case conf >= 0.5:
+		label = "疑似根因"
+	}
+
+	return fmt.Sprintf("%s: %s (confidence: %.0f%%)\n\nEvidence:\n%s",
+		label,
 		r.TopCandidate.Hypothesis.Description,
-		r.TopCandidate.Confidence*100,
+		conf*100,
 		formatEvidence(r.TopCandidate.Hypothesis.Evidence))
 }
 
