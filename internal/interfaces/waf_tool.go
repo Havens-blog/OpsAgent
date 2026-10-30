@@ -55,10 +55,10 @@ func createWAFLogQueryTool(q *wafQuerier) *tool.Tool {
 		"type": "object",
 		"properties": {
 			"domain": {"type": "string", "description": "WAF 防护的域名/主机, 例如 www.zxhgroup.com"},
-			"start_time": {"type": "string", "description": "开始时间 RFC3339"},
-			"end_time": {"type": "string", "description": "结束时间 RFC3339"}
+			"start_time": {"type": "string", "description": "开始时间 RFC3339，可选；不传则默认最近 24 小时"},
+			"end_time": {"type": "string", "description": "结束时间 RFC3339，可选；不传则默认当前时间"}
 		},
-		"required": ["domain", "start_time", "end_time"]
+		"required": ["domain"]
 	}`
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
@@ -73,20 +73,27 @@ func createWAFLogQueryTool(q *wafQuerier) *tool.Tool {
 		IsAvailable: func(map[string]interface{}) bool { return q != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
 			domain, _ := params["domain"].(string)
-			start, err := parseRFC3339(params["start_time"])
-			if err != nil {
-				return nil, fmt.Errorf("start_time 解析失败: %w", err)
+			// Default to the last 24h so the model never has to guess the
+			// current time; an absent window must not silently query an
+			// ancient/zero window and report a misleading "no attacks".
+			start := time.Now().Add(-24 * time.Hour)
+			end := time.Now()
+			if v, ok := params["start_time"].(string); ok && v != "" {
+				t, err := time.Parse(time.RFC3339, v)
+				if err != nil {
+					return nil, fmt.Errorf("start_time 解析失败: %w", err)
+				}
+				start = t
 			}
-			end, err := parseRFC3339(params["end_time"])
-			if err != nil {
-				return nil, fmt.Errorf("end_time 解析失败: %w", err)
+			if v, ok := params["end_time"].(string); ok && v != "" {
+				t, err := time.Parse(time.RFC3339, v)
+				if err != nil {
+					return nil, fmt.Errorf("end_time 解析失败: %w", err)
+				}
+				end = t
 			}
 			return q.query(ctx, domain, start, end)
 		},
 	}
 }
 
-func parseRFC3339(v interface{}) (time.Time, error) {
-	s, _ := v.(string)
-	return time.Parse(time.RFC3339, s)
-}
