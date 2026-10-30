@@ -14,11 +14,19 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 )
 
+// agentExecutor is the package-internal contract a delegate must satisfy. It
+// lets the coordinator dispatch to a concrete agent's Execute instead of always
+// falling back to BaseAgent.Execute.
+type agentExecutor interface {
+	Execute(ctx context.Context, task *Task) (*ExecutionResult, error)
+	GetConfig() *AgentConfig
+}
+
 // CoordinatorAgent orchestrates multiple agents to complete complex tasks.
 // It decomposes tasks, delegates to specialized agents, and aggregates results.
 type CoordinatorAgent struct {
 	*BaseAgent
-	agents      map[string]*BaseAgent
+	agents      map[string]agentExecutor
 	mu          sync.RWMutex
 	subTasks    map[string][]*TaskSubmission
 	taskCounter int64
@@ -73,14 +81,14 @@ When delegating:
 
 	return &CoordinatorAgent{
 		BaseAgent:   base,
-		agents:      make(map[string]*BaseAgent),
+		agents:      make(map[string]agentExecutor),
 		subTasks:    make(map[string][]*TaskSubmission),
 		taskCounter: 0,
 	}, nil
 }
 
 // RegisterAgent registers a specialized agent for delegation.
-func (c *CoordinatorAgent) RegisterAgent(name string, agent *BaseAgent) error {
+func (c *CoordinatorAgent) RegisterAgent(name string, agent agentExecutor) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -362,9 +370,11 @@ func (c *CoordinatorAgent) routeWithLLM(ctx context.Context, task *Task) (*Execu
 	infos := make([]agentInfo, 0, len(c.agents))
 	for name, ag := range c.agents {
 		info := agentInfo{name: name}
-		if ag != nil && ag.config != nil {
-			info.desc = ag.config.Description
-			info.caps = ag.config.Capabilities
+		if ag != nil {
+			if cfg := ag.GetConfig(); cfg != nil {
+				info.desc = cfg.Description
+				info.caps = cfg.Capabilities
+			}
 		}
 		infos = append(infos, info)
 	}

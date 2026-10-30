@@ -58,7 +58,7 @@ func TestCoordinatorAgentRegisterAgent(t *testing.T) {
 	}
 
 	// Register the mock agent
-	err = coord.RegisterAgent("mock", mockAgent.BaseAgent)
+	err = coord.RegisterAgent("mock", mockAgent)
 	if err != nil {
 		t.Errorf("RegisterAgent failed: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestCoordinatorAgentDelegateTask(t *testing.T) {
 		t.Fatalf("NewMockAgent failed: %v", err)
 	}
 
-	err = coord.RegisterAgent("mock", mockAgent.BaseAgent)
+	err = coord.RegisterAgent("mock", mockAgent)
 	if err != nil {
 		t.Fatalf("RegisterAgent failed: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestCoordinatorRouting(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewMockAgent failed: %v", err)
 			}
-			if err := coord.RegisterAgent(name, m.BaseAgent); err != nil {
+			if err := coord.RegisterAgent(name, m); err != nil {
 				t.Fatalf("RegisterAgent(%s) failed: %v", name, err)
 			}
 		}
