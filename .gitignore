@@ -24,6 +24,9 @@ web/frontend/out/
 web/frontend/.turbo/
 web/frontend/.next-start.err
 
+# Local browser-verification artifacts (Playwright scripts + screenshots)
+.pw-verify/
+
 # TypeScript incremental build cache
 *.tsbuildinfo
 
