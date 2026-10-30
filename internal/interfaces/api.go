@@ -870,77 +870,22 @@ func normalizeWarnings(warnings []string) []string {
 	return warnings
 }
 
-// rcaStatusHandler handles RCA status requests.
-func (s *APIServer) rcaStatusHandler(w http.ResponseWriter, r *http.Request) {
-	incidentID := strings.TrimPrefix(r.URL.Path, "/api/v1/rca/status/")
-
-	if incidentID == "" {
-		s.writeErrorResponse(w, http.StatusBadRequest, "missing_incident_id", "Incident ID is required", "")
-		return
-	}
-
-	// In real implementation, would query status from store
-	response := map[string]interface{}{
-		"incident_id": incidentID,
-		"status":      "not_found",
-		"message":     "Incident not found in active analyses",
-	}
-
-	s.writeJSONResponse(w, http.StatusNotFound, response)
-}
-
-// logQueryHandler handles log query requests.
+// logQueryHandler / metricsQueryHandler / tracesQueryHandler are legacy query
+// stubs that used to return a fake "accepted + empty" response. They were never
+// wired to a real backend; returning 501 makes that plain instead of lying.
 func (s *APIServer) logQueryHandler(w http.ResponseWriter, r *http.Request) {
-	var req LogQueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
-		return
-	}
-
-	s.logger.Info("Log query requested",
-		observability.String("query", req.Query),
-	)
-
-	// In real implementation, would query logs
-	response := map[string]interface{}{
-		"query":  req.Query,
-		"status": "accepted",
-		"count":  0,
-		"logs":   []interface{}{},
-	}
-
-	s.writeJSONResponse(w, http.StatusAccepted, response)
+	s.writeErrorResponse(w, http.StatusNotImplemented, "not_implemented",
+		"log query endpoint is not implemented", "")
 }
 
-// metricsQueryHandler handles metrics query requests.
 func (s *APIServer) metricsQueryHandler(w http.ResponseWriter, r *http.Request) {
-	var req MetricsQueryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
-		return
-	}
-
-	s.logger.Info("Metrics query requested",
-		observability.String("query", req.Query),
-	)
-
-	response := map[string]interface{}{
-		"query":  req.Query,
-		"status": "accepted",
-		"series": []interface{}{},
-	}
-
-	s.writeJSONResponse(w, http.StatusAccepted, response)
+	s.writeErrorResponse(w, http.StatusNotImplemented, "not_implemented",
+		"metrics query endpoint is not implemented", "")
 }
 
-// tracesQueryHandler handles trace query requests.
 func (s *APIServer) tracesQueryHandler(w http.ResponseWriter, r *http.Request) {
-	response := map[string]interface{}{
-		"status": "accepted",
-		"traces": []interface{}{},
-	}
-
-	s.writeJSONResponse(w, http.StatusAccepted, response)
+	s.writeErrorResponse(w, http.StatusNotImplemented, "not_implemented",
+		"traces query endpoint is not implemented", "")
 }
 
 // topologyNodeDTO / topologyEdgeDTO are the API-boundary shapes consumed by

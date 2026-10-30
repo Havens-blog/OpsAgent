@@ -160,8 +160,8 @@ func TestLogQueryEndpoint(t *testing.T) {
 
 		server.ServeHTTP(w, req)
 
-		if w.Code != http.StatusOK && w.Code != http.StatusAccepted {
-			t.Errorf("Expected status 200 or 202, got %d", w.Code)
+		if w.Code != http.StatusNotImplemented {
+			t.Errorf("Expected status 501 (not implemented), got %d", w.Code)
 		}
 	})
 }
@@ -197,8 +197,8 @@ func TestMetricsQueryEndpoint(t *testing.T) {
 
 		server.ServeHTTP(w, req)
 
-		if w.Code != http.StatusOK && w.Code != http.StatusAccepted {
-			t.Errorf("Expected status 200 or 202, got %d", w.Code)
+		if w.Code != http.StatusNotImplemented {
+			t.Errorf("Expected status 501 (not implemented), got %d", w.Code)
 		}
 	})
 }
