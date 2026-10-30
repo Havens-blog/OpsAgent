@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Havens-blog/OpsAgent/internal/config"
+	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
 
 func specialistTestSettings() *config.Settings {
@@ -17,22 +18,30 @@ func specialistTestSettings() *config.Settings {
 	}
 }
 
-func assertAvailableTools(t *testing.T, available []string, expected []string) {
+// assertBoundTools verifies a specialist's BoundTools exposes the expected
+// tool names. The old package-level CreateXxxTools were removed; each agent's
+// BoundTools is now the single source of its real tools.
+func assertBoundTools(t *testing.T, tools []*tool.Tool, expected []string) {
 	t.Helper()
 
-	got := make(map[string]bool, len(available))
-	for _, name := range available {
-		got[name] = true
+	got := make(map[string]bool, len(tools))
+	for _, tl := range tools {
+		if tl != nil && tl.Metadata != nil {
+			got[tl.Metadata.Name] = true
+		}
+	}
+	if len(got) != len(expected) {
+		t.Fatalf("expected %d bound tools, got %d (%v)", len(expected), len(got), got)
 	}
 	for _, name := range expected {
 		if !got[name] {
-			t.Errorf("expected tool %q in available tools, got %v", name, available)
+			t.Errorf("expected tool %q in bound tools, got %v", name, got)
 		}
 	}
 }
 
 // TestSpecialistAgentsRegisterTools guards the free-text delegation path: each
-// specialist must expose its dedicated tools through the base tool registry.
+// specialist must expose its dedicated tools through BoundTools.
 func TestSpecialistAgentsRegisterTools(t *testing.T) {
 	settings := specialistTestSettings()
 
@@ -43,12 +52,7 @@ func TestSpecialistAgentsRegisterTools(t *testing.T) {
 		}
 		defer agent.Shutdown(context.Background())
 
-		tools := agent.BoundTools()
-		available := agent.GetAvailableTools()
-		if len(available) != len(tools) {
-			t.Fatalf("expected %d available tools, got %d (%v)", len(tools), len(available), available)
-		}
-		assertAvailableTools(t, available, []string{
+		assertBoundTools(t, agent.BoundTools(), []string{
 			"analyze_incident",
 			"query_metrics",
 			"query_logs",
@@ -64,12 +68,7 @@ func TestSpecialistAgentsRegisterTools(t *testing.T) {
 		}
 		defer agent.Shutdown(context.Background())
 
-		tools := agent.BoundTools()
-		available := agent.GetAvailableTools()
-		if len(available) != len(tools) {
-			t.Fatalf("expected %d available tools, got %d (%v)", len(tools), len(available), available)
-		}
-		assertAvailableTools(t, available, []string{
+		assertBoundTools(t, agent.BoundTools(), []string{
 			"analyze_logs",
 			"query_logs_advanced",
 			"correlate_logs",
@@ -83,12 +82,7 @@ func TestSpecialistAgentsRegisterTools(t *testing.T) {
 		}
 		defer agent.Shutdown(context.Background())
 
-		tools := agent.BoundTools()
-		available := agent.GetAvailableTools()
-		if len(available) != len(tools) {
-			t.Fatalf("expected %d available tools, got %d (%v)", len(tools), len(available), available)
-		}
-		assertAvailableTools(t, available, []string{
+		assertBoundTools(t, agent.BoundTools(), []string{
 			"run_inspection",
 			"check_health",
 			"validate_compliance",

@@ -31,6 +31,15 @@ func (b *blockingLogSource) QueryErrors(ctx context.Context, _, _ time.Time) ([]
 	}
 }
 
+func (b *blockingLogSource) QueryErrorsByService(ctx context.Context, _ string, _, _ time.Time) ([]models.LogEntry, error) {
+	select {
+	case <-b.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (b *blockingLogSource) QueryLogsByService(_ context.Context, _ string, _, _ time.Time) ([]models.LogEntry, error) {
 	return nil, nil
 }

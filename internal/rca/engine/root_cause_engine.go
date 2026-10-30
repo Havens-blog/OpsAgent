@@ -352,6 +352,13 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 				defer wg.Done()
 				entries, err := e.logSource.QueryErrorsByService(ctx, svc, start, end)
 				if err != nil {
+					// Report the first per-service failure without blocking the
+					// fan-out (the channel is small and a fleet of failures must
+					// not deadlock collection).
+					select {
+					case srcErrChan <- srcErr{name: "logs", msg: err.Error()}:
+					default:
+					}
 					return
 				}
 				mu.Lock()
