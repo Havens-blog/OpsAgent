@@ -541,6 +541,7 @@ export default function ChatPage() {
   const approvalInFlightRef = useRef<Set<string>>(new Set())
   const streamIdRef = useRef<string>("")
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   // High-frequency stream deltas are accumulated here and flushed once per
   // animation frame, so the UI does not re-render the whole message list for
@@ -917,7 +918,12 @@ export default function ChatPage() {
   }, [activeId])
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+    const el = scrollRef.current
+    if (!el) return
+    // Only follow the stream when the user is already near the bottom; a user
+    // reading earlier messages must not have their scroll position stolen.
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [messages, sending])
 
   useEffect(() => {
@@ -1270,7 +1276,7 @@ export default function ChatPage() {
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4">
+          <div ref={scrollRef} className="flex-1 overflow-y-auto p-4">
             {loadingMessages ? (
               <div className="flex h-full items-center justify-center gap-2 text-[13px] text-text-secondary">
                 <Loader2 className="h-4 w-4 animate-spin" />
