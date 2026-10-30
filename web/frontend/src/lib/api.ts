@@ -82,7 +82,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export interface StreamCallbacks {
   onDelta: (content: string) => void
-  onDone: (messageId: string, conversationId: string) => void
+  onDone: (
+    messageId: string,
+    conversationId: string,
+    evidence?: ToolEvidence[],
+    grounding?: string
+  ) => void
   onError: (message: string) => void
   onToolCall?: (event: ToolEvent) => void
   onToolResult?: (event: ToolEvent) => void
@@ -104,7 +109,13 @@ function processSSEEvent(raw: string, callbacks: StreamCallbacks) {
   }
 
   if (event.type === "delta") callbacks.onDelta(event.content)
-  else if (event.type === "done") callbacks.onDone(event.message_id, event.conversation_id)
+  else if (event.type === "done")
+    callbacks.onDone(
+      event.message_id,
+      event.conversation_id,
+      event.evidence,
+      event.grounding
+    )
   else if (event.type === "error") callbacks.onError(event.message)
   else if (event.type === "tool_call")
     callbacks.onToolCall?.({
@@ -507,6 +518,17 @@ export interface Conversation {
   updated_at: string
 }
 
+export interface ToolEvidence {
+  evidence_id: string
+  tool_name: string
+  status: "success" | "failed" | "unavailable"
+  source: string
+  params: Record<string, unknown>
+  result_digest: Record<string, unknown>
+  error: string
+  at: string
+}
+
 export interface ConversationMessage {
   id: string
   conversation_id: string
@@ -514,6 +536,8 @@ export interface ConversationMessage {
   content: string
   client_message_id?: string
   created_at: string
+  evidence?: ToolEvidence[]
+  grounding?: string
 }
 
 export interface ToolEvent {
@@ -551,7 +575,13 @@ export interface Approval {
 
 export type StreamEvent =
   | { type: "delta"; content: string }
-  | { type: "done"; message_id: string; conversation_id: string }
+  | {
+      type: "done"
+      message_id: string
+      conversation_id: string
+      evidence?: ToolEvidence[]
+      grounding?: string
+    }
   | { type: "error"; message: string }
   | {
       type: "tool_call"
@@ -567,6 +597,9 @@ export type StreamEvent =
       status: string
       result?: string
       error?: string
+      evidence_id?: string
+      source?: string
+      result_digest?: Record<string, unknown>
     }
   | {
       type: "approval_required"

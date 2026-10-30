@@ -44,13 +44,16 @@ type ChatClient interface {
 type ToolProvider interface {
 	ToolSpecsForLLM() ([]llm.Tool, error)
 	ExecuteTool(ctx context.Context, name string, args map[string]interface{}) (interface{}, error)
+	// ToolSource returns the registered tool's data-source string, or "" when
+	// the tool is not registered.
+	ToolSource(name string) string
 }
 
 // StreamHandler receives lifecycle events emitted by StreamWithTools.
 type StreamHandler struct {
 	OnDelta            func(string) error
 	OnToolCall         func(callID string, name string, params map[string]interface{}) error
-	OnToolResult       func(callID string, name string, status string, result string, errMsg string) error
+	OnToolResult       func(callID string, name string, status string, result string, errMsg string, evidence ToolEvidence) error
 	OnApprovalRequired func(req guardrails.ApprovalRequest) error
 }
 
@@ -70,12 +73,14 @@ func (s *Service) SetToolProvider(p ToolProvider) {
 
 // Message represents a chat message, both as LLM input and persisted history.
 type Message struct {
-	ID              string    `json:"id,omitempty"`
-	ConversationID  string    `json:"conversation_id,omitempty"`
-	Role            string    `json:"role"` // "user" or "assistant"
-	Content         string    `json:"content"`
-	ClientMessageID string    `json:"client_message_id,omitempty"`
-	CreatedAt       time.Time `json:"created_at,omitempty"`
+	ID              string         `json:"id,omitempty"`
+	ConversationID  string         `json:"conversation_id,omitempty"`
+	Role            string         `json:"role"` // "user" or "assistant"
+	Content         string         `json:"content"`
+	ClientMessageID string         `json:"client_message_id,omitempty"`
+	Evidence        []ToolEvidence `json:"evidence,omitempty"`
+	Grounding       string         `json:"grounding,omitempty"`
+	CreatedAt       time.Time      `json:"created_at,omitempty"`
 }
 
 // NewService creates a new chat service from LLM configuration.
@@ -211,11 +216,14 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 // loop asks again so the model can chain a second tool on the first result
 // (e.g. list_cmdb_models -> list_cmdb_instances). When the model stops
 // requesting tools, the accumulated context is streamed as the final answer.
-func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h StreamHandler) (string, error) {
+// The returned evidence and grounding are persisted and exposed over SSE.
+func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h StreamHandler) (string, []ToolEvidence, string, error) {
 	if !s.IsAvailable() {
-		return "", fmt.Errorf("chat service not available")
+		return "", nil, "", fmt.Errorf("chat service not available")
 	}
 
+	required := mustQueryTools(latestUserText(messages))
+	var evidence []ToolEvidence
 	llmMessages := s.buildLLMMessages(messages)
 
 	var tools []llm.Tool
@@ -223,12 +231,12 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 		var err error
 		tools, err = s.toolProvider.ToolSpecsForLLM()
 		if err != nil {
-			return "", fmt.Errorf("failed to load tools: %w", err)
+			return "", nil, "", fmt.Errorf("failed to load tools: %w", err)
 		}
 	}
 
 	if len(tools) == 0 {
-		return s.streamAnswer(ctx, llmMessages, h)
+		return s.finishAnswer(ctx, llmMessages, h, required, evidence)
 	}
 
 	// Cap the rounds so a model that keeps calling tools can never loop forever.
@@ -237,17 +245,17 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 		resp, err := s.client.ChatWithTools(ctx, llmMessages, tools)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", ctx.Err()
+				return "", evidence, computeGrounding(required, evidence), ctx.Err()
 			}
-			return "", fmt.Errorf("LLM call failed: %w", err)
+			return "", evidence, computeGrounding(required, evidence), fmt.Errorf("LLM call failed: %w", err)
 		}
 		if len(resp.Choices) == 0 {
-			return "", fmt.Errorf("empty response from LLM")
+			return "", evidence, computeGrounding(required, evidence), fmt.Errorf("empty response from LLM")
 		}
 
 		assistantMsg := resp.Choices[0].Message
 		if len(assistantMsg.ToolCalls) == 0 {
-			return s.streamAnswer(ctx, llmMessages, h)
+			return s.finishAnswer(ctx, llmMessages, h, required, evidence)
 		}
 
 		// Record the assistant's tool-call request so the next round sees it.
@@ -261,7 +269,7 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 			args, err := parseToolArguments(call.Function.Arguments)
 			if err != nil {
 				if h.OnToolResult != nil {
-					_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", err.Error())
+					_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", err.Error(), ToolEvidence{})
 				}
 				llmMessages = append(llmMessages, llm.Message{
 					Role:       "tool",
@@ -273,7 +281,7 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 			if h.OnToolCall != nil {
 				if err := h.OnToolCall(call.ID, call.Function.Name, args); err != nil {
-					return "", err
+					return "", evidence, computeGrounding(required, evidence), err
 				}
 			}
 
@@ -285,10 +293,22 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 							_ = h.OnApprovalRequired(ar.Request)
 						}
 					}
-					return "", fmt.Errorf("需要审批，请在前端批准后重试")
+					return "", evidence, computeGrounding(required, evidence), fmt.Errorf("需要审批，请在前端批准后重试")
 				}
+
+				status := s.classifyToolError(call.Function.Name, execErr)
+				ev := ToolEvidence{
+					EvidenceID: newEvidenceID(),
+					ToolName:   call.Function.Name,
+					Status:     status,
+					Source:     s.toolSource(call.Function.Name),
+					Params:     args,
+					Error:      execErr.Error(),
+					At:         time.Now(),
+				}
+				evidence = append(evidence, ev)
 				if h.OnToolResult != nil {
-					_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", execErr.Error())
+					_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", execErr.Error(), ev)
 				}
 				llmMessages = append(llmMessages, llm.Message{
 					Role:       "tool",
@@ -298,9 +318,20 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 				continue
 			}
 
+			ev := ToolEvidence{
+				EvidenceID:   newEvidenceID(),
+				ToolName:     call.Function.Name,
+				Status:       "success",
+				Source:       s.toolSource(call.Function.Name),
+				Params:       args,
+				ResultDigest: toolDigest(call.Function.Name, result),
+				At:           time.Now(),
+			}
+			evidence = append(evidence, ev)
+
 			resultStr := stringifyToolResult(result)
 			if h.OnToolResult != nil {
-				_ = h.OnToolResult(call.ID, call.Function.Name, "success", resultStr, "")
+				_ = h.OnToolResult(call.ID, call.Function.Name, "success", resultStr, "", ev)
 			}
 			llmMessages = append(llmMessages, llm.Message{
 				Role:       "tool",
@@ -312,7 +343,55 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 	// Exhausted the round budget: stream whatever the accumulated tool results
 	// support rather than leaving the user with no answer.
-	return s.streamAnswer(ctx, llmMessages, h)
+	return s.finishAnswer(ctx, llmMessages, h, required, evidence)
+}
+
+// finishAnswer streams the final reply, then applies the unsupported suffix and
+// grounding decision before returning to the caller.
+func (s *Service) finishAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler, required []string, evidence []ToolEvidence) (string, []ToolEvidence, string, error) {
+	text, err := s.streamAnswer(ctx, llmMessages, h)
+	if err != nil {
+		return "", evidence, computeGrounding(required, evidence), err
+	}
+	grounding := computeGrounding(required, evidence)
+	if grounding == "unsupported" {
+		text += "\n\n⚠️ 本次回答未取得相关数据源的工具结果（未接入或查询失败），以上内容可信度低，请以工具/控制台实际数据为准。"
+	}
+	return text, evidence, grounding, nil
+}
+
+// toolSource returns the registered tool's source, guarding a nil provider.
+func (s *Service) toolSource(name string) string {
+	if s.toolProvider == nil {
+		return ""
+	}
+	return s.toolProvider.ToolSource(name)
+}
+
+// classifyToolError maps an execution error to an evidence status. Missing and
+// unavailable tools are distinguished from genuine execution failures.
+func (s *Service) classifyToolError(name string, err error) string {
+	if s.toolSource(name) == "" {
+		return "unavailable"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "not available") ||
+		strings.Contains(msg, "not configured") ||
+		strings.Contains(msg, "未配置") ||
+		strings.Contains(msg, "未接入") {
+		return "unavailable"
+	}
+	return "failed"
+}
+
+// latestUserText returns the newest user message text, or "" when absent.
+func latestUserText(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return messages[i].Content
+		}
+	}
+	return ""
 }
 
 // streamAnswer streams the final reply and accumulates it for persistence.
