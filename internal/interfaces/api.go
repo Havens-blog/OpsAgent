@@ -214,7 +214,24 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	// Approval state and pending-approval store are shared between the chat
 	// tool-execution path and the approval HTTP endpoints.
 	approvalMgr := guardrails.NewApprovalManager(nil)
+
+	// Pending-approval persistence: use the disk-backed store when the path is
+	// configured, falling back to memory so the server still starts without it
+	// or when the snapshot is corrupt/unwritable.
+	approvalPath := strings.TrimSpace(os.Getenv("OPSAGENT_APPROVALS_PATH"))
 	pendingApprovals := NewPendingApprovalStore()
+	if approvalPath == "" {
+		logger.Warn("Approval persistence disabled, using in-memory store",
+			observability.String("hint", "set OPSAGENT_APPROVALS_PATH to persist pending approvals across restarts"),
+		)
+	} else if ps, err := NewFileBackedPendingApprovalStore(approvalPath); err != nil {
+		logger.Warn("Persistent approval store unavailable, using in-memory fallback",
+			observability.String("path", approvalPath),
+			observability.Err(err),
+		)
+	} else {
+		pendingApprovals = ps
+	}
 	// WAF facts querier (nil when e-cam is not configured): shared between the
 	// chat tool registry and the WatchAlert webhook. The chat tool PROVIDER is
 	// wired after initAgents — it needs the specialists' bound tools.
