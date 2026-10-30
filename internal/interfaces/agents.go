@@ -4,6 +4,7 @@ package interfaces
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -371,6 +372,7 @@ func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
 		task.Status = TaskStatusFailed
 		task.Error = "agent not found or not available: " + agentID
 		_ = s.taskStore.Update(ctx, task)
+		s.recordAgentTaskExecution(task, nil, errors.New(task.Error))
 		return
 	}
 
@@ -402,6 +404,7 @@ func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
 		task.Error = execErr.Error()
 		task.Result = nil
 		_ = s.taskStore.Update(ctx, task)
+		s.recordAgentTaskExecution(task, nil, execErr)
 		return
 	}
 
@@ -415,6 +418,7 @@ func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
 			task.Error = result.Error
 		}
 		_ = s.taskStore.Update(ctx, task)
+		s.recordAgentTaskExecution(task, result, nil)
 		return
 	}
 
@@ -422,6 +426,7 @@ func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
 	task.Result = result
 	task.Error = ""
 	_ = s.taskStore.Update(ctx, task)
+	s.recordAgentTaskExecution(task, result, nil)
 }
 
 // handleApprovalRequired parks a task in awaiting_approval and creates the
