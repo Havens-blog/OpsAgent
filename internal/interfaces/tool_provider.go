@@ -84,6 +84,14 @@ func (p *registryToolProvider) ExecuteTool(ctx context.Context, name string, arg
 	return t.Execute(ctx, args, p.config)
 }
 
+func (p *registryToolProvider) ToolSource(name string) string {
+	t, err := p.registry.Get(name)
+	if err != nil {
+		return ""
+	}
+	return string(t.Metadata.Source)
+}
+
 func approvalScope(s string) guardrails.ApprovalScope {
 	if s == string(guardrails.ScopeSession) {
 		return guardrails.ScopeSession

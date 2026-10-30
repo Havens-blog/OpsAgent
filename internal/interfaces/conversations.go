@@ -43,6 +43,11 @@ type sseEvent struct {
 	Error          string                 `json:"error,omitempty"`
 	ApprovalID     string                 `json:"approval_id,omitempty"`
 	Reason         string                 `json:"reason,omitempty"`
+	EvidenceID     string                 `json:"evidence_id,omitempty"`
+	Source         string                 `json:"source,omitempty"`
+	ResultDigest   map[string]interface{} `json:"result_digest,omitempty"`
+	Evidence       []chat.ToolEvidence    `json:"evidence,omitempty"`
+	Grounding      string                 `json:"grounding,omitempty"`
 }
 
 // writeSSE writes one SSE event and flushes when the writer supports it.
@@ -304,14 +309,17 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 				Status:   "running",
 			})
 		},
-		OnToolResult: func(callID string, name string, status string, result string, errMsg string) error {
+		OnToolResult: func(callID string, name string, status string, result string, errMsg string, evidence chat.ToolEvidence) error {
 			return s.writeSSE(w, sseEvent{
-				Type:     "tool_result",
-				CallID:   callID,
-				ToolName: name,
-				Status:   status,
-				Result:   result,
-				Error:    errMsg,
+				Type:         "tool_result",
+				CallID:       callID,
+				ToolName:     name,
+				Status:       status,
+				Result:       result,
+				Error:        errMsg,
+				EvidenceID:   evidence.EvidenceID,
+				Source:       evidence.Source,
+				ResultDigest: evidence.ResultDigest,
 			})
 		},
 		OnApprovalRequired: func(req guardrails.ApprovalRequest) error {
@@ -355,7 +363,7 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		},
 	}
 
-	fullText, err := chatSvc.StreamWithTools(ctx, messages, handler)
+	fullText, evidence, grounding, err := chatSvc.StreamWithTools(ctx, messages, handler)
 
 	if err != nil {
 		// Client disconnection cancels the request; there is no peer left to
@@ -370,6 +378,8 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		ID:        uuid.New().String(),
 		Role:      "assistant",
 		Content:   fullText,
+		Evidence:  evidence,
+		Grounding: grounding,
 		CreatedAt: time.Now(),
 	}
 	if err := s.conversationStore.AddMessage(ctx, id, assistantMsg); err != nil {
@@ -381,5 +391,5 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 
-	_ = s.writeSSE(w, sseEvent{Type: "done", MessageID: assistantMsg.ID, ConversationID: id})
+	_ = s.writeSSE(w, sseEvent{Type: "done", MessageID: assistantMsg.ID, ConversationID: id, Evidence: evidence, Grounding: grounding})
 }

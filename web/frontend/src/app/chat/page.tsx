@@ -34,6 +34,7 @@ import {
   type Approval,
   type Conversation,
   type ConversationMessage,
+  type ToolEvidence,
 } from "@/lib/api"
 
 interface ToolCall {
@@ -69,6 +70,8 @@ interface UiMessage {
   error?: string
   toolCalls?: ToolCall[]
   approval?: ApprovalState
+  evidence?: ToolEvidence[]
+  grounding?: string
 }
 
 const SUGGESTED_PROMPTS = [
@@ -103,6 +106,8 @@ function buildUiMessages(
     role: m.role,
     content: m.content,
     clientMessageId: m.client_message_id,
+    evidence: m.evidence,
+    grounding: m.grounding,
   }))
 
   for (const a of pendingApprovals) {
@@ -736,10 +741,14 @@ export default function ChatPage() {
             })
           }
         },
-        onDone: () => {
+        onDone: (_messageId, _conversationId, evidence, grounding) => {
           flushDeltaBuffer()
           setMessages((prev) =>
-            prev.map((m) => (m.id === streamId ? { ...m, streaming: false } : m))
+            prev.map((m) =>
+              m.id === streamId
+                ? { ...m, streaming: false, evidence, grounding }
+                : m
+            )
           )
         },
         onError: (msg) => {
@@ -969,6 +978,10 @@ export default function ChatPage() {
       )
     }
 
+    const evidenceCount = (msg.evidence ?? []).filter(
+      (e) => e.status === "success"
+    ).length
+
     return (
       <div key={msg.id} className="flex items-start gap-3">
         <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary">
@@ -979,6 +992,26 @@ export default function ChatPage() {
 
           {msg.toolCalls && msg.toolCalls.length > 0 && (
             <ToolCallGroup calls={msg.toolCalls} />
+          )}
+
+          {msg.grounding === "unsupported" && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-md border border-warning-border bg-warning-soft px-3 py-2 text-xs leading-5 text-warning"
+            >
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                本次回答未取得相关数据源的工具结果，可信度低，请以工具/控制台实际数据为准。
+              </span>
+            </div>
+          )}
+
+          {msg.grounding === "grounded" && (
+            <div className="flex items-center gap-1.5">
+              <span className="rounded-full bg-accent px-2.5 py-1 text-[11px] font-medium text-accent-foreground">
+                基于 {evidenceCount} 条工具证据
+              </span>
+            </div>
           )}
 
           {msg.approval && (
