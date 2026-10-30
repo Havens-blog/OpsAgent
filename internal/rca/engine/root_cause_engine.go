@@ -17,18 +17,18 @@ import (
 
 // Engine is the RCA engine that orchestrates root cause analysis.
 type Engine struct {
-	logSource      sources.LogSource
-	metricSource   sources.MetricSource
-	traceSource    sources.TraceSource
-	topologySource sources.TopologySource
-	changeSource   sources.ChangeSource
+	logSource       sources.LogSource
+	metricSource    sources.MetricSource
+	traceSource     sources.TraceSource
+	topologySource  sources.TopologySource
+	changeSource    sources.ChangeSource
 	wafSource       sources.WAFSource
 	backendResolver sources.DomainBackendResolver
 	slbEdgeResolver sources.SLBEdgeResolver
 	cdnEdgeResolver sources.CDNEdgeResolver
 	weights         scoring.Weights
-	windowSize     time.Duration
-	minConfidence  float64
+	windowSize      time.Duration
+	minConfidence   float64
 }
 
 // NewEngine creates a new RCA engine.
@@ -152,17 +152,17 @@ func (e *Engine) Analyze(ctx context.Context, incident *models.Incident) (*model
 		}
 	}
 	report := &models.RCAReport{
-		Incident:        incident,
-		Signals:         signals,
-		Candidates:      ranked,
-		TopCandidate:    getTopCandidate(ranked),
-		Confidence:      getOverallConfidence(ranked),
-		AnalysisWindow:  getAnalysisWindow(incident, e.windowSize),
-		Duration:        time.Since(startTime),
-		GeneratedAt:     time.Now(),
-		Warnings:        buildWarnings(signals.SourceErrors),
-		Note:            note,
-		EdgeFacts:       edgeFacts,
+		Incident:       incident,
+		Signals:        signals,
+		Candidates:     ranked,
+		TopCandidate:   getTopCandidate(ranked),
+		Confidence:     getOverallConfidence(ranked),
+		AnalysisWindow: getAnalysisWindow(incident, e.windowSize),
+		Duration:       time.Since(startTime),
+		GeneratedAt:    time.Now(),
+		Warnings:       buildWarnings(signals.SourceErrors),
+		Note:           note,
+		EdgeFacts:      edgeFacts,
 	}
 
 	return report, nil
@@ -371,14 +371,57 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 		doneChan <- struct{}{}
 	}()
 
-	// Collect metrics
+	// Collect metrics — scoped to the affected services when the incident
+	// names any. Per-service queries keep the owning service on each series,
+	// which the global anomaly scan loses (and which left metric_anomaly
+	// candidates with an empty Service, zeroing topology score).
 	go func() {
-		metrics, err := e.metricSource.QueryAnomalies(ctx, incident.StartTime.Add(-e.windowSize), incident.EndTime)
-		if err == nil {
-			signals.Metrics = metrics
-		} else {
-			srcErrChan <- srcErr{name: "metrics", msg: err.Error()}
+		start := incident.StartTime.Add(-e.windowSize)
+		end := incident.EndTime
+		if len(incident.AffectedServices) == 0 {
+			metrics, err := e.metricSource.QueryAnomalies(ctx, start, end)
+			if err == nil {
+				signals.Metrics = metrics
+			} else {
+				srcErrChan <- srcErr{name: "metrics", msg: err.Error()}
+			}
+			doneChan <- struct{}{}
+			return
 		}
+		var (
+			wg      sync.WaitGroup
+			mu      sync.Mutex
+			metrics []models.MetricSeries
+		)
+		for _, svc := range incident.AffectedServices {
+			wg.Add(1)
+			go func(svc string) {
+				defer wg.Done()
+				series, err := e.metricSource.QueryMetricsForService(ctx, svc, start, end)
+				if err != nil {
+					// Report the first per-service failure without blocking the
+					// fan-out (mirrors the log fan-out error handling).
+					select {
+					case srcErrChan <- srcErr{name: "metrics", msg: err.Error()}:
+					default:
+					}
+					return
+				}
+				mu.Lock()
+				for _, s := range series {
+					if s.Labels == nil {
+						s.Labels = map[string]string{}
+					}
+					if s.Labels["service"] == "" {
+						s.Labels["service"] = svc
+					}
+					metrics = append(metrics, s)
+				}
+				mu.Unlock()
+			}(svc)
+		}
+		wg.Wait()
+		signals.Metrics = metrics
 		doneChan <- struct{}{}
 	}()
 
@@ -570,11 +613,31 @@ func bucketTracesByTime(traces []models.TraceSummary, windows []models.TimeWindo
 	return result
 }
 
+// metricTrendKeySeparator joins a service and metric name in the MetricTrends
+// map key. The NUL byte cannot appear in either component, so it is a safe,
+// unambiguous delimiter that also sorts deterministically.
+const metricTrendKeySeparator = "\x00"
+
+// metricTrendKey builds a MetricTrends key that distinguishes the same metric
+// name across services (service is empty for the global fallback).
+func metricTrendKey(service, metricName string) string {
+	return service + metricTrendKeySeparator + metricName
+}
+
+// splitMetricTrendKey splits a MetricTrends key back into service and metric
+// name. Legacy/bare-name keys (no separator) yield an empty service.
+func splitMetricTrendKey(key string) (service, metricName string) {
+	if idx := strings.Index(key, metricTrendKeySeparator); idx >= 0 {
+		return key[:idx], key[idx+len(metricTrendKeySeparator):]
+	}
+	return "", key
+}
+
 func calculateMetricTrends(metrics []models.MetricSeries, windows []models.TimeWindow) map[string]map[int]models.Trend {
 	result := make(map[string]map[int]models.Trend)
 	for _, metric := range metrics {
 		trends := make(map[int]models.Trend)
-		result[metric.Name] = trends
+		result[metricTrendKey(metric.Labels["service"], metric.Name)] = trends
 		for i := 0; i < len(windows)-1; i++ {
 			avg1 := getAverageMetricValue(metric, windows[i])
 			avg2 := getAverageMetricValue(metric, windows[i+1])
@@ -641,16 +704,27 @@ func (e *Engine) generateHypotheses(ctx context.Context, signals *models.Signals
 	// Metric anomaly hypotheses — diagnostic: real timestamps, direction
 	// counts and window averages instead of opaque "Window N" indices (whose
 	// order was also map-random, so evidence lines shuffled between runs).
-	for metricName, trends := range normalized.MetricTrends {
-		if hasAnomalousTrend(trends, normalized, incident) {
-			desc, evidence := describeMetricAnomaly(metricName, trends, normalized.TimeWindows, signals.Metrics)
-			candidates = append(candidates, models.Hypothesis{
-				Type:        models.HypothesisTypeMetricAnomaly,
-				Description: desc,
-				Metric:      metricName,
-				Evidence:    evidence,
-			})
+	// Iterate in sorted key order so candidate generation (and therefore the
+	// evidence order) is deterministic across runs.
+	metricKeys := make([]string, 0, len(normalized.MetricTrends))
+	for key := range normalized.MetricTrends {
+		metricKeys = append(metricKeys, key)
+	}
+	sort.Strings(metricKeys)
+	for _, key := range metricKeys {
+		trends := normalized.MetricTrends[key]
+		if !hasAnomalousTrend(trends, normalized, incident) {
+			continue
 		}
+		service, metricName := splitMetricTrendKey(key)
+		desc, evidence := describeMetricAnomaly(service, metricName, trends, normalized.TimeWindows, signals.Metrics)
+		candidates = append(candidates, models.Hypothesis{
+			Type:        models.HypothesisTypeMetricAnomaly,
+			Service:     service,
+			Description: desc,
+			Metric:      metricName,
+			Evidence:    evidence,
+		})
 	}
 
 	// WAF attack hypothesis: the alarm window's own WAF logs are direct
@@ -838,10 +912,16 @@ func hasAnomalousTrend(trends map[int]models.Trend, normalized *models.Normalize
 // recent anomalous windows as evidence lines with real timestamps and average
 // values (capped at 5, chronological — the old "Window 44: trending up" was
 // opaque to on-call and shuffled between runs).
-func describeMetricAnomaly(metricName string, trends map[int]models.Trend, windows []models.TimeWindow, series []models.MetricSeries) (string, []string) {
+func describeMetricAnomaly(service, metricName string, trends map[int]models.Trend, windows []models.TimeWindow, series []models.MetricSeries) (string, []string) {
 	var ms *models.MetricSeries
 	for i := range series {
-		if series[i].Name == metricName {
+		if series[i].Name != metricName {
+			continue
+		}
+		// When the candidate is service-scoped, join on the owning service so
+		// the evidence averages come from the right series. The global fallback
+		// (empty service) keeps the original name-only join.
+		if service == "" || series[i].Labels["service"] == service {
 			ms = &series[i]
 			break
 		}
@@ -904,14 +984,14 @@ func isChangeRelevant(change models.Change, incident *models.Incident) bool {
 // resourceFailureReasons are K8s event reasons that indicate an infrastructure
 // resource failure — a distinct root-cause class from deployment/config changes.
 var resourceFailureReasons = map[string]bool{
-	"OOMKilled":             true,
-	"Unhealthy":             true,
-	"Evicted":               true,
-	"FailedScheduling":      true,
-	"CrashLoopBackOff":      true,
-	"BackOff":               true,
-	"NodeNotReady":          true,
-	"NodePressure":          true,
+	"OOMKilled":              true,
+	"Unhealthy":              true,
+	"Evicted":                true,
+	"FailedScheduling":       true,
+	"CrashLoopBackOff":       true,
+	"BackOff":                true,
+	"NodeNotReady":           true,
+	"NodePressure":           true,
 	"ContainerStatusUnknown": true,
 }
 

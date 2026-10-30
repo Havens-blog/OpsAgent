@@ -135,7 +135,13 @@ func (s *MultiDimensionalScorer) scoreTimeCorrelation(hypothesis *models.Hypothe
 
 	// Check metric trends during incident
 	if hypothesis.Metric != "" {
-		if trends, ok := signals.MetricTrends[hypothesis.Metric]; ok {
+		trends, ok := signals.MetricTrends[metricTrendKey(hypothesis.Service, hypothesis.Metric)]
+		if !ok {
+			// Back-compat with trends keyed by a bare metric name (tests or
+			// callers that never scoped metrics to a service).
+			trends, ok = signals.MetricTrends[hypothesis.Metric]
+		}
+		if ok {
 			for i, window := range signals.TimeWindows {
 				isIncidentWindow := window.End.After(incident.StartTime) && window.Start.Before(incident.EndTime)
 				if isIncidentWindow {
@@ -221,7 +227,11 @@ func (s *MultiDimensionalScorer) scoreMetricSeverity(hypothesis *models.Hypothes
 		return 0.0
 	}
 
-	trends, ok := signals.MetricTrends[hypothesis.Metric]
+	trends, ok := signals.MetricTrends[metricTrendKey(hypothesis.Service, hypothesis.Metric)]
+	if !ok {
+		// Back-compat with trends keyed by a bare metric name.
+		trends, ok = signals.MetricTrends[hypothesis.Metric]
+	}
 	if !ok {
 		return 0.0
 	}
@@ -400,4 +410,13 @@ func max(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// metricTrendKeySeparator matches the engine's composite MetricTrends key:
+// service + NUL + metric name. A NUL byte cannot appear in either component.
+const metricTrendKeySeparator = "\x00"
+
+// metricTrendKey builds the composite MetricTrends lookup key for a hypothesis.
+func metricTrendKey(service, metric string) string {
+	return service + metricTrendKeySeparator + metric
 }
