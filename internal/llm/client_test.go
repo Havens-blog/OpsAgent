@@ -42,12 +42,18 @@ func TestHandleStreamEmptyChoicesFinalChunk(t *testing.T) {
 	defer server.Close()
 
 	var deltas []string
-	err := newTestClient(server.URL).ChatStream(context.Background(), nil, collectDeltas(&deltas))
+	resp, err := newTestClient(server.URL).ChatStream(context.Background(), nil, collectDeltas(&deltas))
 	if err != nil {
 		t.Fatalf("ChatStream returned error: %v", err)
 	}
 	if got := strings.Join(deltas, ""); got != "你好世界" {
 		t.Fatalf("expected deltas 你好世界, got %q", got)
+	}
+	if resp == nil {
+		t.Fatal("expected non-nil ChatResponse")
+	}
+	if resp.Usage.TotalTokens != 10 {
+		t.Fatalf("expected TotalTokens 10, got %d", resp.Usage.TotalTokens)
 	}
 }
 
@@ -61,7 +67,7 @@ func TestHandleStreamNoSpaceAfterData(t *testing.T) {
 	defer server.Close()
 
 	var deltas []string
-	err := newTestClient(server.URL).ChatStream(context.Background(), nil, collectDeltas(&deltas))
+	_, err := newTestClient(server.URL).ChatStream(context.Background(), nil, collectDeltas(&deltas))
 	if err != nil {
 		t.Fatalf("ChatStream returned error: %v", err)
 	}
@@ -77,7 +83,7 @@ func TestHandleStreamNoValidChunk(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := newTestClient(server.URL).ChatStream(context.Background(), nil, func(ChatChunk) {})
+	_, err := newTestClient(server.URL).ChatStream(context.Background(), nil, func(ChatChunk) {})
 	if err == nil || !strings.Contains(err.Error(), "no valid response received") {
 		t.Fatalf("expected no valid response received, got %v", err)
 	}

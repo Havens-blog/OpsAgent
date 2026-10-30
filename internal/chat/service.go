@@ -35,7 +35,7 @@ const (
 type ChatClient interface {
 	Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error)
 	ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error)
-	ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error
+	ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error)
 }
 
 // ToolProvider supplies the LLM-visible tool set and executes tool calls. The
@@ -426,7 +426,7 @@ func (s *Service) buildLLMMessages(messages []Message) []llm.Message {
 // streamLLM streams the given llm messages and invokes onDelta per text delta.
 func (s *Service) streamLLM(ctx context.Context, llmMessages []llm.Message, onDelta func(string) error) error {
 	var deltaErr error
-	err := s.client.ChatStream(ctx, llmMessages, func(chunk llm.ChatChunk) {
+	_, err := s.client.ChatStream(ctx, llmMessages, func(chunk llm.ChatChunk) {
 		if deltaErr != nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
 			return
 		}

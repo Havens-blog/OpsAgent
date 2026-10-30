@@ -24,19 +24,19 @@ func (f *fakeStreamClient) ChatWithTools(ctx context.Context, messages []llm.Mes
 	return &llm.ChatResponse{}, nil
 }
 
-func (f *fakeStreamClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
+func (f *fakeStreamClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
 	if f.err != nil {
-		return f.err
+		return nil, f.err
 	}
 	for _, c := range f.chunks {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
 		handler(c)
 	}
-	return nil
+	return &llm.ChatResponse{}, nil
 }
 
 type blockingClient struct{}
@@ -49,9 +49,9 @@ func (b *blockingClient) ChatWithTools(ctx context.Context, messages []llm.Messa
 	return nil, nil
 }
 
-func (b *blockingClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
+func (b *blockingClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
 	<-ctx.Done()
-	return ctx.Err()
+	return nil, ctx.Err()
 }
 
 func TestServiceChatStreamDeltas(t *testing.T) {
@@ -148,16 +148,16 @@ func (c *toolLoopClient) ChatWithTools(ctx context.Context, messages []llm.Messa
 	return &llm.ChatResponse{Choices: []llm.Choice{{Message: llm.ResponseMessage{Role: "assistant", ToolCalls: c.toolCalls}}}}, nil
 }
 
-func (c *toolLoopClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) error {
+func (c *toolLoopClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
 	for _, ch := range c.chunks {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		default:
 		}
 		handler(ch)
 	}
-	return nil
+	return &llm.ChatResponse{}, nil
 }
 
 func newStreamHandler() (StreamHandler, *strings.Builder) {
