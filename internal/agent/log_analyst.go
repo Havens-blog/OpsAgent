@@ -118,22 +118,18 @@ func (l *LogAnalystAgent) AnalyzeLogs(ctx context.Context, service string, start
 		observability.String("end", end.Format(time.RFC3339)),
 	)
 
-	// Query error logs
-	logs, err := l.logSource.QueryErrors(ctx, start, end)
+	// Query error logs — store-scoped per service when one is named (exact and
+	// fast): the global QueryErrors is a bounded newest-first sample across
+	// ~800 stores, so one service's errors get washed out by fleet noise.
+	var filteredLogs []models.LogEntry
+	var err error
+	if service != "" {
+		filteredLogs, err = l.logSource.QueryErrorsByService(ctx, service, start, end)
+	} else {
+		filteredLogs, err = l.logSource.QueryErrors(ctx, start, end)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to query error logs: %w", err)
-	}
-
-	// Filter by service if specified
-	var filteredLogs []models.LogEntry
-	if service != "" {
-		for _, log := range logs {
-			if log.Service == service {
-				filteredLogs = append(filteredLogs, log)
-			}
-		}
-	} else {
-		filteredLogs = logs
 	}
 
 	// Analyze patterns
@@ -301,21 +297,20 @@ func (l *LogAnalystAgent) CorrelateWithIncident(ctx context.Context, service str
 	start := incidentTime.Add(-30 * time.Minute)
 	end := incidentTime.Add(30 * time.Minute)
 
-	logs, err := l.logSource.QueryErrors(ctx, start, end)
+	// Store-scoped query for the service — a global scan's bounded
+	// newest-first sample would dilute this service's errors out entirely.
+	logs, err := l.logSource.QueryErrorsByService(ctx, service, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query logs: %w", err)
 	}
 
-	// Filter by service
 	var correlatedLogs []models.LogEntry
 	relatedErrors := make(map[string]bool)
 
 	for _, log := range logs {
-		if log.Service == service {
-			correlatedLogs = append(correlatedLogs, log)
-			pattern := l.normalizePattern(log.Message)
-			relatedErrors[pattern] = true
-		}
+		correlatedLogs = append(correlatedLogs, log)
+		pattern := l.normalizePattern(log.Message)
+		relatedErrors[pattern] = true
 	}
 
 	// Detect error spike (5-minute window around incident)
@@ -410,20 +405,30 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 	startTimeStr := getString(task.Params, "start_time")
 	endTimeStr := getString(task.Params, "end_time")
 
-	start, err := time.Parse(time.RFC3339, startTimeStr)
-	if err != nil {
-		return &ExecutionResult{
-			Success: false,
-			Error:   fmt.Errorf("invalid start_time format: %w", err),
-		}, nil
+	// Missing times default to the last hour so free-text delegations (e.g.
+	// from the coordinator) still run; malformed values stay an error.
+	start := time.Now().Add(-time.Hour)
+	if startTimeStr != "" {
+		t, err := time.Parse(time.RFC3339, startTimeStr)
+		if err != nil {
+			return &ExecutionResult{
+				Success: false,
+				Error:   fmt.Errorf("invalid start_time format: %w", err),
+			}, nil
+		}
+		start = t
 	}
 
-	end, err := time.Parse(time.RFC3339, endTimeStr)
-	if err != nil {
-		return &ExecutionResult{
-			Success: false,
-			Error:   fmt.Errorf("invalid end_time format: %w", err),
-		}, nil
+	end := time.Now()
+	if endTimeStr != "" {
+		t, err := time.Parse(time.RFC3339, endTimeStr)
+		if err != nil {
+			return &ExecutionResult{
+				Success: false,
+				Error:   fmt.Errorf("invalid end_time format: %w", err),
+			}, nil
+		}
+		end = t
 	}
 
 	// Perform analysis
@@ -502,27 +507,26 @@ func (l *LogAnalystAgent) executeTask(ctx context.Context, task *Task) (*Executi
 	return result, err
 }
 
-// CreateLogAnalystTools creates the standard set of tools for LogAnalystAgent.
-func CreateLogAnalystTools() []*tool.Tool {
+// BoundTools returns the analyst's tools bound to its REAL log source and
+// analysis methods. (The old package-level CreateLogAnalystTools returned
+// "use the method directly" stubs — dead ends the LLM cannot call.)
+func (l *LogAnalystAgent) BoundTools() []*tool.Tool {
 	return []*tool.Tool{
-		createAnalyzeLogsTool(),
-		createQueryLogsAdvancedTool(),
-		createCorrelateLogsTool(),
+		l.analyzeLogsTool(),
+		l.queryLogsAdvancedTool(),
+		l.correlateLogsTool(),
 	}
 }
 
-// createAnalyzeLogsTool creates the log analysis tool.
-func createAnalyzeLogsTool() *tool.Tool {
+// analyzeLogsTool runs the real pattern-detection analysis for one service.
+func (l *LogAnalystAgent) analyzeLogsTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
-			"service": {"type": "string", "description": "Service name to analyze logs for"},
-			"start_time": {"type": "string", "description": "Analysis start time in RFC3339 format"},
-			"end_time": {"type": "string", "description": "Analysis end time in RFC3339 format"},
-			"error_level": {"type": "string", "description": "Error level to filter", "enum": ["error", "warning", "info"]},
-			"max_results": {"type": "integer", "description": "Maximum results to return", "default": 100}
-		},
-		"required": ["service", "start_time", "end_time"]
+			"service": {"type": "string", "description": "Service name to analyze logs for (empty = all services)"},
+			"start_time": {"type": "string", "description": "Analysis start time in RFC3339 format (default 1h ago)"},
+			"end_time": {"type": "string", "description": "Analysis end time in RFC3339 format (default now)"}
+		}
 	}`
 
 	return &tool.Tool{
@@ -540,50 +544,94 @@ func createAnalyzeLogsTool() *tool.Tool {
 				"Correlate logs with incidents",
 			},
 		},
-		IsAvailable: func(config map[string]interface{}) bool { return true },
+		IsAvailable: func(map[string]interface{}) bool { return l.logSource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"status": "use LogAnalystAgent.AnalyzeLogs method directly"}, nil
+			if l.logSource == nil {
+				return nil, fmt.Errorf("log source not configured")
+			}
+			start, end := timeRange(params)
+			return l.AnalyzeLogs(ctx, getString(params, "service"), start, end)
 		},
 	}
 }
 
-// createQueryLogsAdvancedTool creates the advanced log query tool.
-func createQueryLogsAdvancedTool() *tool.Tool {
+// queryLogsAdvancedTool does an honest keyword search over error logs
+// (case-insensitive substring on the message), optionally scoped to a service.
+func (l *LogAnalystAgent) queryLogsAdvancedTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
-			"query": {"type": "string", "description": "Log query expression"},
-			"start_time": {"type": "string", "description": "Query start time in RFC3339 format"},
-			"end_time": {"type": "string", "description": "Query end time in RFC3339 format"},
-			"limit": {"type": "integer", "description": "Maximum number of entries", "default": 100}
+			"query": {"type": "string", "description": "Keyword to search for in error log messages"},
+			"service": {"type": "string", "description": "Optional service scope (much faster)"},
+			"start_time": {"type": "string", "description": "RFC3339 (default 1h ago)"},
+			"end_time": {"type": "string", "description": "RFC3339 (default now)"},
+			"limit": {"type": "integer", "description": "Max entries to return", "default": 50}
 		},
-		"required": ["query", "start_time", "end_time"]
+		"required": ["query"]
 	}`
 
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "query_logs_advanced",
-			Description: "Query logs from SLS with custom filters and pattern detection",
+			Description: "Keyword-search error logs (case-insensitive substring on message), optionally scoped to a service",
 			Source:      tool.DataSourceTypeSLS,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
 			SideEffect:  guardrails.SideEffectReadOnly,
 			Category:    "logs",
 		},
+		IsAvailable: func(map[string]interface{}) bool { return l.logSource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"message": "advanced log query - to be implemented with SLS integration", "query": params["query"]}, nil
+			if l.logSource == nil {
+				return nil, fmt.Errorf("log source not configured")
+			}
+			start, end := timeRange(params)
+			kw := strings.ToLower(strings.TrimSpace(getString(params, "query")))
+			var logs []models.LogEntry
+			var err error
+			if svc := getString(params, "service"); svc != "" {
+				logs, err = l.logSource.QueryErrorsByService(ctx, svc, start, end)
+			} else {
+				logs, err = l.logSource.QueryErrors(ctx, start, end)
+			}
+			if err != nil {
+				return nil, err
+			}
+			limit := 50
+			if v, ok := params["limit"].(float64); ok && int(v) > 0 {
+				limit = int(v)
+			}
+			matched := make([]map[string]interface{}, 0, limit)
+			total := 0
+			for _, e := range logs {
+				if kw != "" && !strings.Contains(strings.ToLower(e.Message), kw) {
+					continue
+				}
+				total++
+				if len(matched) < limit {
+					msg := e.Message
+					if len(msg) > 200 {
+						msg = msg[:200] + "…"
+					}
+					matched = append(matched, map[string]interface{}{
+						"timestamp": e.Timestamp.Format(time.RFC3339),
+						"service":   e.Service,
+						"message":   msg,
+					})
+				}
+			}
+			return map[string]interface{}{"total_matched": total, "entries": matched}, nil
 		},
 	}
 }
 
-// createCorrelateLogsTool creates the log correlation tool.
-func createCorrelateLogsTool() *tool.Tool {
+// correlateLogsTool runs the real incident-time correlation for a service.
+func (l *LogAnalystAgent) correlateLogsTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
 			"service": {"type": "string", "description": "Service name"},
-			"incident_time": {"type": "string", "description": "Incident timestamp in RFC3339 format"},
-			"window_minutes": {"type": "integer", "description": "Time window in minutes", "default": 30}
+			"incident_time": {"type": "string", "description": "Incident timestamp in RFC3339 format"}
 		},
 		"required": ["service", "incident_time"]
 	}`
@@ -598,8 +646,16 @@ func createCorrelateLogsTool() *tool.Tool {
 			SideEffect:  guardrails.SideEffectReadOnly,
 			Category:    "logs",
 		},
+		IsAvailable: func(map[string]interface{}) bool { return l.logSource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"message": "log correlation - use LogAnalystAgent.CorrelateWithIncident method directly"}, nil
+			if l.logSource == nil {
+				return nil, fmt.Errorf("log source not configured")
+			}
+			it, err := time.Parse(time.RFC3339, getString(params, "incident_time"))
+			if err != nil {
+				return nil, fmt.Errorf("invalid incident_time: %w", err)
+			}
+			return l.CorrelateWithIncident(ctx, getString(params, "service"), it)
 		},
 	}
 }

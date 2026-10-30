@@ -166,121 +166,24 @@ func (i *InspectorAgent) RunInspection(ctx context.Context, params *InspectionPa
 	return report, nil
 }
 
-// runCloudInspection performs cloud resource inspection.
+// runCloudInspection performs cloud resource inspection. No real cloud-resource
+// backend is wired yet; the old implementation FABRICATED counts and findings
+// ("Simulate"), which is worse than refusing — an invented audit trail
+// misleads on-call and compliance alike.
 func (i *InspectorAgent) runCloudInspection(ctx context.Context, params *InspectionParams, report *InspectionReport) error {
-	// Simulate cloud inspection
-	report.Resources = 10
-	report.Passed = 8
-	report.Failed = 1
-	report.Warning = 1
-
-	// Add sample findings
-	report.Findings = append(report.Findings,
-		Finding{
-			ID:           fmt.Sprintf("%s-finding-1", report.ID),
-			ResourceID:   "i-bp12345678",
-			ResourceType: "ecs_instance",
-			Severity:     "warning",
-			Title:        "Instance without proper tags",
-			Description:  "ECS instance is missing required cost center tags",
-			Remediation:  "Add required tags to the instance",
-			Timestamp:    time.Now(),
-		},
-		Finding{
-			ID:           fmt.Sprintf("%s-finding-2", report.ID),
-			ResourceID:   "rds-bp87654321",
-			ResourceType: "rds_instance",
-			Severity:     "info",
-			Title:        "Backup configuration check",
-			Description:  "RDS instance has backup properly configured",
-			Timestamp:    time.Now(),
-		},
-	)
-
-	return nil
+	return fmt.Errorf("cloud resource inspection is not wired to a real data source (refusing to fabricate findings)")
 }
 
-// runESInspection performs Elasticsearch cluster inspection.
+// runESInspection performs Elasticsearch cluster inspection. Not wired to a
+// real cluster yet — refuse honestly instead of simulating health findings.
 func (i *InspectorAgent) runESInspection(ctx context.Context, params *InspectionParams, report *InspectionReport) error {
-	// Simulate ES inspection
-	report.Resources = 5
-	report.Passed = 4
-	report.Warning = 1
-	report.Failed = 0
-
-	// Add sample findings
-	report.Findings = append(report.Findings,
-		Finding{
-			ID:           fmt.Sprintf("%s-es-finding-1", report.ID),
-			ResourceID:   params.ClusterURL,
-			ResourceType: "elasticsearch_cluster",
-			Severity:     "warning",
-			Title:        "Cluster health is yellow",
-			Description:  "Some cluster shards are unassigned",
-			Remediation:  "Check shard allocation and reassign unassigned shards",
-			Timestamp:    time.Now(),
-		},
-	)
-
-	if params.CheckIndices {
-		report.Resources += 3
-		report.Findings = append(report.Findings,
-			Finding{
-				ID:           fmt.Sprintf("%s-index-finding-1", report.ID),
-				ResourceID:   "logs-2024-06",
-				ResourceType: "elasticsearch_index",
-				Severity:     "info",
-				Title:        "Index size check",
-				Description:  "Index size is within acceptable range",
-				Timestamp:    time.Now(),
-			},
-		)
-	}
-
-	return nil
+	return fmt.Errorf("elasticsearch inspection is not wired to a real cluster (refusing to fabricate findings)")
 }
 
-// runComplianceCheck performs compliance validation.
+// runComplianceCheck performs compliance validation. Not wired to a real
+// policy/resource source yet — refuse honestly instead of inventing violations.
 func (i *InspectorAgent) runComplianceCheck(ctx context.Context, params *InspectionParams, report *InspectionReport) error {
-	// Simulate compliance check
-	report.Resources = 15
-	report.Passed = 12
-	report.Failed = 2
-	report.Warning = 1
-
-	// Add sample findings
-	report.Findings = append(report.Findings,
-		Finding{
-			ID:           fmt.Sprintf("%s-comp-finding-1", report.ID),
-			ResourceID:   "sg-bp123456",
-			ResourceType: "security_group",
-			Severity:     "critical",
-			Title:        "Overly permissive security group",
-			Description:  "Security group allows 0.0.0.0/0 access on port 22",
-			Remediation:  "Restrict SSH access to specific IP ranges",
-			Labels: map[string]string{
-				"compliance_id": params.ComplianceID,
-				"category":      "network_security",
-			},
-			Timestamp: time.Now(),
-		},
-		Finding{
-			ID:           fmt.Sprintf("%s-comp-finding-2", report.ID),
-			ResourceID:   "bucket-logs",
-			ResourceType: "oss_bucket",
-			Severity:     "warning",
-			Title:        "Missing bucket encryption",
-			Description:  "OSS bucket does not have encryption enabled",
-			Remediation:  "Enable server-side encryption for the bucket",
-			Labels: map[string]string{
-				"compliance_id": params.ComplianceID,
-				"category":      "data_security",
-			},
-			Timestamp: time.Now(),
-		},
-	)
-
-	return nil
+	return fmt.Errorf("compliance check is not wired to a real policy data source (refusing to fabricate findings)")
 }
 
 // calculateSummary calculates the summary statistics for the report.
@@ -495,17 +398,19 @@ func (i *InspectorAgent) executeTask(ctx context.Context, task *Task) (*Executio
 	return result, err
 }
 
-// CreateInspectorTools creates the standard set of tools for InspectorAgent.
-func CreateInspectorTools() []*tool.Tool {
+// BoundTools returns the inspector's tools bound to the real RunInspection.
+// Until real inspection backends are wired, RunInspection (and thus these
+// tools) fail HONESTLY instead of returning fabricated findings.
+func (i *InspectorAgent) BoundTools() []*tool.Tool {
 	return []*tool.Tool{
-		createRunInspectionTool(),
-		createCheckHealthTool(),
-		createValidateComplianceTool(),
+		i.runInspectionTool(),
+		i.checkHealthTool(),
+		i.validateComplianceTool(),
 	}
 }
 
-// createRunInspectionTool creates the inspection tool.
-func createRunInspectionTool() *tool.Tool {
+// runInspectionTool dispatches to the real RunInspection pipeline.
+func (i *InspectorAgent) runInspectionTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
@@ -528,7 +433,7 @@ func createRunInspectionTool() *tool.Tool {
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "run_inspection",
-			Description: "Run operations inspection and compliance checks",
+			Description: "Run operations inspection and compliance checks (fails honestly when no real backend is wired)",
 			Source:      tool.DataSourceTypeGeneric,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
@@ -540,15 +445,39 @@ func createRunInspectionTool() *tool.Tool {
 				"Compliance validation",
 			},
 		},
-		IsAvailable: func(config map[string]interface{}) bool { return true },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"status": "use InspectorAgent.RunInspection method directly"}, nil
+			p := &InspectionParams{
+				Type:         getString(params, "inspection_type"),
+				ClusterURL:   getString(params, "cluster_url"),
+				ComplianceID: getString(params, "compliance_id"),
+				ResourceType: getString(params, "resource_type"),
+			}
+			for _, key := range []struct {
+				param string
+				dst   *[]string
+			}{{"providers", &p.Providers}, {"services", &p.Services}} {
+				if arr, ok := params[key.param].([]interface{}); ok {
+					for _, v := range arr {
+						if s, ok := v.(string); ok {
+							*key.dst = append(*key.dst, s)
+						}
+					}
+				}
+			}
+			if v, ok := params["check_indices"].(bool); ok {
+				p.CheckIndices = v
+			}
+			if v, ok := params["check_nodes"].(bool); ok {
+				p.CheckNodes = v
+			}
+			return i.RunInspection(ctx, p)
 		},
 	}
 }
 
-// createCheckHealthTool creates the health check tool.
-func createCheckHealthTool() *tool.Tool {
+// checkHealthTool — no real health-check backend is wired; refuse honestly
+// (the old stub answered "healthy" for ANY endpoint, which is a lie).
+func (i *InspectorAgent) checkHealthTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
@@ -565,7 +494,7 @@ func createCheckHealthTool() *tool.Tool {
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "check_health",
-			Description: "Check health status of a system component",
+			Description: "Check health status of a system component (fails honestly until a real probe backend is wired)",
 			Source:      tool.DataSourceTypeGeneric,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
@@ -573,18 +502,13 @@ func createCheckHealthTool() *tool.Tool {
 			Category:    "health",
 		},
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{
-				"message":  "health check completed",
-				"target":   params["target_type"],
-				"endpoint": params["endpoint"],
-				"status":   "healthy",
-			}, nil
+			return nil, fmt.Errorf("health check is not wired to a real probe backend (refusing to fabricate status)")
 		},
 	}
 }
 
-// createValidateComplianceTool creates the compliance validation tool.
-func createValidateComplianceTool() *tool.Tool {
+// validateComplianceTool — same honesty contract as checkHealthTool.
+func (i *InspectorAgent) validateComplianceTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
@@ -598,7 +522,7 @@ func createValidateComplianceTool() *tool.Tool {
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "validate_compliance",
-			Description: "Validate resources against compliance policies",
+			Description: "Validate resources against compliance policies (fails honestly until a real policy source is wired)",
 			Source:      tool.DataSourceTypeGeneric,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
@@ -606,11 +530,7 @@ func createValidateComplianceTool() *tool.Tool {
 			Category:    "compliance",
 		},
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{
-				"message":       "compliance validation completed",
-				"compliance_id": params["compliance_id"],
-				"resource_type": params["resource_type"],
-			}, nil
+			return nil, fmt.Errorf("compliance validation is not wired to a real policy source (refusing to fabricate results)")
 		},
 	}
 }

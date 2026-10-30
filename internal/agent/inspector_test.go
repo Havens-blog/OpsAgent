@@ -44,7 +44,10 @@ func TestNewInspectorAgent(t *testing.T) {
 	})
 }
 
-// TestInspectorAgentRunInspection tests inspection functionality.
+// TestInspectorAgentRunInspection locks in honest refusal: with no real
+// inspection backend wired, RunInspection must error instead of fabricating
+// findings (the old "Simulate" implementation invented resource counts and
+// compliance violations).
 func TestInspectorAgentRunInspection(t *testing.T) {
 	settings := &config.Settings{
 		Environment:   config.EnvDevelopment,
@@ -54,88 +57,45 @@ func TestInspectorAgentRunInspection(t *testing.T) {
 		DataSources:   make(map[string]interface{}),
 	}
 
-	t.Run("runs_cloud_inspection", func(t *testing.T) {
-		agent, err := NewInspectorAgent(settings)
-		if err != nil {
-			t.Fatalf("Failed to create InspectorAgent: %v", err)
-		}
-		defer agent.Shutdown(context.Background())
-
-		ctx := context.Background()
-
-		report, err := agent.RunInspection(ctx, &InspectionParams{
+	cases := []struct {
+		name   string
+		params *InspectionParams
+	}{
+		{"cloud_inspection_refuses_to_fabricate", &InspectionParams{
 			Type:      "cloud_resources",
 			Providers: []string{"aliyun"},
 			Services:  []string{"ecs", "rds"},
-		})
-		if err != nil {
-			t.Fatalf("RunInspection failed: %v", err)
-		}
-
-		if report == nil {
-			t.Fatal("Expected non-nil report")
-		}
-
-		if report.Type != "cloud_resources" {
-			t.Errorf("Expected type 'cloud_resources', got '%s'", report.Type)
-		}
-	})
-
-	t.Run("runs_elasticsearch_health_check", func(t *testing.T) {
-		agent, err := NewInspectorAgent(settings)
-		if err != nil {
-			t.Fatalf("Failed to create InspectorAgent: %v", err)
-		}
-		defer agent.Shutdown(context.Background())
-
-		ctx := context.Background()
-
-		report, err := agent.RunInspection(ctx, &InspectionParams{
-			Type:          "elasticsearch",
-			ClusterURL:    "http://localhost:9200",
-			CheckIndices:  true,
-			CheckNodes:    true,
-		})
-		if err != nil {
-			t.Fatalf("RunInspection failed: %v", err)
-		}
-
-		if report == nil {
-			t.Fatal("Expected non-nil report")
-		}
-
-		if report.Status != "completed" {
-			t.Errorf("Expected status 'completed', got '%s'", report.Status)
-		}
-	})
-
-	t.Run("validates_config_compliance", func(t *testing.T) {
-		agent, err := NewInspectorAgent(settings)
-		if err != nil {
-			t.Fatalf("Failed to create InspectorAgent: %v", err)
-		}
-		defer agent.Shutdown(context.Background())
-
-		ctx := context.Background()
-
-		report, err := agent.RunInspection(ctx, &InspectionParams{
+		}},
+		{"elasticsearch_inspection_refuses_to_fabricate", &InspectionParams{
+			Type:         "elasticsearch",
+			ClusterURL:   "http://localhost:9200",
+			CheckIndices: true,
+			CheckNodes:   true,
+		}},
+		{"compliance_check_refuses_to_fabricate", &InspectionParams{
 			Type:         "compliance",
 			ComplianceID: "CIS-aliyun-1.0.0",
 			ResourceType: "all",
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent, err := NewInspectorAgent(settings)
+			if err != nil {
+				t.Fatalf("Failed to create InspectorAgent: %v", err)
+			}
+			defer agent.Shutdown(context.Background())
+
+			report, err := agent.RunInspection(context.Background(), tc.params)
+			if err == nil {
+				t.Fatalf("expected honest error, got report %+v", report)
+			}
+			if report != nil {
+				t.Errorf("report must be nil on error, got %+v", report)
+			}
 		})
-		if err != nil {
-			t.Fatalf("RunInspection failed: %v", err)
-		}
-
-		if report == nil {
-			t.Fatal("Expected non-nil report")
-		}
-
-		// Compliance reports should include findings
-		if len(report.Findings) == 0 {
-			t.Error("Expected compliance findings")
-		}
-	})
+	}
 }
 
 // TestInspectorAgentExecute tests task execution.
@@ -172,12 +132,13 @@ func TestInspectorAgentExecute(t *testing.T) {
 			t.Fatalf("Execute failed: %v", err)
 		}
 
-		if !result.Success {
-			t.Errorf("Expected success, got error response: %s", result.Response)
+		// No real inspection backend is wired: the task must fail HONESTLY
+		// instead of returning fabricated findings.
+		if result.Success {
+			t.Errorf("Expected honest failure without a real backend, got success: %s", result.Response)
 		}
-
-		if result.Data == nil {
-			t.Error("Expected data in result")
+		if result.Error == nil {
+			t.Error("Expected error to be set on the failed result")
 		}
 	})
 

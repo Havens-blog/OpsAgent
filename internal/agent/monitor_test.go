@@ -213,13 +213,13 @@ func TestMonitorAgentExecute(t *testing.T) {
 		}
 	})
 
-	t.Run("RCA task with invalid incident data", func(t *testing.T) {
+	t.Run("RCA task without structured incident falls back to task-derived window", func(t *testing.T) {
 		task := &Task{
 			ID:          "task-003",
-			Description: "Invalid RCA task",
+			Description: "Free-text RCA delegation",
 			Params: map[string]interface{}{
 				"type":     "rca",
-				"incident": "invalid", // Not a map
+				"incident": "invalid", // Not a map — free-text delegation shape
 			},
 			CreatedAt: time.Now(),
 			Status:    "pending",
@@ -230,8 +230,11 @@ func TestMonitorAgentExecute(t *testing.T) {
 			t.Fatalf("Execute failed: %v", err)
 		}
 
-		if result.Success {
-			t.Error("Expected failure for invalid incident data")
+		// Free-text delegations (e.g. from the coordinator's LLM routing) may
+		// lack a structured incident; the monitor derives a default one-hour
+		// window instead of failing the delegation.
+		if !result.Success {
+			t.Errorf("Expected fallback RCA to succeed, got failure: %s", result.Response)
 		}
 	})
 }
@@ -280,9 +283,22 @@ func TestMonitorAgentGetRCAStatus(t *testing.T) {
 	})
 }
 
-// TestCreateMonitorTools tests tool creation.
-func TestCreateMonitorTools(t *testing.T) {
-	tools := CreateMonitorTools()
+// TestMonitorBoundTools tests the bound tool set (real implementations).
+func TestMonitorBoundTools(t *testing.T) {
+	settings := &config.Settings{
+		Environment:   config.EnvDevelopment,
+		LLM:           config.LLMConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "test-key"},
+		Observability: config.ObservabilityConfig{LogLevel: "info", LogFormat: "json"},
+		Security:      config.SecurityConfig{EnableAuditLog: false},
+		DataSources:   make(map[string]interface{}),
+	}
+	agent, err := NewMonitorAgent(settings, nil)
+	if err != nil {
+		t.Fatalf("NewMonitorAgent failed: %v", err)
+	}
+	defer agent.Shutdown(context.Background())
+
+	tools := agent.BoundTools()
 
 	if len(tools) != 5 {
 		t.Errorf("Expected 5 tools, got %d", len(tools))

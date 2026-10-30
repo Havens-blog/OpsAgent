@@ -4,6 +4,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/config"
@@ -20,6 +21,7 @@ import (
 type MonitorAgent struct {
 	*BaseAgent
 	rcaEngine *engine.Engine
+	sources   *RCASources
 }
 
 // NewMonitorAgent creates a new MonitorAgent.
@@ -73,11 +75,15 @@ When analyzing an incident:
 
 // RCASources contains the data sources for RCA analysis.
 type RCASources struct {
-	LogSource      sources.LogSource
-	MetricSource   sources.MetricSource
-	TraceSource    sources.TraceSource
-	TopologySource sources.TopologySource
-	ChangeSource   sources.ChangeSource
+	LogSource       sources.LogSource
+	MetricSource    sources.MetricSource
+	TraceSource     sources.TraceSource
+	TopologySource  sources.TopologySource
+	ChangeSource    sources.ChangeSource
+	WAFSource       sources.WAFSource
+	BackendResolver sources.DomainBackendResolver
+	SLBEdgeResolver sources.SLBEdgeResolver
+	CDNEdgeResolver sources.CDNEdgeResolver
 }
 
 // InitializeRCA initializes the RCA engine with data sources.
@@ -96,6 +102,18 @@ func (m *MonitorAgent) InitializeRCA(sources *RCASources) error {
 	if sources.ChangeSource != nil {
 		opts = append(opts, engine.WithChangeSource(sources.ChangeSource))
 	}
+	if sources.WAFSource != nil {
+		opts = append(opts, engine.WithWAFSource(sources.WAFSource))
+	}
+	if sources.BackendResolver != nil {
+		opts = append(opts, engine.WithDomainBackendResolver(sources.BackendResolver))
+	}
+	if sources.SLBEdgeResolver != nil {
+		opts = append(opts, engine.WithSLBEdgeResolver(sources.SLBEdgeResolver))
+	}
+	if sources.CDNEdgeResolver != nil {
+		opts = append(opts, engine.WithCDNEdgeResolver(sources.CDNEdgeResolver))
+	}
 
 	rcaEngine, err := engine.NewEngine(opts...)
 	if err != nil {
@@ -103,6 +121,7 @@ func (m *MonitorAgent) InitializeRCA(sources *RCASources) error {
 	}
 
 	m.rcaEngine = rcaEngine
+	m.sources = sources
 	return nil
 }
 
@@ -198,13 +217,21 @@ func (m *MonitorAgent) Execute(ctx context.Context, task *Task) (*ExecutionResul
 
 // executeRCATask executes an RCA analysis task.
 func (m *MonitorAgent) executeRCATask(ctx context.Context, task *Task) (*ExecutionResult, error) {
-	// Extract incident from params
+	// Extract incident from params; free-text delegations (e.g. from the
+	// coordinator's LLM routing) may lack a structured incident — derive a
+	// default one-hour window from the task itself instead of failing.
 	incidentData, ok := task.Params["incident"].(map[string]interface{})
 	if !ok {
-		return &ExecutionResult{
-			Success: false,
-			Error:   fmt.Errorf("invalid incident data"),
-		}, nil
+		incidentData = map[string]interface{}{
+			"id":          task.ID,
+			"start_time":  time.Now().Add(-time.Hour).Format(time.RFC3339),
+			"end_time":    time.Now().Format(time.RFC3339),
+			"severity":    "P3",
+			"description": task.Description,
+		}
+		if svc := getString(task.Params, "service"); svc != "" {
+			incidentData["affected_services"] = []interface{}{svc}
+		}
 	}
 
 	incident := &models.Incident{
@@ -250,10 +277,19 @@ func (m *MonitorAgent) formatRCAReport(report *models.RCAReport) string {
 	output += fmt.Sprintf("## Root Cause Analysis Report\n\n")
 	output += fmt.Sprintf("**Incident:** %s\n", report.Incident.ID)
 	output += fmt.Sprintf("**Severity:** %s\n", report.Incident.Severity)
-	output += fmt.Sprintf("**Confidence:** %.1f%%\n\n", report.Confidence*100)
+	if report.Note != "" {
+		output += fmt.Sprintf("**结论:** %s\n\n", report.Note)
+		output += fmt.Sprintf("**Confidence:** 0.0%%\n\n")
+	} else {
+		output += fmt.Sprintf("**Confidence:** %.1f%%\n\n", report.Confidence*100)
+	}
 
 	if report.TopCandidate != nil {
-		output += fmt.Sprintf("### Top Root Cause Candidate\n\n")
+		if report.Note != "" {
+			output += fmt.Sprintf("### 窗口内信号(仅供参考)\n\n")
+		} else {
+			output += fmt.Sprintf("### Top Root Cause Candidate\n\n")
+		}
 		output += fmt.Sprintf("**Type:** %s\n", report.TopCandidate.Hypothesis.Type)
 		output += fmt.Sprintf("**Service:** %s\n", report.TopCandidate.Hypothesis.Service)
 		output += fmt.Sprintf("**Description:** %s\n", report.TopCandidate.Hypothesis.Description)
@@ -268,9 +304,94 @@ func (m *MonitorAgent) formatRCAReport(report *models.RCAReport) string {
 	}
 
 	if len(report.Candidates) > 1 {
-		output += fmt.Sprintf("### Other Candidates (%d)\n\n", len(report.Candidates)-1)
-		for i, c := range report.Candidates[1:] {
+		// Cap the list: a fleet-wide window can produce dozens of same-score
+		// candidates, and an unbounded dump buries the ranked ones.
+		const maxOther = 8
+		others := report.Candidates[1:]
+		output += fmt.Sprintf("### Other Candidates (%d)\n\n", len(others))
+		for i, c := range others {
+			if i >= maxOther {
+				output += fmt.Sprintf("...(另有 %d 个更低分候选,见事件详情页)\n", len(others)-maxOther)
+				break
+			}
 			output += fmt.Sprintf("%d. %s - Score: %.2f\n", i+1, c.Hypothesis.Description, c.Score)
+		}
+		output += "\n"
+	}
+
+	// Only when the facts did NOT become the root cause: the top candidate's
+	// evidence already lists these exact lines, and repeating them is the
+	// "wall of text" on-call complained about.
+	if report.Signals != nil && report.Signals.WAFFacts != nil && report.Signals.WAFFacts.Total > 0 &&
+		(report.TopCandidate == nil || report.TopCandidate.Hypothesis.Type != models.HypothesisTypeWAFAttack) {
+		output += "\n### WAF 攻击事实\n\n"
+		for _, line := range report.Signals.WAFFacts.EvidenceLines() {
+			output += "- " + line + "\n"
+		}
+		output += "\n"
+	}
+
+	// Edge (CDN/SLB) reference facts for a domain alarm. These never became a
+	// root-cause candidate — they answer "did the SLB->backend hop forward 5xx
+	// in the window, and does the CDN hop even have logs" for a dial-test alarm
+	// whose backend looked healthy, so on-call can see the full edge chain and
+	// which hops actually have data instead of guessing from the Note.
+	if report.EdgeFacts != nil && (report.EdgeFacts.CDN != nil || report.EdgeFacts.SLB != nil) {
+		output += "\n### 边缘事实(仅供参考)\n\n"
+		if report.EdgeFacts.CDN != nil {
+			cdn := report.EdgeFacts.CDN
+			if cdn.Provider != "" || cdn.CNAME != "" || cdn.OriginHost != "" {
+				chain := cdn.Provider
+				if cdn.CNAME != "" {
+					chain += " → " + cdn.CNAME
+				}
+				if cdn.OriginHost != "" {
+					chain += " → 回源 " + cdn.OriginHost
+				}
+				output += "- CDN: " + strings.TrimSpace(chain) + "\n"
+			}
+			if cdn.LogChecked {
+				switch {
+				case cdn.Total == 0:
+					output += "- CDN 日志: 窗口内 0 条,该域名 CDN 日志未采集,边缘 5xx 数据不可得\n"
+				case cdn.SampleSize > 0:
+					output += fmt.Sprintf("- CDN 日志: 窗口内命中 %d 条(采样 %d 条),边缘 5xx %d 条\n", cdn.Total, cdn.SampleSize, cdn.Status5xx)
+					if cdn.Status5xx > 0 {
+						output += "- 解读: CDN 边缘在窗口内返回 5xx,不可用可能就在 CDN 这一跳\n"
+					} else {
+						output += "- 解读: CDN 边缘无 5xx,转发正常,不可用不在 CDN 这一跳\n"
+					}
+				default:
+					output += fmt.Sprintf("- CDN 日志: 窗口内命中 %d 条(采样为空,无法统计 5xx)\n", cdn.Total)
+				}
+			}
+		}
+		if report.EdgeFacts.SLB != nil {
+			slb := report.EdgeFacts.SLB
+			if len(slb.Backends) > 0 {
+				backends := make([]string, 0, len(slb.Backends))
+				for _, b := range slb.Backends {
+					if b.Service != "" && b.TargetIP != "" {
+						backends = append(backends, fmt.Sprintf("%s(%s:%d)", b.Service, b.TargetIP, b.Port))
+					} else if b.Service != "" {
+						backends = append(backends, b.Service)
+					} else if b.TargetIP != "" {
+						backends = append(backends, b.TargetIP)
+					}
+				}
+				if len(backends) > 0 {
+					output += "- SLB 后端: " + strings.Join(backends, " · ") + "\n"
+				}
+			}
+			output += fmt.Sprintf("- SLB 窗口内命中 %d 条(采样 %d 条),5xx %d 条\n", slb.Total, slb.SampleSize, slb.Status5xx)
+			switch {
+			case slb.Status5xx > 0:
+				output += "- 解读: SLB→后端在窗口内出现 5xx,不可用大概率在这一跳\n"
+			case slb.Total > 0:
+				output += "- 解读: SLB→后端转发正常(无 5xx),不可用不在 SLB 这一跳\n"
+			default:
+				output += "- 解读: 窗口内该域名无 SLB 记录,探测流量可能未到达 SLB\n"
+			}
 		}
 		output += "\n"
 	}
@@ -334,36 +455,54 @@ func getStringSlice(m map[string]interface{}, key string) []string {
 	return []string{}
 }
 
-// CreateMonitorTools creates the standard set of tools for MonitorAgent.
-func CreateMonitorTools() []*tool.Tool {
+// BoundTools returns the monitor's tools bound to its REAL RCA engine and data
+// sources. (The old package-level CreateMonitorTools returned stubs telling the
+// LLM to "use the method directly" — a dead end a model cannot call.)
+func (m *MonitorAgent) BoundTools() []*tool.Tool {
 	return []*tool.Tool{
-		createAnalyzeIncidentTool(),
-		createQueryMetricsTool(),
-		createQueryLogsTool(),
-		createQueryTracesTool(),
-		createGetTopologyTool(),
+		m.analyzeIncidentTool(),
+		m.queryMetricsTool(),
+		m.queryLogsTool(),
+		m.queryTracesTool(),
+		m.getTopologyTool(),
 	}
 }
 
-// createAnalyzeIncidentTool creates the RCA analysis tool.
-func createAnalyzeIncidentTool() *tool.Tool {
+// timeRange extracts start/end from tool params, defaulting to the last hour.
+func timeRange(params map[string]interface{}) (time.Time, time.Time) {
+	end := time.Now()
+	start := end.Add(-time.Hour)
+	if v, ok := params["start_time"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			start = t
+		}
+	}
+	if v, ok := params["end_time"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			end = t
+		}
+	}
+	return start, end
+}
+
+// analyzeIncidentTool runs the real RCA engine over a structured incident.
+func (m *MonitorAgent) analyzeIncidentTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
 			"incident_id": {"type": "string", "description": "Unique identifier for the incident"},
-			"start_time": {"type": "string", "description": "Incident start time in RFC3339 format"},
-			"end_time": {"type": "string", "description": "Incident end time in RFC3339 format"},
+			"start_time": {"type": "string", "description": "Incident start time in RFC3339 format (default 1h ago)"},
+			"end_time": {"type": "string", "description": "Incident end time in RFC3339 format (default now)"},
 			"severity": {"type": "string", "description": "Incident severity (P0-P4)", "enum": ["P0", "P1", "P2", "P3", "P4"]},
 			"affected_services": {"type": "array", "items": {"type": "string"}, "description": "List of affected service names"},
 			"description": {"type": "string", "description": "Incident description"}
-		},
-		"required": ["incident_id", "start_time", "end_time", "severity"]
+		}
 	}`
 
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "analyze_incident",
-			Description: "Perform Root Cause Analysis (RCA) on a production incident using multi-dimensional scoring",
+			Description: "Perform Root Cause Analysis (RCA) on a production incident using multi-dimensional scoring over real logs/metrics/topology/changes",
 			Source:      tool.DataSourceTypeGeneric,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
@@ -375,122 +514,246 @@ func createAnalyzeIncidentTool() *tool.Tool {
 				"Identify root cause of latency increases",
 			},
 		},
-		IsAvailable: func(config map[string]interface{}) bool { return true },
+		IsAvailable: func(map[string]interface{}) bool { return m.rcaEngine != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"status": "use MonitorAgent.AnalyzeIncident method directly"}, nil
+			if m.rcaEngine == nil {
+				return nil, fmt.Errorf("RCA engine not initialized")
+			}
+			id := getString(params, "incident_id")
+			if id == "" {
+				id = fmt.Sprintf("tool-%d", time.Now().UnixNano())
+			}
+			start, end := timeRange(params)
+			severity := getString(params, "severity")
+			if severity == "" {
+				severity = "P3"
+			}
+			incident := &models.Incident{
+				ID:               id,
+				DetectedAt:       time.Now(),
+				StartTime:        start,
+				EndTime:          end,
+				Severity:         severity,
+				Description:      getString(params, "description"),
+				AffectedServices: getStringSlice(params, "affected_services"),
+			}
+			report, err := m.AnalyzeIncident(ctx, incident)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]interface{}{
+				"incident_id": report.Incident.ID,
+				"confidence":  report.Confidence,
+				"summary":     report.GetSummary(),
+				"report":      m.formatRCAReport(report),
+			}, nil
 		},
 	}
 }
 
-// createQueryMetricsTool creates the metrics query tool.
-func createQueryMetricsTool() *tool.Tool {
+// queryMetricsTool queries the real metric source for anomalous series.
+func (m *MonitorAgent) queryMetricsTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
-			"query": {"type": "string", "description": "Prometheus query expression"},
-			"start_time": {"type": "string", "description": "Query start time in RFC3339 format"},
-			"end_time": {"type": "string", "description": "Query end time in RFC3339 format"},
-			"step": {"type": "string", "description": "Query resolution step (e.g., '1m', '5m')"}
-		},
-		"required": ["query", "start_time", "end_time"]
+			"start_time": {"type": "string", "description": "Query start time in RFC3339 format (default 1h ago)"},
+			"end_time": {"type": "string", "description": "Query end time in RFC3339 format (default now)"}
+		}
 	}`
 
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "query_metrics",
-			Description: "Query time-series metrics from Prometheus",
+			Description: "Query anomalous time-series metrics (Prometheus) in the window",
 			Source:      tool.DataSourceTypePrometheus,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
 			SideEffect:  guardrails.SideEffectReadOnly,
 			Category:    "metrics",
 		},
+		IsAvailable: func(map[string]interface{}) bool { return m.sources != nil && m.sources.MetricSource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"message": "metrics query - to be implemented with Prometheus integration", "query": params["query"]}, nil
+			if m.sources == nil || m.sources.MetricSource == nil {
+				return nil, fmt.Errorf("metric source not configured")
+			}
+			start, end := timeRange(params)
+			series, err := m.sources.MetricSource.QueryAnomalies(ctx, start, end)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]map[string]interface{}, 0, len(series))
+			for _, sr := range series {
+				item := map[string]interface{}{
+					"name":   sr.Name,
+					"labels": sr.Labels,
+					"points": len(sr.DataPoints),
+				}
+				if n := len(sr.DataPoints); n > 0 {
+					item["latest_value"] = sr.DataPoints[n-1].Value
+					item["latest_time"] = sr.DataPoints[n-1].Timestamp.Format(time.RFC3339)
+				}
+				out = append(out, item)
+			}
+			return map[string]interface{}{"count": len(out), "anomaly_series": out}, nil
 		},
 	}
 }
 
-// createQueryLogsTool creates the log query tool.
-func createQueryLogsTool() *tool.Tool {
+// queryLogsTool queries the real log source; a service name scopes the query
+// to that service's store (fast path), otherwise it scans error logs globally.
+func (m *MonitorAgent) queryLogsTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
-			"query": {"type": "string", "description": "Log query expression"},
-			"start_time": {"type": "string", "description": "Query start time in RFC3339 format"},
-			"end_time": {"type": "string", "description": "Query end time in RFC3339 format"},
-			"limit": {"type": "integer", "description": "Maximum number of log entries to return", "default": 100}
-		},
-		"required": ["query", "start_time", "end_time"]
+			"service": {"type": "string", "description": "Service name to scope the query (recommended: much faster)"},
+			"start_time": {"type": "string", "description": "Query start time in RFC3339 format (default 1h ago)"},
+			"end_time": {"type": "string", "description": "Query end time in RFC3339 format (default now)"},
+			"limit": {"type": "integer", "description": "Max sample entries to return", "default": 20}
+		}
 	}`
 
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "query_logs",
-			Description: "Query error logs from SLS for the specified time range",
+			Description: "Query error logs in the window, optionally scoped to one service",
 			Source:      tool.DataSourceTypeSLS,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
 			SideEffect:  guardrails.SideEffectReadOnly,
 			Category:    "logs",
 		},
+		IsAvailable: func(map[string]interface{}) bool { return m.sources != nil && m.sources.LogSource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"message": "log query - to be implemented with SLS integration", "query": params["query"]}, nil
+			if m.sources == nil || m.sources.LogSource == nil {
+				return nil, fmt.Errorf("log source not configured")
+			}
+			start, end := timeRange(params)
+			var entries []models.LogEntry
+			var err error
+			if svc := getString(params, "service"); svc != "" {
+				entries, err = m.sources.LogSource.QueryErrorsByService(ctx, svc, start, end)
+			} else {
+				entries, err = m.sources.LogSource.QueryErrors(ctx, start, end)
+			}
+			if err != nil {
+				return nil, err
+			}
+			limit := 20
+			if v, ok := params["limit"].(float64); ok && int(v) > 0 {
+				limit = int(v)
+			}
+			sample := make([]map[string]interface{}, 0, limit)
+			for i, e := range entries {
+				if i >= limit {
+					break
+				}
+				msg := e.Message
+				if len(msg) > 200 {
+					msg = msg[:200] + "…"
+				}
+				sample = append(sample, map[string]interface{}{
+					"timestamp": e.Timestamp.Format(time.RFC3339),
+					"service":   e.Service,
+					"level":     e.Level,
+					"message":   msg,
+				})
+			}
+			return map[string]interface{}{"total": len(entries), "sample": sample}, nil
 		},
 	}
 }
 
-// createQueryTracesTool creates the trace query tool.
-func createQueryTracesTool() *tool.Tool {
+// queryTracesTool queries the real trace source. The trace dimension is
+// currently backed by an empty source (tracing data lives in Prometheus in
+// this deployment), so an empty result is the honest steady state.
+func (m *MonitorAgent) queryTracesTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
 		"properties": {
-			"service": {"type": "string", "description": "Service name to filter traces"},
-			"start_time": {"type": "string", "description": "Query start time in RFC3339 format"},
-			"end_time": {"type": "string", "description": "Query end time in RFC3339 format"},
-			"has_error": {"type": "boolean", "description": "Filter only error traces", "default": true},
-			"limit": {"type": "integer", "description": "Maximum number of traces to return", "default": 50}
-		},
-		"required": ["start_time", "end_time"]
+			"start_time": {"type": "string", "description": "Query start time in RFC3339 format (default 1h ago)"},
+			"end_time": {"type": "string", "description": "Query end time in RFC3339 format (default now)"}
+		}
 	}`
 
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "query_traces",
-			Description: "Query distributed traces from ARMS",
+			Description: "Query error traces in the window (empty until a tracing backend is wired)",
 			Source:      tool.DataSourceTypeARMS,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
 			SideEffect:  guardrails.SideEffectReadOnly,
 			Category:    "traces",
 		},
+		IsAvailable: func(map[string]interface{}) bool { return m.sources != nil && m.sources.TraceSource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"message": "trace query - to be implemented with ARMS integration", "service": params["service"]}, nil
+			if m.sources == nil || m.sources.TraceSource == nil {
+				return nil, fmt.Errorf("trace source not configured")
+			}
+			start, end := timeRange(params)
+			traces, err := m.sources.TraceSource.QueryErrorTraces(ctx, start, end)
+			if err != nil {
+				return nil, err
+			}
+			const maxTraces = 10
+			if len(traces) > maxTraces {
+				traces = traces[:maxTraces]
+			}
+			return map[string]interface{}{"count": len(traces), "traces": traces}, nil
 		},
 	}
 }
 
-// createGetTopologyTool creates the topology query tool.
-func createGetTopologyTool() *tool.Tool {
+// getTopologyTool queries the real topology source (ARMS APM when configured).
+func (m *MonitorAgent) getTopologyTool() *tool.Tool {
 	inputSchema := `{
 		"type": "object",
-		"properties": {
-			"service": {"type": "string", "description": "Service name to get topology for (optional, returns full topology if omitted)"}
-		}
+		"properties": {}
 	}`
 
 	return &tool.Tool{
 		Metadata: &tool.ToolMetadata{
 			Name:        "get_topology",
-			Description: "Get service dependency topology from ARMS",
+			Description: "Get the service dependency topology (nodes + edges)",
 			Source:      tool.DataSourceTypeARMS,
 			InputSchema: []byte(inputSchema),
 			Tier:        guardrails.TierSafe,
 			SideEffect:  guardrails.SideEffectReadOnly,
 			Category:    "topology",
 		},
+		IsAvailable: func(map[string]interface{}) bool { return m.sources != nil && m.sources.TopologySource != nil },
 		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
-			return map[string]interface{}{"message": "topology query - to be implemented with ARMS integration"}, nil
+			if m.sources == nil || m.sources.TopologySource == nil {
+				return nil, fmt.Errorf("topology source not configured")
+			}
+			topo, err := m.sources.TopologySource.GetTopology(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if topo == nil {
+				return map[string]interface{}{"node_count": 0, "edge_count": 0}, nil
+			}
+			const maxItems = 30
+			names := make([]string, 0, len(topo.Nodes))
+			for i, n := range topo.Nodes {
+				if i >= maxItems {
+					break
+				}
+				names = append(names, n.Name)
+			}
+			edges := make([]string, 0, len(topo.Edges))
+			for i, e := range topo.Edges {
+				if i >= maxItems {
+					break
+				}
+				edges = append(edges, e.From+"->"+e.To)
+			}
+			return map[string]interface{}{
+				"node_count":   len(topo.Nodes),
+				"edge_count":   len(topo.Edges),
+				"services":     names,
+				"dependencies": edges,
+			}, nil
 		},
 	}
 }

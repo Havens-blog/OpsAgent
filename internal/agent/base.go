@@ -27,6 +27,8 @@ const (
 	AgentTypeMonitor AgentType = "monitor"
 	// AgentTypeInspector represents the inspector agent.
 	AgentTypeInspector AgentType = "inspector"
+	// AgentTypeTopology represents the resource-topology / CMDB agent.
+	AgentTypeTopology AgentType = "resource_topology"
 )
 
 // Message represents a message in the conversation.

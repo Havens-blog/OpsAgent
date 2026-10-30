@@ -64,6 +64,7 @@ func NewDataSourceConfigFromEnv() *DataSourceConfig {
 		ECamTenantID:       envInt64("ECAM_LOGQUERY_TENANT_ID"),
 		ECamLogType:        os.Getenv("ECAM_LOGQUERY_LOG_TYPE"),
 		ECamTimeout:        os.Getenv("ECAM_LOGQUERY_TIMEOUT"),
+		CMDBEndpoint:       os.Getenv("CMDB_ENDPOINT"),
 		LogSources:         logSourcesFromEnv(),
 	}
 }
@@ -171,6 +172,9 @@ type DataSourceConfig struct {
 	ECamTenantID     int64  // S2S 令牌绑定的租户（eiam 校验 allowed_tenants）
 	ECamLogType      string // default "app"
 	ECamTimeout      string // Go duration; default "30s"
+	// CMDBEndpoint is the e-cmdb service base URL (resource topology + domain
+	// origins). Auth reuses the same EIAM S2S token as e-cam (ECamTokenURL/...).
+	CMDBEndpoint string
 	// LogSources lists the cloud log backends to query. Multiple entries are
 	// queried concurrently and merged (multi-cloud aggregation). Empty => mock.
 	LogSources []LogSourceConfig
@@ -222,7 +226,7 @@ func (c *DataSourceConfig) IsEmpty() bool {
 // Defined as a free function, not inline in CreateRCASources, because that
 // function shadows the imported `sources` package with a local variable of the
 // same name — so the package is only reachable from here.
-func buildLogSources(cfg *DataSourceConfig) sources.LogSource {
+func buildLogSources(cfg *DataSourceConfig, ecamTP sources.TokenProvider) sources.LogSource {
 	if cfg == nil || (len(cfg.LogSources) == 0 && cfg.ECamEndpoint == "") {
 		return nil
 	}
@@ -244,10 +248,8 @@ func buildLogSources(cfg *DataSourceConfig) sources.LogSource {
 			}
 		}
 		ecam := sources.NewECamLogSource(cfg.ECamEndpoint, cfg.ECamToken, cfg.ECamLogType, timeout)
-		if cfg.ECamTokenURL != "" {
-			ecam.WithTokenProvider(sources.NewServiceTokenProvider(
-				cfg.ECamTokenURL, cfg.ECamClientID, cfg.ECamClientSecret, cfg.ECamTenantID,
-			))
+		if ecamTP != nil {
+			ecam.WithTokenProvider(ecamTP)
 		}
 		if pingOK(ecam) {
 			named = append(named, sources.NamedLogSource{Name: "e-cam-federation", Source: ecam})
@@ -352,7 +354,18 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 	}
 
 	result := &RCASources{}
-	result.LogSource = buildLogSources(cfg)
+
+	// One shared S2S token provider for every e-cam source (log federation +
+	// k8s events): each provider caches its token under its own mutex, so
+	// sharing one instance avoids duplicated client_credentials exchanges.
+	var ecamTP sources.TokenProvider
+	if cfg.ECamTokenURL != "" {
+		ecamTP = sources.NewServiceTokenProvider(
+			cfg.ECamTokenURL, cfg.ECamClientID, cfg.ECamClientSecret, cfg.ECamTenantID,
+		)
+	}
+
+	result.LogSource = buildLogSources(cfg, ecamTP)
 
 	if cfg.PrometheusEndpoint != "" {
 		promSource, err := integrations.NewPrometheusMetricSourceWithToken(cfg.PrometheusEndpoint, cfg.PrometheusToken)
@@ -395,7 +408,139 @@ func CreateRCASources(cfg *DataSourceConfig) (*RCASources, error) {
 		}
 	}
 
+	// K8s events via the e-cam federation (log_type "k8s-event") → resource
+	// failures (OOMKilled/Unhealthy/...). Reuses the S2S token path that already
+	// feeds the log dimension; becomes the ChangeSource when configured. Absent
+	// creds leave the change dimension empty, never fabricated.
+	if cfg.ECamEndpoint != "" {
+		timeout := time.Duration(0)
+		if cfg.ECamTimeout != "" {
+			if d, err := time.ParseDuration(cfg.ECamTimeout); err == nil {
+				timeout = d
+			}
+		}
+		k8sEvt := sources.NewECamK8sEventSource(cfg.ECamEndpoint, cfg.ECamToken, timeout)
+		if ecamTP != nil {
+			k8sEvt.WithTokenProvider(ecamTP)
+		}
+		if pingOK(k8sEvt) {
+			result.ChangeSource = k8sEvt
+		}
+
+		// WAF attack facts (log_type "waf", resources-scoped per domain): the
+		// only dimension that can explain a WAF alarm. Same S2S token path.
+		wafSrc := sources.NewECamWAFSource(cfg.ECamEndpoint, cfg.ECamToken, timeout)
+		if ecamTP != nil {
+			wafSrc.WithTokenProvider(ecamTP)
+		}
+		if pingOK(wafSrc) {
+			result.WAFSource = wafSrc
+		}
+
+		// Domain -> backend service (log_type "slb", host -> server_group_name):
+		// anchors a dial-test alarm on the real gateway. Same S2S token path.
+		slbSrc := sources.NewECamLogSource(cfg.ECamEndpoint, cfg.ECamToken, "slb", timeout)
+		if ecamTP != nil {
+			slbSrc.WithTokenProvider(ecamTP)
+		}
+		if pingOK(slbSrc) {
+			result.BackendResolver = slbSrc
+			result.SLBEdgeResolver = slbSrc
+		}
+	}
+
+	// CDN edge facts: the CMDB supplies the CDN hop (provider/CNAME/origin)
+	// and the e-cam CDN access-log federation supplies the hit count. The CDN
+	// log is per-domain configured, so a domain whose collection is off comes
+	// back 0 — the CMDB chain still renders and the report says so honestly.
+	if cfg.CMDBEndpoint != "" {
+		cmdbSrc := sources.NewCMDBDataSource(cfg.CMDBEndpoint, 30*time.Second)
+		if ecamTP != nil {
+			cmdbSrc.WithTokenProvider(ecamTP)
+		}
+		var cdnLogSrc *sources.ECamLogSource
+		if cfg.ECamEndpoint != "" {
+			cdnLogSrc = sources.NewECamLogSource(cfg.ECamEndpoint, cfg.ECamToken, "cdn", 30*time.Second)
+			if ecamTP != nil {
+				cdnLogSrc.WithTokenProvider(ecamTP)
+			}
+		}
+		result.CDNEdgeResolver = &cdnEdgeResolver{
+			cmdb:     cmdbSrc,
+			cdnLog:   cdnLogSrc,
+			tenantID: cfg.ECamTenantID,
+		}
+	}
+
 	return result, nil
+}
+
+// cdnEdgeResolver composes the two CDN data paths the edge section needs: the
+// CMDB (provider/CNAME/origin chain) and the e-cam CDN access-log federation
+// (hit count). Either half may be absent and the other still reports.
+type cdnEdgeResolver struct {
+	cmdb     *sources.CMDBDataSource
+	cdnLog   *sources.ECamLogSource
+	tenantID int64
+}
+
+func (r *cdnEdgeResolver) QueryDomainCDN(ctx context.Context, domain string, start, end time.Time) (*models.CDNEdgeFacts, error) {
+	facts := &models.CDNEdgeFacts{}
+	if r.cmdb != nil {
+		if d, err := r.cmdb.LookupDomain(ctx, r.tenantID, domain); err == nil && d != nil {
+			facts.Provider = d.Provider
+			facts.CNAME = d.CNAME
+			facts.OriginHost = d.OriginHost
+			facts.OriginType = d.OriginType
+		}
+	}
+	if r.cdnLog != nil {
+		if total, status5xx, sampleSize, err := r.cdnLog.QueryDomainCDNLog(ctx, domain, start, end); err == nil {
+			facts.Total = total
+			facts.SampleSize = sampleSize
+			facts.Status5xx = status5xx
+			facts.LogChecked = true
+		}
+	}
+	return facts, nil
+}
+
+// NewCMDBDataSourceFromConfig builds the e-cmdb resource-topology source when
+// CMDB_ENDPOINT is configured. Auth reuses the EIAM S2S token (the CMDB
+// verifies EIAM-issued tokens). nil when the endpoint is absent.
+func NewCMDBDataSourceFromConfig(cfg *DataSourceConfig) *sources.CMDBDataSource {
+	if cfg == nil || cfg.CMDBEndpoint == "" {
+		return nil
+	}
+	src := sources.NewCMDBDataSource(cfg.CMDBEndpoint, 30*time.Second)
+	if cfg.ECamTokenURL != "" {
+		src.WithTokenProvider(sources.NewServiceTokenProvider(
+			cfg.ECamTokenURL, cfg.ECamClientID, cfg.ECamClientSecret, cfg.ECamTenantID,
+		))
+	}
+	return src
+}
+
+// NewECamSLBSourceFromConfig builds a dedicated e-cam log source for SLB/ALB
+// access-log queries (domain -> backend service). Shares the same EIAM S2S
+// token as the app-log source. nil when e-cam is absent.
+func NewECamSLBSourceFromConfig(cfg *DataSourceConfig) *sources.ECamLogSource {
+	if cfg == nil || cfg.ECamEndpoint == "" {
+		return nil
+	}
+	timeout := time.Duration(0)
+	if cfg.ECamTimeout != "" {
+		if d, err := time.ParseDuration(cfg.ECamTimeout); err == nil {
+			timeout = d
+		}
+	}
+	src := sources.NewECamLogSource(cfg.ECamEndpoint, cfg.ECamToken, "slb", timeout)
+	if cfg.ECamTokenURL != "" {
+		src.WithTokenProvider(sources.NewServiceTokenProvider(
+			cfg.ECamTokenURL, cfg.ECamClientID, cfg.ECamClientSecret, cfg.ECamTenantID,
+		))
+	}
+	return src
 }
 
 // CreateRCASourcesWithFallback builds real data sources from cfg and fills any
@@ -412,6 +557,7 @@ func CreateRCASourcesWithFallback(cfg *DataSourceConfig) (*RCASources, map[strin
 		"topology": false,
 		"changes":  false,
 		"logs":     false, // upgraded to true below when a real log source connects
+		"waf":      false, // upgraded when the e-cam WAF federation connects
 	}
 
 	real := &RCASources{}
@@ -435,6 +581,7 @@ func CreateRCASourcesWithFallback(cfg *DataSourceConfig) (*RCASources, map[strin
 		TraceSource:    sources.NewEmptyTraceSource(),
 		TopologySource: sources.NewEmptyTopologySource(),
 		ChangeSource:   sources.NewEmptyChangeSource(),
+		WAFSource:      sources.NewEmptyWAFSource(),
 	}
 	if real.LogSource != nil {
 		result.LogSource = real.LogSource
@@ -451,6 +598,19 @@ func CreateRCASourcesWithFallback(cfg *DataSourceConfig) (*RCASources, map[strin
 	if real.ChangeSource != nil {
 		result.ChangeSource = real.ChangeSource
 		active["changes"] = true
+	}
+	if real.WAFSource != nil {
+		result.WAFSource = real.WAFSource
+		active["waf"] = true
+	}
+	if real.BackendResolver != nil {
+		result.BackendResolver = real.BackendResolver
+	}
+	if real.SLBEdgeResolver != nil {
+		result.SLBEdgeResolver = real.SLBEdgeResolver
+	}
+	if real.CDNEdgeResolver != nil {
+		result.CDNEdgeResolver = real.CDNEdgeResolver
 	}
 
 	return result, active
@@ -611,6 +771,22 @@ func (m *MockLogSource) QueryErrors(ctx context.Context, start, end time.Time) (
 			Message:   "Timeout waiting for response from api-gateway",
 		},
 	}, nil
+}
+
+// QueryErrorsByService filters the mock error stream by service, mirroring
+// the real sources' store-scoped semantics.
+func (m *MockLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	all, err := m.QueryErrors(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+	var filtered []models.LogEntry
+	for _, entry := range all {
+		if entry.Service == service {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered, nil
 }
 
 func (m *MockLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {

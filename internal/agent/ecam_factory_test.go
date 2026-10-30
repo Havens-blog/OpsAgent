@@ -32,7 +32,7 @@ func TestBuildLogSourcesECamFederation(t *testing.T) {
 		ECamToken:    "tok",
 		ECamTimeout:  (3 * time.Second).String(),
 	}
-	got := buildLogSources(cfg)
+	got := buildLogSources(cfg, nil)
 	if got == nil {
 		t.Fatalf("e-cam 配置 + 可达应产出日志源")
 	}
@@ -42,7 +42,7 @@ func TestBuildLogSourcesECamFederation(t *testing.T) {
 	}
 
 	// 不可达端点:跳过(渐进增强,不阻塞启动)
-	dead := buildLogSources(&DataSourceConfig{ECamEndpoint: "http://127.0.0.1:1", ECamToken: "t"})
+	dead := buildLogSources(&DataSourceConfig{ECamEndpoint: "http://127.0.0.1:1", ECamToken: "t"}, nil)
 	if dead != nil {
 		t.Fatalf("e-cam 不可达应跳过, got %v", dead)
 	}

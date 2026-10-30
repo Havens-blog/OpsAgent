@@ -14,10 +14,13 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 )
 
-// agentExecutor is the package-internal contract a delegate must satisfy. It
-// lets the coordinator dispatch to a concrete agent's Execute instead of always
-// falling back to BaseAgent.Execute.
-type agentExecutor interface {
+// SpecialistAgent is a sub-agent registered with the Coordinator: it executes
+// tasks and describes itself for LLM routing. Registered as an interface so
+// delegation dispatches to the specialist's TYPED Execute override — Go
+// dispatches statically on *BaseAgent, so the old *BaseAgent registry silently
+// bypassed the real capability paths (RCA engine, log analysis) and reduced
+// every delegation to a bare LLM chat.
+type SpecialistAgent interface {
 	Execute(ctx context.Context, task *Task) (*ExecutionResult, error)
 	GetConfig() *AgentConfig
 }
@@ -26,7 +29,7 @@ type agentExecutor interface {
 // It decomposes tasks, delegates to specialized agents, and aggregates results.
 type CoordinatorAgent struct {
 	*BaseAgent
-	agents      map[string]agentExecutor
+	agents      map[string]SpecialistAgent
 	mu          sync.RWMutex
 	subTasks    map[string][]*TaskSubmission
 	taskCounter int64
@@ -81,14 +84,14 @@ When delegating:
 
 	return &CoordinatorAgent{
 		BaseAgent:   base,
-		agents:      make(map[string]agentExecutor),
+		agents:      make(map[string]SpecialistAgent),
 		subTasks:    make(map[string][]*TaskSubmission),
 		taskCounter: 0,
 	}, nil
 }
 
 // RegisterAgent registers a specialized agent for delegation.
-func (c *CoordinatorAgent) RegisterAgent(name string, agent agentExecutor) error {
+func (c *CoordinatorAgent) RegisterAgent(name string, agent SpecialistAgent) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -290,6 +293,8 @@ var knownTypeAgent = map[string]string{
 	"rca":          "monitor",
 	"log_analysis": "log_analyst",
 	"inspection":   "inspector",
+	"topology":     "resource_topology",
+	"cmdb":         "resource_topology",
 }
 
 // createExecutionPlan analyzes the task and creates an execution plan.
@@ -314,7 +319,7 @@ func (c *CoordinatorAgent) createExecutionPlan(ctx context.Context, task *Task) 
 	// (1) Explicit type fast-path.
 	if taskType, ok := task.Params["type"].(string); ok {
 		if agentName, known := knownTypeAgent[taskType]; known {
-			plan.Delegations = append(plan.Delegations, c.newDelegation(agentName, taskType, task))
+			plan.Delegations = append(plan.Delegations, c.newDelegation(agentName, taskType, task, nil))
 			return plan, nil
 		}
 		// Unknown explicit type: fall through to LLM / direct rather than
@@ -336,14 +341,38 @@ func (c *CoordinatorAgent) createExecutionPlan(ctx context.Context, task *Task) 
 	return plan, nil
 }
 
-// newDelegation builds a sub-task delegation for the named agent.
-func (c *CoordinatorAgent) newDelegation(agentName, suffix string, task *Task) TaskDelegation {
+// agentTaskType maps a specialist to its typed-task route, so delegated tasks
+// deterministically hit the specialist's real capability path even when the
+// caller/LLM omitted the type.
+var agentTaskType = map[string]string{
+	"monitor":           "rca",
+	"log_analyst":       "log_analysis",
+	"inspector":         "inspection",
+	"resource_topology": "topology",
+}
+
+// newDelegation builds a sub-task delegation for the named agent. Params are
+// CLONED (never shared with the original task), overlaid with LLM-extracted
+// params, and stamped with the agent's task type.
+func (c *CoordinatorAgent) newDelegation(agentName, suffix string, task *Task, extra map[string]interface{}) TaskDelegation {
+	params := make(map[string]interface{}, len(task.Params)+len(extra)+1)
+	for k, v := range task.Params {
+		params[k] = v
+	}
+	for k, v := range extra {
+		params[k] = v
+	}
+	if _, exists := params["type"]; !exists {
+		if t, ok := agentTaskType[agentName]; ok {
+			params["type"] = t
+		}
+	}
 	return TaskDelegation{
 		AgentName: agentName,
 		Task: &Task{
 			ID:          fmt.Sprintf("%s-%s", task.ID, suffix),
 			Description: task.Description,
-			Params:      task.Params,
+			Params:      params,
 			CreatedAt:   time.Now(),
 			Status:      "pending",
 		},
@@ -398,19 +427,26 @@ func (c *CoordinatorAgent) routeWithLLM(ctx context.Context, task *Task) (*Execu
 
 	prompt := fmt.Sprintf(`You are routing an operations request to specialist agents.
 
+Current time: %s
 Available agents:
 %s
 User request:
 %q
 
-Choose the agent(s) best suited to handle this request. Respond with ONLY a
-JSON object, no prose, in this exact shape:
-{"strategy":"sequential|parallel","agents":["<agent-name>", ...]}
+Choose the agent(s) best suited to handle this request, and extract the
+parameters each needs from the request (omit fields it does not imply).
+Respond with ONLY a JSON object, no prose, in this exact shape:
+{"strategy":"sequential|parallel","delegations":[{"agent":"<name>","params":{...}}, ...]}
+
+Params per agent:
+- log_analyst: {"service":"<svc>","start_time":"<RFC3339>","end_time":"<RFC3339>"}
+- monitor: {"incident":{"id":"<short-slug>","start_time":"<RFC3339>","end_time":"<RFC3339>","severity":"P0|P1|P2|P3|P4","affected_services":["<svc>"],"description":"<what happened>"}}
+- inspector: {"inspection_type":"cloud_resources|elasticsearch|compliance"}
 
 Rules:
-- "agents" must be a non-empty subset of the available agent names above.
+- every "agent" must be one of the available agent names above.
 - Use "parallel" only when the chosen agents can work independently.
-- If a single agent suffices, return just that one.`, catalog.String(), task.Description)
+- If a single agent suffices, return just that one.`, time.Now().Format(time.RFC3339), catalog.String(), task.Description)
 
 	messages := []llm.ClaudeMessage{{Role: "user", Content: prompt}}
 	raw, err := c.llmClient.Chat(ctx, messages)
@@ -433,8 +469,12 @@ func (c *CoordinatorAgent) parsePlanJSON(raw string, valid map[string]bool, task
 	}
 
 	var parsed struct {
-		Strategy string   `json:"strategy"`
-		Agents   []string `json:"agents"`
+		Strategy    string   `json:"strategy"`
+		Agents      []string `json:"agents"` // legacy shape: bare names
+		Delegations []struct {
+			Agent  string                 `json:"agent"`
+			Params map[string]interface{} `json:"params"`
+		} `json:"delegations"`
 	}
 	if err := json.Unmarshal([]byte(raw[start:end+1]), &parsed); err != nil {
 		return nil, fmt.Errorf("malformed routing JSON: %w", err)
@@ -451,13 +491,19 @@ func (c *CoordinatorAgent) parsePlanJSON(raw string, valid map[string]bool, task
 		Dependencies: make(map[string][]string),
 	}
 	seen := make(map[string]bool)
-	for _, name := range parsed.Agents {
+	add := func(name string, params map[string]interface{}) {
 		name = strings.TrimSpace(name)
 		if !valid[name] || seen[name] {
-			continue // drop unknown/duplicate agents
+			return // drop unknown/duplicate agents
 		}
 		seen[name] = true
-		plan.Delegations = append(plan.Delegations, c.newDelegation(name, name, task))
+		plan.Delegations = append(plan.Delegations, c.newDelegation(name, name, task, params))
+	}
+	for _, d := range parsed.Delegations {
+		add(d.Agent, d.Params)
+	}
+	for _, name := range parsed.Agents {
+		add(name, nil)
 	}
 
 	if len(plan.Delegations) == 0 {
