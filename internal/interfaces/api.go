@@ -189,11 +189,25 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		observability.Bool("waf_real", dsActive["waf"]),
 	)
 
-	// Initialize RCA report store
-	// Start with an empty report store. Reports appear here only from real
-	// analyses run via POST /api/v1/rca/analyze, so the console never shows
-	// seeded/demo data masquerading as real results.
+	// Initialize RCA report store. Reports appear here only from real analyses
+	// run via POST /api/v1/rca/analyze, so the console never shows seeded/demo
+	// data masquerading as real results. Use the disk-backed store when the
+	// path is configured, falling back to memory so the server still starts
+	// without it or when the snapshot is corrupt/unwritable.
 	rcaStore := rca.NewMemoryRCAReportStore()
+	rcaPath := strings.TrimSpace(os.Getenv("OPSAGENT_RCA_PATH"))
+	if rcaPath == "" {
+		logger.Warn("RCA report persistence disabled, using in-memory store",
+			observability.String("hint", "set OPSAGENT_RCA_PATH to persist RCA reports across restarts"),
+		)
+	} else if fs, err := rca.NewFileBackedRCAReportStore(rcaPath); err != nil {
+		logger.Warn("Persistent RCA report store unavailable, using in-memory fallback",
+			observability.String("path", rcaPath),
+			observability.Err(err),
+		)
+	} else {
+		rcaStore = fs
+	}
 
 	// Initialize chat service (nil-safe - if LLM not configured, chat endpoints return 503)
 	llmConfig := settings.ToLLMConfig()
