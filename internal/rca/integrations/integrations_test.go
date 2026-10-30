@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,9 +101,9 @@ func TestPrometheusGetAlerts(t *testing.T) {
 				{
 					"labels":      map[string]string{"alertname": "HighErrorRate", "service": "api-service"},
 					"annotations": map[string]string{"summary": "High error rate detected", "description": "Error rate exceeds 5%"},
-					"state":        "firing",
-					"startsAt":     time.Now().Add(-10 * time.Minute).Format(time.RFC3339),
-					"endsAt":       "0001-01-01T00:00:00Z",
+					"state":       "firing",
+					"startsAt":    time.Now().Add(-10 * time.Minute).Format(time.RFC3339),
+					"endsAt":      "0001-01-01T00:00:00Z",
 				},
 			},
 		},
@@ -137,10 +138,10 @@ func TestPrometheusGetAlerts(t *testing.T) {
 
 func TestBuildQuery(t *testing.T) {
 	tests := []struct {
-		name       string
-		metric     string
-		filters    map[string]string
-		wantQuery  string
+		name      string
+		metric    string
+		filters   map[string]string
+		wantQuery string
 	}{
 		{"no filters", "http_requests_total", nil, "http_requests_total"},
 		{"with filters", "http_requests_total", map[string]string{"service": "api"}, `http_requests_total{service="api"}`},
@@ -525,6 +526,173 @@ func TestPrometheusQueryMetricsForService(t *testing.T) {
 	}
 }
 
+func promMatrixResponse(series []map[string]interface{}) map[string]interface{} {
+	if series == nil {
+		series = []map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "matrix",
+			"result":     series,
+		},
+	}
+}
+
+// newARMSMetricsServer returns a fake Prometheus that answers the three
+// arms_app_* per-service RED queries with one deterministic series each. It
+// records every PromQL query into captured when captured is non-nil.
+func newARMSMetricsServer(t *testing.T, service string, now time.Time, captured *[]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		if captured != nil {
+			*captured = append(*captured, q)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		var metric map[string]string
+		switch {
+		case strings.Contains(q, "arms_app_requests_error_count_raw"):
+			metric = map[string]string{"__name__": "arms_app_errors_per_sec", "service": service}
+		case strings.Contains(q, "arms_app_requests_seconds_raw"):
+			metric = map[string]string{"__name__": "arms_app_latency_ms", "service": service}
+		case strings.Contains(q, "arms_app_throughput_per_sec"):
+			metric = map[string]string{"__name__": "arms_app_throughput_per_sec", "service": service}
+		default:
+			json.NewEncoder(w).Encode(promMatrixResponse(nil))
+			return
+		}
+
+		json.NewEncoder(w).Encode(promMatrixResponse([]map[string]interface{}{
+			{
+				"metric": metric,
+				"values": [][]interface{}{
+					{float64(now.Add(-5 * time.Minute).Unix()), "10.0"},
+				},
+			},
+		}))
+	}))
+}
+
+func TestPrometheusQueryMetricsForServiceARMS(t *testing.T) {
+	service := "prod_pcb-order-service"
+	now := time.Now()
+
+	var captured []string
+	server := newARMSMetricsServer(t, service, now, &captured)
+	defer server.Close()
+
+	src, err := NewPrometheusMetricSource(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to create source: %v", err)
+	}
+
+	series, err := src.QueryMetricsForService(context.Background(), service, now.Add(-15*time.Minute), now)
+	if err != nil {
+		t.Fatalf("QueryMetricsForService() error: %v", err)
+	}
+
+	if len(series) != 3 {
+		t.Fatalf("QueryMetricsForService() returned %d series, want 3 (error/latency/throughput)", len(series))
+	}
+
+	gotNames := map[string]bool{}
+	for _, s := range series {
+		gotNames[s.Name] = true
+		if s.Labels["service"] != service {
+			t.Errorf("series %q missing service label: got %q, want %q", s.Name, s.Labels["service"], service)
+		}
+	}
+	for _, want := range []string{"arms_app_errors_per_sec", "arms_app_latency_ms", "arms_app_throughput_per_sec"} {
+		if !gotNames[want] {
+			t.Errorf("missing expected series %q", want)
+		}
+	}
+
+	joined := strings.Join(captured, "\n")
+	if !strings.Contains(joined, "arms_app_requests_error_count_raw") {
+		t.Errorf("captured PromQL missing arms_app_requests_error_count_raw: %s", joined)
+	}
+	if !strings.Contains(joined, `service="`+service+`"`) {
+		t.Errorf("captured PromQL missing service filter: %s", joined)
+	}
+}
+
+func TestPrometheusQueryMetricsForServiceHTTPFallback(t *testing.T) {
+	service := "prod_pcb-order-service"
+	now := time.Now()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+
+		// ARMS APM counters are empty, forcing the self-hosted fallback path.
+		if strings.Contains(q, "arms_app_") {
+			json.NewEncoder(w).Encode(promMatrixResponse(nil))
+			return
+		}
+
+		json.NewEncoder(w).Encode(promMatrixResponse([]map[string]interface{}{
+			{
+				"metric": map[string]string{"__name__": "http_requests_total", "service": service},
+				"values": [][]interface{}{
+					{float64(now.Add(-5 * time.Minute).Unix()), "100.0"},
+				},
+			},
+		}))
+	}))
+	defer server.Close()
+
+	src, err := NewPrometheusMetricSource(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to create source: %v", err)
+	}
+
+	series, err := src.QueryMetricsForService(context.Background(), service, now.Add(-15*time.Minute), now)
+	if err != nil {
+		t.Fatalf("QueryMetricsForService() error: %v", err)
+	}
+	if len(series) == 0 {
+		t.Fatalf("expected fallback http series, got none")
+	}
+	for _, s := range series {
+		if s.Labels["service"] != service {
+			t.Errorf("series %q missing service label: got %q, want %q", s.Name, s.Labels["service"], service)
+		}
+	}
+}
+
+func TestPrometheusQueryMetricsForServiceDeterministic(t *testing.T) {
+	service := "prod_pcb-order-service"
+	now := time.Now()
+
+	server := newARMSMetricsServer(t, service, now, nil)
+	defer server.Close()
+
+	src, err := NewPrometheusMetricSource(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to create source: %v", err)
+	}
+
+	windowStart := now.Add(-15 * time.Minute)
+	first, err := src.QueryMetricsForService(context.Background(), service, windowStart, now)
+	if err != nil {
+		t.Fatalf("QueryMetricsForService() error: %v", err)
+	}
+	second, err := src.QueryMetricsForService(context.Background(), service, windowStart, now)
+	if err != nil {
+		t.Fatalf("QueryMetricsForService() error: %v", err)
+	}
+
+	a, _ := json.Marshal(first)
+	b, _ := json.Marshal(second)
+	if string(a) != string(b) {
+		t.Errorf("non-deterministic result:\nfirst=%s\nsecond=%s", a, b)
+	}
+}
+
 func TestK8sQueryChangesByService(t *testing.T) {
 	deployTime := time.Now().Add(-30 * time.Minute)
 	k8sResponse := map[string]interface{}{
@@ -646,11 +814,11 @@ func TestExecuteQueryDropsNonFinite(t *testing.T) {
 				{
 					"metric": map[string]string{"__name__": "arms_app_latency_ms", "service": "low-traffic-svc"},
 					"values": [][]interface{}{
-						{float64(now.Add(-4 * time.Minute).Unix()), "12.5"},    // finite, keep
-						{float64(now.Add(-3 * time.Minute).Unix()), "+Inf"},    // drop
-						{float64(now.Add(-2 * time.Minute).Unix()), "NaN"},     // drop
-						{float64(now.Add(-1 * time.Minute).Unix()), "-Inf"},    // drop
-						{float64(now.Unix()), "33.0"},                          // finite, keep
+						{float64(now.Add(-4 * time.Minute).Unix()), "12.5"}, // finite, keep
+						{float64(now.Add(-3 * time.Minute).Unix()), "+Inf"}, // drop
+						{float64(now.Add(-2 * time.Minute).Unix()), "NaN"},  // drop
+						{float64(now.Add(-1 * time.Minute).Unix()), "-Inf"}, // drop
+						{float64(now.Unix()), "33.0"},                       // finite, keep
 					},
 				},
 			},
