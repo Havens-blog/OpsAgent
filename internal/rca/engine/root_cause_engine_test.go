@@ -66,6 +66,11 @@ func (m *mockLogSource) GetLogCount(ctx context.Context, service string, start, 
 type mockMetricSource struct {
 	metrics []models.MetricSeries
 	err     error
+
+	// byService, when non-nil, is the per-service series returned by
+	// QueryMetricsForService. When nil, QueryMetricsForService falls back to
+	// metrics (the pre-existing behavior used by most tests).
+	byService map[string][]models.MetricSeries
 }
 
 func (m *mockMetricSource) QueryAnomalies(ctx context.Context, start, end time.Time) ([]models.MetricSeries, error) {
@@ -90,6 +95,9 @@ func (m *mockMetricSource) QueryMetric(ctx context.Context, metricName string, s
 func (m *mockMetricSource) QueryMetricsForService(ctx context.Context, service string, start, end time.Time) ([]models.MetricSeries, error) {
 	if m.err != nil {
 		return nil, m.err
+	}
+	if m.byService != nil {
+		return m.byService[service], nil
 	}
 	return m.metrics, nil
 }
@@ -1020,4 +1028,250 @@ func TestGetOverallConfidence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func risingMetricSeries(name, service string, base time.Time, values []float64) models.MetricSeries {
+	dps := make([]models.DataPoint, 0, len(values))
+	for i, v := range values {
+		dps = append(dps, models.DataPoint{
+			Timestamp: base.Add(time.Duration(i)*time.Minute + 30*time.Second),
+			Value:     v,
+		})
+	}
+	var labels map[string]string
+	if service != "" {
+		labels = map[string]string{"service": service}
+	}
+	return models.MetricSeries{Name: name, Labels: labels, Unit: "count", DataPoints: dps}
+}
+
+func metricCandidates(t *testing.T, all []models.Hypothesis) []models.Hypothesis {
+	t.Helper()
+	var out []models.Hypothesis
+	for _, h := range all {
+		if h.Type == models.HypothesisTypeMetricAnomaly {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+func testWindows(base time.Time) []models.TimeWindow {
+	return []models.TimeWindow{
+		{Start: base, End: base.Add(time.Minute)},
+		{Start: base.Add(time.Minute), End: base.Add(2 * time.Minute)},
+		{Start: base.Add(2 * time.Minute), End: base.Add(3 * time.Minute)},
+		{Start: base.Add(3 * time.Minute), End: base.Add(4 * time.Minute)},
+		{Start: base.Add(4 * time.Minute), End: base.Add(5 * time.Minute)},
+	}
+}
+
+// TestMetricAnomalyServiceAttributionAndScoring locks in that a metric_anomaly
+// candidate carries its owning service (via the composite trend key), that the
+// same metric name in two services produces two candidates instead of one
+// overwriting the other, that generation is deterministic, and that the
+// service-scoped candidate earns a non-zero topology score.
+func TestMetricAnomalyServiceAttributionAndScoring(t *testing.T) {
+	base := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	incident := &models.Incident{
+		ID:               "metric-service",
+		StartTime:        base,
+		EndTime:          base.Add(5 * time.Minute),
+		Severity:         "P1",
+		AffectedServices: []string{"svc-a", "svc-b"},
+	}
+	windows := testWindows(base)
+
+	// Same metric name in two services: the composite trend key must keep them
+	// distinct instead of one overwriting the other.
+	metrics := []models.MetricSeries{
+		risingMetricSeries("cpu", "svc-a", base, []float64{10, 20, 30, 40, 50}),
+		risingMetricSeries("cpu", "svc-b", base, []float64{100, 200, 300, 400, 500}),
+	}
+
+	trends := calculateMetricTrends(metrics, windows)
+	if len(trends) != 2 {
+		t.Fatalf("calculateMetricTrends produced %d keys, want 2 (same-name metrics must not overwrite): %v", len(trends), trends)
+	}
+	if _, ok := trends[metricTrendKey("svc-a", "cpu")]; !ok {
+		t.Errorf("missing trend key for svc-a/cpu: %v", trends)
+	}
+	if _, ok := trends[metricTrendKey("svc-b", "cpu")]; !ok {
+		t.Errorf("missing trend key for svc-b/cpu: %v", trends)
+	}
+
+	normalized := &models.NormalizedSignals{
+		TimeWindows:  windows,
+		MetricTrends: trends,
+		Topology:     &models.Topology{},
+	}
+	signals := &models.Signals{Metrics: metrics}
+
+	engine, err := NewEngine(WithLogSource(&mockLogSource{}), WithMetricSource(&mockMetricSource{}))
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	first := metricCandidates(t, engine.generateHypotheses(context.Background(), signals, normalized, incident))
+	second := metricCandidates(t, engine.generateHypotheses(context.Background(), signals, normalized, incident))
+
+	if len(first) != 2 {
+		t.Fatalf("got %d metric candidates, want 2: %+v", len(first), first)
+	}
+	byService := map[string]models.Hypothesis{}
+	for _, h := range first {
+		if h.Metric != "cpu" {
+			t.Errorf("metric candidate Metric = %q, want %q", h.Metric, "cpu")
+		}
+		byService[h.Service] = h
+	}
+	if _, ok := byService["svc-a"]; !ok {
+		t.Errorf("missing metric candidate for svc-a: %+v", first)
+	}
+	if _, ok := byService["svc-b"]; !ok {
+		t.Errorf("missing metric candidate for svc-b: %+v", first)
+	}
+
+	// Determinism: identical input must produce identical ordering.
+	if len(second) != len(first) {
+		t.Fatalf("second run produced %d candidates, want %d", len(second), len(first))
+	}
+	for i := range first {
+		if first[i].Service != second[i].Service || first[i].Metric != second[i].Metric || first[i].Description != second[i].Description {
+			t.Errorf("candidate order changed between runs: [%d] %+v vs %+v", i, first[i], second[i])
+		}
+	}
+
+	scored := engine.scoreCandidates(context.Background(), first, normalized, incident)
+	for _, s := range scored {
+		if s.Hypothesis.Service == "" {
+			t.Errorf("service-scoped metric candidate has empty Service")
+			continue
+		}
+		if s.Breakdown.TopologyScore <= 0 {
+			t.Errorf("TopologyScore for service %q = %v, want > 0", s.Hypothesis.Service, s.Breakdown.TopologyScore)
+		}
+	}
+}
+
+// TestMetricAnomalyEmptyServiceScoresZeroTopology locks in the global-fallback
+// behavior: with no affected services, the metric candidate keeps an empty
+// Service and therefore scores zero topology (the original behavior preserved).
+func TestMetricAnomalyEmptyServiceScoresZeroTopology(t *testing.T) {
+	base := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	incident := &models.Incident{
+		ID:        "metric-global",
+		StartTime: base,
+		EndTime:   base.Add(5 * time.Minute),
+		Severity:  "P1",
+	}
+	windows := testWindows(base)
+	metrics := []models.MetricSeries{
+		risingMetricSeries("cpu", "", base, []float64{10, 20, 30, 40, 50}),
+	}
+	trends := calculateMetricTrends(metrics, windows)
+	normalized := &models.NormalizedSignals{
+		TimeWindows:  windows,
+		MetricTrends: trends,
+		Topology:     &models.Topology{},
+	}
+
+	engine, err := NewEngine(WithLogSource(&mockLogSource{}), WithMetricSource(&mockMetricSource{}))
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+
+	candidates := metricCandidates(t, engine.generateHypotheses(context.Background(), &models.Signals{Metrics: metrics}, normalized, incident))
+	if len(candidates) != 1 {
+		t.Fatalf("got %d metric candidates, want 1: %+v", len(candidates), candidates)
+	}
+	if candidates[0].Service != "" {
+		t.Errorf("global-fallback metric candidate Service = %q, want empty", candidates[0].Service)
+	}
+
+	scored := engine.scoreCandidates(context.Background(), candidates, normalized, incident)
+	if len(scored) != 1 {
+		t.Fatalf("got %d scored candidates, want 1", len(scored))
+	}
+	if scored[0].Breakdown.TopologyScore != 0 {
+		t.Errorf("empty-service candidate TopologyScore = %v, want 0", scored[0].Breakdown.TopologyScore)
+	}
+}
+
+// TestGatherSignalsMetricScoping locks in the signal-collection split: named
+// services fan out to QueryMetricsForService and inject a service label, while
+// an incident with no affected services falls back to the global
+// QueryAnomalies (service left empty).
+func TestGatherSignalsMetricScoping(t *testing.T) {
+	base := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+
+	t.Run("per-service queries", func(t *testing.T) {
+		incident := &models.Incident{
+			ID:               "scope-a",
+			StartTime:        base,
+			EndTime:          base.Add(time.Hour),
+			Severity:         "P1",
+			AffectedServices: []string{"svc-a", "svc-b"},
+		}
+		metricSource := &mockMetricSource{
+			byService: map[string][]models.MetricSeries{
+				"svc-a": {{Name: "cpu", Labels: map[string]string{"service": "svc-a"}}},
+				// Labels nil so the engine must inject the queried service.
+				"svc-b": {{Name: "mem"}},
+			},
+		}
+		engine, err := NewEngine(WithLogSource(&mockLogSource{}), WithMetricSource(metricSource))
+		if err != nil {
+			t.Fatalf("NewEngine: %v", err)
+		}
+
+		signals, err := engine.gatherSignals(context.Background(), incident)
+		if err != nil {
+			t.Fatalf("gatherSignals: %v", err)
+		}
+
+		byService := map[string]int{}
+		for _, s := range signals.Metrics {
+			byService[s.Labels["service"]]++
+		}
+		if byService["svc-a"] != 1 {
+			t.Errorf("svc-a series count = %d, want 1 (metrics: %+v)", byService["svc-a"], signals.Metrics)
+		}
+		if byService["svc-b"] != 1 {
+			t.Errorf("svc-b series count = %d, want 1 (metrics: %+v)", byService["svc-b"], signals.Metrics)
+		}
+		if len(signals.Metrics) != 2 {
+			t.Errorf("got %d metrics, want 2", len(signals.Metrics))
+		}
+	})
+
+	t.Run("global fallback", func(t *testing.T) {
+		incident := &models.Incident{
+			ID:        "scope-b",
+			StartTime: base,
+			EndTime:   base.Add(time.Hour),
+			Severity:  "P1",
+		}
+		metricSource := &mockMetricSource{
+			metrics: []models.MetricSeries{{Name: "global_cpu"}},
+		}
+		engine, err := NewEngine(WithLogSource(&mockLogSource{}), WithMetricSource(metricSource))
+		if err != nil {
+			t.Fatalf("NewEngine: %v", err)
+		}
+
+		signals, err := engine.gatherSignals(context.Background(), incident)
+		if err != nil {
+			t.Fatalf("gatherSignals: %v", err)
+		}
+		if len(signals.Metrics) != 1 {
+			t.Fatalf("got %d metrics, want 1", len(signals.Metrics))
+		}
+		if signals.Metrics[0].Name != "global_cpu" {
+			t.Errorf("metric Name = %q, want %q", signals.Metrics[0].Name, "global_cpu")
+		}
+		if svc := signals.Metrics[0].Labels["service"]; svc != "" {
+			t.Errorf("global fallback service label = %q, want empty", svc)
+		}
+	})
 }
