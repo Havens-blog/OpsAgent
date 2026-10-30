@@ -13,10 +13,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Havens-blog/OpsAgent/internal/agent"
 	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
@@ -226,6 +228,85 @@ func (s *APIServer) recordLLMCall(r *http.Request, usage llm.Usage) {
 			"prompt_tokens":     usage.PromptTokens,
 			"completion_tokens": usage.CompletionTokens,
 			"total_tokens":      usage.TotalTokens,
+		},
+	})
+}
+
+// agentTaskErrText resolves the audit error text for an async agent task:
+// the execution error wins over the result's embedded error string.
+func agentTaskErrText(execErr error, resultErr string) string {
+	if execErr != nil {
+		return execErr.Error()
+	}
+	return resultErr
+}
+
+// recordAgentTaskExecution records one async agent task reaching a terminal
+// state: in-memory ring plus JSONL file append when audit_log_path is
+// configured. Async execution has no *http.Request, so the user is degraded to
+// the numeric UserID and the IP is empty.
+func (s *APIServer) recordAgentTaskExecution(task *AgentTask, result *agent.ExecutionResult, execErr error) {
+	sec := s.settings.ToSecurityConfig()
+	if !sec.EnableAuditLog {
+		return
+	}
+
+	resultStr := "failed"
+	if result != nil && result.Success {
+		resultStr = "success"
+	}
+
+	tools := []string{}
+	if result != nil {
+		tools = result.ToolsUsed
+	}
+	detail := "tools=" + strings.Join(tools, ",")
+	var resultErr string
+	if result != nil {
+		resultErr = result.Error
+	}
+	errText := agentTaskErrText(execErr, resultErr)
+	if errText != "" {
+		detail += ", error=" + errText
+	}
+
+	user := "local"
+	if task.UserID != 0 {
+		user = strconv.FormatInt(task.UserID, 10)
+	}
+	operation := "agent_task:" + task.AgentID
+
+	entry := auditEntry{
+		Time:      time.Now(),
+		User:      user,
+		Operation: operation,
+		IP:        "",
+		Result:    resultStr,
+		Detail:    detail,
+	}
+	s.auditLog.add(entry)
+
+	if sec.AuditLogPath == "" {
+		return
+	}
+	w, err := observability.NewFileAuditWriter(sec.AuditLogPath)
+	if err != nil {
+		s.logger.Warn("audit file writer unavailable",
+			observability.String("path", sec.AuditLogPath), observability.Err(err))
+		return
+	}
+	defer w.Close()
+	_ = w.Write(&observability.AuditEvent{
+		Timestamp: entry.Time,
+		EventType: observability.EventToolExecution,
+		Action:    operation,
+		Result:    resultStr,
+		Error:     errText,
+		Metadata: map[string]interface{}{
+			"user_id":    task.UserID,
+			"tenant_id":  task.TenantID,
+			"agent_id":   task.AgentID,
+			"tools_used": tools,
 		},
 	})
 }
