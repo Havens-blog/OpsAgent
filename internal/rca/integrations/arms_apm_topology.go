@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -71,6 +72,20 @@ type ARMSPromTopologySource struct {
 	client   *http.Client
 	endpoint string
 	token    string
+
+	// Each topology/metrics fetch fans out to 3-4 PromQL round-trips to ARMS.
+	// The console polls this endpoint continuously, so a short cache both cuts
+	// ARMS load and, on a transient ARMS error, lets us serve the last-good
+	// result instead of a 502 that would ripple up the proxy chain.
+	topoMu        sync.Mutex
+	topoCache     *models.Topology
+	topoExpire    time.Time
+	topoRetryAt   time.Time
+	metricsMu     sync.Mutex
+	metricsCache  map[string]sources.ServiceMetrics
+	metricsExpire time.Time
+	metricsRetryAt time.Time
+	ttl           time.Duration
 }
 
 // NewARMSPromTopologySource creates a topology source over an ARMS APM
@@ -84,6 +99,7 @@ func NewARMSPromTopologySource(endpoint, token string) (*ARMSPromTopologySource,
 		client:   &http.Client{Timeout: 40 * time.Second},
 		endpoint: strings.TrimSuffix(endpoint, "/"),
 		token:    token,
+		ttl:      15 * time.Second,
 	}, nil
 }
 
@@ -213,8 +229,40 @@ func (a *ARMSPromTopologySource) queryServiceValues(ctx context.Context, promql 
 // counters. It satisfies sources.ServiceMetricsProvider. Values are sanitized
 // (no Inf/NaN) in queryServiceValues.
 func (a *ARMSPromTopologySource) GetServiceMetrics(ctx context.Context) (map[string]sources.ServiceMetrics, error) {
-	// The three RED queries are independent, so run them concurrently rather
-	// than paying three sequential round-trips to ARMS.
+	a.metricsMu.Lock()
+	defer a.metricsMu.Unlock()
+
+	now := time.Now()
+	if a.metricsCache != nil && now.Before(a.metricsExpire) {
+		return a.metricsCache, nil
+	}
+	// Negative cache: after a failed fetch, back off briefly so concurrent
+	// callers don't each pay a fresh timeout serially.
+	if now.Before(a.metricsRetryAt) {
+		if a.metricsCache != nil {
+			return a.metricsCache, nil
+		}
+		return nil, fmt.Errorf("ARMS service metrics unavailable, retry after %s", a.metricsRetryAt.Format(time.RFC3339))
+	}
+
+	m, err := a.fetchServiceMetrics(ctx)
+	if err == nil {
+		a.metricsCache = m
+		a.metricsExpire = now.Add(a.ttl)
+		return m, nil
+	}
+	a.metricsRetryAt = now.Add(5 * time.Second)
+	if a.metricsCache != nil {
+		// Transient ARMS failure: serve the last-good snapshot instead of a 502.
+		log.Printf("[arms-topology] serving stale service metrics: %v", err)
+		return a.metricsCache, nil
+	}
+	return nil, err
+}
+
+// fetchServiceMetrics runs the three independent RED queries concurrently
+// rather than paying three sequential round-trips to ARMS.
+func (a *ARMSPromTopologySource) fetchServiceMetrics(ctx context.Context) (map[string]sources.ServiceMetrics, error) {
 	var throughput, errRate, latency map[string]float64
 	if err := runConcurrent(
 		func() (err error) {
@@ -273,8 +321,43 @@ func infraType(callType string) (nodeType string, isInfra bool) {
 	return "", false
 }
 
-// GetTopology builds the service dependency graph from ARMS APM metrics.
+// GetTopology returns the service dependency graph, cached briefly so the
+// console's continuous polling and concurrent RCA runs do not each fan out a
+// fresh set of PromQL queries to ARMS. A transient ARMS error falls back to
+// the last-good snapshot rather than surfacing a 502 up the proxy chain.
 func (a *ARMSPromTopologySource) GetTopology(ctx context.Context) (*models.Topology, error) {
+	a.topoMu.Lock()
+	defer a.topoMu.Unlock()
+
+	now := time.Now()
+	if a.topoCache != nil && now.Before(a.topoExpire) {
+		return a.topoCache, nil
+	}
+	// Negative cache: after a failed fetch, back off briefly so concurrent
+	// callers don't each pay a fresh timeout serially.
+	if now.Before(a.topoRetryAt) {
+		if a.topoCache != nil {
+			return a.topoCache, nil
+		}
+		return nil, fmt.Errorf("ARMS topology unavailable, retry after %s", a.topoRetryAt.Format(time.RFC3339))
+	}
+
+	topo, err := a.fetchTopology(ctx)
+	if err == nil {
+		a.topoCache = topo
+		a.topoExpire = now.Add(a.ttl)
+		return topo, nil
+	}
+	a.topoRetryAt = now.Add(5 * time.Second)
+	if a.topoCache != nil {
+		log.Printf("[arms-topology] serving stale topology: %v", err)
+		return a.topoCache, nil
+	}
+	return nil, err
+}
+
+// fetchTopology builds the service dependency graph from ARMS APM metrics.
+func (a *ARMSPromTopologySource) fetchTopology(ctx context.Context) (*models.Topology, error) {
 	nodes := map[string]*models.ServiceNode{} // name -> node
 	type edgeKey struct{ from, to, typ string }
 	edges := map[edgeKey]bool{}

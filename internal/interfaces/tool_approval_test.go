@@ -15,6 +15,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/tenant"
+	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
 
 type toolCallingClient struct {
@@ -27,6 +28,17 @@ func (c *toolCallingClient) Chat(ctx context.Context, messages []llm.Message) (*
 }
 
 func (c *toolCallingClient) ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error) {
+	// Multi-round loop: once a tool result is already in the transcript, stop
+	// requesting tools so the final answer flows out instead of looping.
+	for _, m := range messages {
+		if m.Role == "tool" {
+			return &llm.ChatResponse{
+				Choices: []llm.Choice{
+					{Message: llm.ResponseMessage{Role: "assistant", Content: ""}},
+				},
+			}, nil
+		}
+	}
 	return &llm.ChatResponse{
 		Choices: []llm.Choice{
 			{Message: llm.ResponseMessage{Role: "assistant", ToolCalls: c.toolCalls}},
@@ -58,7 +70,24 @@ func newToolServer(t *testing.T, client chat.ChatClient) *APIServer {
 	t.Cleanup(func() { server.Shutdown(context.Background()) })
 	if client != nil {
 		svc := chat.NewServiceWithClient(client, "test-model")
-		svc.SetToolProvider(newRegistryToolProvider(buildChatToolRegistry(), nil, server.approvalMgr))
+		// Stand-in for the bound specialist tools initAgents collects on a
+		// real server (there the chat registry gets the agents' BoundTools).
+		testTool := &tool.Tool{
+			Metadata: &tool.ToolMetadata{
+				Name:        "analyze_logs",
+				Description: "test analyze tool",
+				Source:      tool.DataSourceTypeGeneric,
+				InputSchema: []byte(`{"type":"object","properties":{"service":{"type":"string"}}}`),
+				Tier:        guardrails.TierSafe,
+				SideEffect:  guardrails.SideEffectReadOnly,
+				Category:    "logs",
+			},
+			IsAvailable: func(map[string]interface{}) bool { return true },
+			Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
+				return map[string]interface{}{"status": "analyzed", "service": params["service"]}, nil
+			},
+		}
+		svc.SetToolProvider(newRegistryToolProvider(buildChatToolRegistry([]*tool.Tool{testTool}, nil), nil, server.approvalMgr))
 		server.setChatService(svc)
 	}
 	return server

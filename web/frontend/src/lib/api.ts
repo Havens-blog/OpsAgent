@@ -317,13 +317,9 @@ export interface ServiceNode {
 }
 
 export interface ServiceEdge {
-  id: string
   from_node_id: string
   to_node_id: string
   type: string
-  error_rate: number
-  latency: number
-  throughput: number
 }
 
 export interface ServiceGraph {

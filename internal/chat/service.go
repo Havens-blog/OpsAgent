@@ -22,8 +22,12 @@ const (
 - 梳理排查思路
 - 理解服务拓扑与依赖关系
 - 审查变更历史
+- 查询实时数据（WAF 拦截日志、服务日志、指标、拓扑等）
 
-请用简洁专业的中文回答。如果需要查询实时数据（日志、指标、拓扑等）但目前无法访问，请如实告知并给出可行的替代排查建议。`
+重要规则：
+- 当用户询问某个域名的 WAF 拦截、Web 攻击、异常访问时，必须先调用 query_waf_logs 工具查询该域名的真实拦截日志，再基于返回的攻击类型/来源IP/目标URI/动作给出事实性回答，禁止凭空给通用检查清单。
+- 查询实时数据时优先调用对应工具获取事实，基于事实作答；工具查不到或未配置时才如实说明，不要编造数据。
+请用简洁专业的中文回答。`
 )
 
 // ChatClient is the narrow LLM client surface the Service depends on.
@@ -200,10 +204,12 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 	return s.streamLLM(ctx, s.buildLLMMessages(messages), onDelta)
 }
 
-// StreamWithTools runs the tool-calling loop and then streams the final
-// answer. It first asks the model (with tools) whether a tool is needed,
-// executes any requested tools while emitting tool_call/tool_result events,
-// and finally streams the answer via the existing delta flow.
+// StreamWithTools runs a multi-round tool-calling loop and then streams the
+// final answer. Each round asks the model (with tools) what to do next: if it
+// requests tools, they are executed and their results are appended, then the
+// loop asks again so the model can chain a second tool on the first result
+// (e.g. list_cmdb_models -> list_cmdb_instances). When the model stops
+// requesting tools, the accumulated context is streamed as the final answer.
 func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h StreamHandler) (string, error) {
 	if !s.IsAvailable() {
 		return "", fmt.Errorf("chat service not available")
@@ -224,81 +230,87 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 		return s.streamAnswer(ctx, llmMessages, h)
 	}
 
-	resp, err := s.client.ChatWithTools(ctx, llmMessages, tools)
-	if err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", fmt.Errorf("LLM call failed: %w", err)
-	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("empty response from LLM")
-	}
-
-	assistantMsg := resp.Choices[0].Message
-	if len(assistantMsg.ToolCalls) == 0 {
-		return s.streamAnswer(ctx, llmMessages, h)
-	}
-
-	// Record the assistant's tool-call request so the final answer can see it.
-	llmMessages = append(llmMessages, llm.Message{
-		Role:      "assistant",
-		Content:   assistantMsg.Content,
-		ToolCalls: assistantMsg.ToolCalls,
-	})
-
-	for _, call := range assistantMsg.ToolCalls {
-		args, err := parseToolArguments(call.Function.Arguments)
+	// Cap the rounds so a model that keeps calling tools can never loop forever.
+	const maxRounds = 6
+	for round := 0; round < maxRounds; round++ {
+		resp, err := s.client.ChatWithTools(ctx, llmMessages, tools)
 		if err != nil {
-			if h.OnToolResult != nil {
-				_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", err.Error())
+			if ctx.Err() != nil {
+				return "", ctx.Err()
 			}
-			llmMessages = append(llmMessages, llm.Message{
-				Role:       "tool",
-				Content:    fmt.Sprintf("error: %v", err),
-				ToolCallID: call.ID,
-			})
-			continue
+			return "", fmt.Errorf("LLM call failed: %w", err)
+		}
+		if len(resp.Choices) == 0 {
+			return "", fmt.Errorf("empty response from LLM")
 		}
 
-		if h.OnToolCall != nil {
-			if err := h.OnToolCall(call.ID, call.Function.Name, args); err != nil {
-				return "", err
-			}
+		assistantMsg := resp.Choices[0].Message
+		if len(assistantMsg.ToolCalls) == 0 {
+			return s.streamAnswer(ctx, llmMessages, h)
 		}
 
-		result, execErr := s.toolProvider.ExecuteTool(ctx, call.Function.Name, args)
-		if execErr != nil {
-			if guardrails.ApprovalRequired(execErr) {
-				if h.OnApprovalRequired != nil {
-					if ar, ok := execErr.(*guardrails.ApprovalRequiredError); ok {
-						_ = h.OnApprovalRequired(ar.Request)
-					}
-				}
-				return "", fmt.Errorf("需要审批，请在前端批准后重试")
-			}
-			if h.OnToolResult != nil {
-				_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", execErr.Error())
-			}
-			llmMessages = append(llmMessages, llm.Message{
-				Role:       "tool",
-				Content:    fmt.Sprintf("error: %v", execErr),
-				ToolCallID: call.ID,
-			})
-			continue
-		}
-
-		resultStr := stringifyToolResult(result)
-		if h.OnToolResult != nil {
-			_ = h.OnToolResult(call.ID, call.Function.Name, "success", resultStr, "")
-		}
+		// Record the assistant's tool-call request so the next round sees it.
 		llmMessages = append(llmMessages, llm.Message{
-			Role:       "tool",
-			Content:    resultStr,
-			ToolCallID: call.ID,
+			Role:      "assistant",
+			Content:   assistantMsg.Content,
+			ToolCalls: assistantMsg.ToolCalls,
 		})
+
+		for _, call := range assistantMsg.ToolCalls {
+			args, err := parseToolArguments(call.Function.Arguments)
+			if err != nil {
+				if h.OnToolResult != nil {
+					_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", err.Error())
+				}
+				llmMessages = append(llmMessages, llm.Message{
+					Role:       "tool",
+					Content:    fmt.Sprintf("error: %v", err),
+					ToolCallID: call.ID,
+				})
+				continue
+			}
+
+			if h.OnToolCall != nil {
+				if err := h.OnToolCall(call.ID, call.Function.Name, args); err != nil {
+					return "", err
+				}
+			}
+
+			result, execErr := s.toolProvider.ExecuteTool(ctx, call.Function.Name, args)
+			if execErr != nil {
+				if guardrails.ApprovalRequired(execErr) {
+					if h.OnApprovalRequired != nil {
+						if ar, ok := execErr.(*guardrails.ApprovalRequiredError); ok {
+							_ = h.OnApprovalRequired(ar.Request)
+						}
+					}
+					return "", fmt.Errorf("需要审批，请在前端批准后重试")
+				}
+				if h.OnToolResult != nil {
+					_ = h.OnToolResult(call.ID, call.Function.Name, "failed", "", execErr.Error())
+				}
+				llmMessages = append(llmMessages, llm.Message{
+					Role:       "tool",
+					Content:    fmt.Sprintf("error: %v", execErr),
+					ToolCallID: call.ID,
+				})
+				continue
+			}
+
+			resultStr := stringifyToolResult(result)
+			if h.OnToolResult != nil {
+				_ = h.OnToolResult(call.ID, call.Function.Name, "success", resultStr, "")
+			}
+			llmMessages = append(llmMessages, llm.Message{
+				Role:       "tool",
+				Content:    resultStr,
+				ToolCallID: call.ID,
+			})
+		}
 	}
 
+	// Exhausted the round budget: stream whatever the accumulated tool results
+	// support rather than leaving the user with no answer.
 	return s.streamAnswer(ctx, llmMessages, h)
 }
 

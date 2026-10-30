@@ -431,6 +431,22 @@ func (s *SyntheticLogSource) QueryLogsByService(ctx context.Context, service str
 	return []models.LogEntry{}, nil
 }
 
+// QueryErrorsByService scopes the synthetic error stream to one service,
+// mirroring the real sources' store-scoped semantics.
+func (s *SyntheticLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	logs, err := s.QueryErrors(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+	filtered := []models.LogEntry{}
+	for _, log := range logs {
+		if log.Service == service {
+			filtered = append(filtered, log)
+		}
+	}
+	return filtered, nil
+}
+
 func (s *SyntheticLogSource) GetLogCount(ctx context.Context, service string, start, end time.Time) (int64, error) {
 	if s.dataFunc != nil {
 		logs, err := s.dataFunc(ctx, start, end)

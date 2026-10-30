@@ -34,8 +34,9 @@ const ROLE_LABELS: Record<string, string> = {
   inspector: "云资源巡检 · 合规检查",
 }
 
-// Coordinator does static routing (no LLM); the specialists call the LLM.
-const LLM_BACKED = new Set(["log_analyst", "monitor", "inspector"])
+// All four call the LLM: the coordinator for intent routing + parameter
+// extraction, the specialists for their default (non-typed) task path.
+const LLM_BACKED = new Set(["coordinator", "log_analyst", "monitor", "inspector"])
 
 const STATUS_LABELS: Record<AgentTaskStatus, string> = {
   pending: "排队中",

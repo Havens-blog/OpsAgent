@@ -19,6 +19,8 @@ const EVIDENCE_STYLE: Record<string, string> = {
   trace: "default",
   change: "danger",
   topology: "secondary",
+  resource: "danger",
+  waf: "danger",
 }
 
 export default function IncidentDetailPage({
