@@ -2,6 +2,7 @@
 
 import { use, useEffect, useState } from "react"
 import Link from "next/link"
+import { AlertTriangle } from "lucide-react"
 import {
   Card,
   CardContent,
@@ -112,6 +113,23 @@ export default function IncidentDetailPage({
           </div>
         </div>
       </header>
+
+      {(incident.warnings?.length ?? 0) > 0 && (
+        <div
+          role="alert"
+          className="rounded-md border border-warning-border bg-warning-soft px-4 py-3 text-sm"
+        >
+          <div className="flex items-center gap-2 font-medium text-warning">
+            <AlertTriangle className="h-4 w-4" />
+            数据源告警：以下数据源采集失败，分析结论可能不完整
+          </div>
+          <ul className="mt-2 list-inside list-disc space-y-1 text-muted-foreground">
+            {incident.warnings!.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-3">
         <Card className="lg:col-span-2 border-primary/40">
