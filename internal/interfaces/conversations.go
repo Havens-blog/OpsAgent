@@ -363,7 +363,7 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		},
 	}
 
-	fullText, evidence, grounding, err := chatSvc.StreamWithTools(ctx, messages, handler)
+	fullText, evidence, grounding, usage, err := chatSvc.StreamWithTools(ctx, messages, handler)
 
 	if err != nil {
 		// Client disconnection cancels the request; there is no peer left to
@@ -378,6 +378,11 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		// Carry the session id in the request context so the audit record can
 		// attribute the tool execution to this conversation.
 		s.recordToolExecution(r.WithContext(ctx), ev)
+	}
+
+	// Skip the all-zero usage emitted when no LLM call actually happened.
+	if usage.PromptTokens != 0 || usage.CompletionTokens != 0 || usage.TotalTokens != 0 {
+		s.recordLLMCall(r, usage)
 	}
 
 	assistantMsg := &chat.Message{

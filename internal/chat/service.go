@@ -207,7 +207,7 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 	if !s.IsAvailable() {
 		return fmt.Errorf("chat service not available")
 	}
-	return s.streamLLM(ctx, s.buildLLMMessages(messages), onDelta)
+	return s.streamLLM(ctx, s.buildLLMMessages(messages), onDelta, nil)
 }
 
 // StreamWithTools runs a multi-round tool-calling loop and then streams the
@@ -216,14 +216,16 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 // loop asks again so the model can chain a second tool on the first result
 // (e.g. list_cmdb_models -> list_cmdb_instances). When the model stops
 // requesting tools, the accumulated context is streamed as the final answer.
-// The returned evidence and grounding are persisted and exposed over SSE.
-func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h StreamHandler) (string, []ToolEvidence, string, error) {
+// The returned evidence, grounding and token usage are persisted and exposed
+// over SSE; usage is the sum of every LLM call in this stream.
+func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h StreamHandler) (string, []ToolEvidence, string, llm.Usage, error) {
 	if !s.IsAvailable() {
-		return "", nil, "", fmt.Errorf("chat service not available")
+		return "", nil, "", llm.Usage{}, fmt.Errorf("chat service not available")
 	}
 
 	required := mustQueryTools(latestUserText(messages))
 	var evidence []ToolEvidence
+	var usage llm.Usage
 	llmMessages := s.buildLLMMessages(messages)
 
 	var tools []llm.Tool
@@ -231,12 +233,13 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 		var err error
 		tools, err = s.toolProvider.ToolSpecsForLLM()
 		if err != nil {
-			return "", nil, "", fmt.Errorf("failed to load tools: %w", err)
+			return "", nil, "", usage, fmt.Errorf("failed to load tools: %w", err)
 		}
 	}
 
 	if len(tools) == 0 {
-		return s.finishAnswer(ctx, llmMessages, h, required, evidence)
+		text, ev, grounding, err := s.finishAnswer(ctx, llmMessages, h, required, evidence, &usage)
+		return text, ev, grounding, usage, err
 	}
 
 	// Cap the rounds so a model that keeps calling tools can never loop forever.
@@ -245,17 +248,23 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 		resp, err := s.client.ChatWithTools(ctx, llmMessages, tools)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", evidence, computeGrounding(required, evidence), ctx.Err()
+				return "", evidence, computeGrounding(required, evidence), usage, ctx.Err()
 			}
-			return "", evidence, computeGrounding(required, evidence), fmt.Errorf("LLM call failed: %w", err)
+			return "", evidence, computeGrounding(required, evidence), usage, fmt.Errorf("LLM call failed: %w", err)
+		}
+		if resp != nil {
+			usage.PromptTokens += resp.Usage.PromptTokens
+			usage.CompletionTokens += resp.Usage.CompletionTokens
+			usage.TotalTokens += resp.Usage.TotalTokens
 		}
 		if len(resp.Choices) == 0 {
-			return "", evidence, computeGrounding(required, evidence), fmt.Errorf("empty response from LLM")
+			return "", evidence, computeGrounding(required, evidence), usage, fmt.Errorf("empty response from LLM")
 		}
 
 		assistantMsg := resp.Choices[0].Message
 		if len(assistantMsg.ToolCalls) == 0 {
-			return s.finishAnswer(ctx, llmMessages, h, required, evidence)
+			text, ev, grounding, err := s.finishAnswer(ctx, llmMessages, h, required, evidence, &usage)
+			return text, ev, grounding, usage, err
 		}
 
 		// Record the assistant's tool-call request so the next round sees it.
@@ -281,7 +290,7 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 			if h.OnToolCall != nil {
 				if err := h.OnToolCall(call.ID, call.Function.Name, args); err != nil {
-					return "", evidence, computeGrounding(required, evidence), err
+					return "", evidence, computeGrounding(required, evidence), usage, err
 				}
 			}
 
@@ -293,7 +302,7 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 							_ = h.OnApprovalRequired(ar.Request)
 						}
 					}
-					return "", evidence, computeGrounding(required, evidence), fmt.Errorf("需要审批，请在前端批准后重试")
+					return "", evidence, computeGrounding(required, evidence), usage, fmt.Errorf("需要审批，请在前端批准后重试")
 				}
 
 				status := s.classifyToolError(call.Function.Name, execErr)
@@ -343,13 +352,15 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 	// Exhausted the round budget: stream whatever the accumulated tool results
 	// support rather than leaving the user with no answer.
-	return s.finishAnswer(ctx, llmMessages, h, required, evidence)
+	text, ev, grounding, err := s.finishAnswer(ctx, llmMessages, h, required, evidence, &usage)
+	return text, ev, grounding, usage, err
 }
 
 // finishAnswer streams the final reply, then applies the unsupported suffix and
-// grounding decision before returning to the caller.
-func (s *Service) finishAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler, required []string, evidence []ToolEvidence) (string, []ToolEvidence, string, error) {
-	text, err := s.streamAnswer(ctx, llmMessages, h)
+// grounding decision before returning to the caller. It accumulates the final
+// stream's usage into the shared total.
+func (s *Service) finishAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler, required []string, evidence []ToolEvidence, usage *llm.Usage) (string, []ToolEvidence, string, error) {
+	text, err := s.streamAnswer(ctx, llmMessages, h, usage)
 	if err != nil {
 		return "", evidence, computeGrounding(required, evidence), err
 	}
@@ -395,7 +406,7 @@ func latestUserText(messages []Message) string {
 }
 
 // streamAnswer streams the final reply and accumulates it for persistence.
-func (s *Service) streamAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler) (string, error) {
+func (s *Service) streamAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler, usage *llm.Usage) (string, error) {
 	var full strings.Builder
 	err := s.streamLLM(ctx, llmMessages, func(delta string) error {
 		full.WriteString(delta)
@@ -403,7 +414,7 @@ func (s *Service) streamAnswer(ctx context.Context, llmMessages []llm.Message, h
 			return h.OnDelta(delta)
 		}
 		return nil
-	})
+	}, usage)
 	return full.String(), err
 }
 
@@ -424,9 +435,9 @@ func (s *Service) buildLLMMessages(messages []Message) []llm.Message {
 }
 
 // streamLLM streams the given llm messages and invokes onDelta per text delta.
-func (s *Service) streamLLM(ctx context.Context, llmMessages []llm.Message, onDelta func(string) error) error {
+func (s *Service) streamLLM(ctx context.Context, llmMessages []llm.Message, onDelta func(string) error, usage *llm.Usage) error {
 	var deltaErr error
-	_, err := s.client.ChatStream(ctx, llmMessages, func(chunk llm.ChatChunk) {
+	resp, err := s.client.ChatStream(ctx, llmMessages, func(chunk llm.ChatChunk) {
 		if deltaErr != nil || len(chunk.Choices) == 0 || chunk.Choices[0].Delta == nil {
 			return
 		}
@@ -436,6 +447,11 @@ func (s *Service) streamLLM(ctx context.Context, llmMessages []llm.Message, onDe
 			}
 		}
 	})
+	if usage != nil && resp != nil {
+		usage.PromptTokens += resp.Usage.PromptTokens
+		usage.CompletionTokens += resp.Usage.CompletionTokens
+		usage.TotalTokens += resp.Usage.TotalTokens
+	}
 	if deltaErr != nil {
 		return deltaErr
 	}
