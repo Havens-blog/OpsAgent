@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react"
 import Link from "next/link"
-import { Plus, Search } from "lucide-react"
+import { AlertTriangle, Plus, Search } from "lucide-react"
 import {
   Card,
   CardContent,
@@ -170,9 +170,20 @@ export default function RCAListPage() {
                       </div>
                     </td>
                     <td className="px-4 py-3">
-                      <Badge variant={statusVariant(r.status)}>
-                        {statusLabel(r.status)}
-                      </Badge>
+                      <div className="flex items-center gap-2">
+                        <Badge variant={statusVariant(r.status)}>
+                          {statusLabel(r.status)}
+                        </Badge>
+                        {(r.warnings?.length ?? 0) > 0 && (
+                          <span
+                            title={r.warnings!.join("；")}
+                            className="inline-flex items-center gap-1 text-xs text-warning"
+                          >
+                            <AlertTriangle className="h-3.5 w-3.5" />
+                            {r.warnings!.length}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <Badge variant={severityVariant(r.severity)}>
