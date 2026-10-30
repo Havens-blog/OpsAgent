@@ -189,8 +189,26 @@ func (p *PrometheusMetricSource) QueryMetric(ctx context.Context, metricName str
 }
 
 // QueryMetricsForService retrieves all metrics for a specific service.
+//
+// It queries two families of metrics and merges whatever each returns:
+//
+//   - ARMS APM (managed Prometheus): the arms_app_* RED counters scoped to a
+//     single service. These mirror QueryAnomalies' arms_app_* queries — same
+//     metric names, rate() wrapping and label_replace __name__ injection — but
+//     filter {service="X"} directly instead of summing by (service).
+//   - Self-hosted application Prometheus: http_requests_total etc. kept as a
+//     fallback for non-ARMS deployments.
+//
+// Either family failing does not affect the other; an empty result from both
+// yields an empty slice.
 func (p *PrometheusMetricSource) QueryMetricsForService(ctx context.Context, service string, start, end time.Time) ([]models.MetricSeries, error) {
 	queries := []string{
+		// --- Alibaba Cloud ARMS APM (per-service RED) ---
+		fmt.Sprintf(`label_replace(rate(arms_app_requests_error_count_raw{service="%s"}[5m]), "__name__", "arms_app_errors_per_sec", "", "")`, service),
+		fmt.Sprintf(`label_replace(1000 * rate(arms_app_requests_seconds_raw{service="%s"}[5m]) / rate(arms_app_requests_count_raw{service="%s"}[5m]), "__name__", "arms_app_latency_ms", "", "")`, service, service),
+		fmt.Sprintf(`label_replace(rate(arms_app_requests_count_raw{service="%s"}[5m]), "__name__", "arms_app_throughput_per_sec", "", "")`, service),
+
+		// --- Self-hosted application Prometheus fallback (counters -> rate) ---
 		fmt.Sprintf(`rate(http_requests_total{service="%s"}[5m])`, service),
 		fmt.Sprintf(`rate(http_request_duration_seconds_sum{service="%s"}[5m]) / rate(http_request_duration_seconds_count{service="%s"}[5m])`, service, service),
 		fmt.Sprintf(`rate(http_requests_total{service="%s",status=~"5.."}[5m])`, service),
@@ -205,7 +223,22 @@ func (p *PrometheusMetricSource) QueryMetricsForService(ctx context.Context, ser
 		allSeries = append(allSeries, series...)
 	}
 
-	return allSeries, nil
+	return ensureServiceLabel(allSeries, service), nil
+}
+
+// ensureServiceLabel backfills the service label on series that omit it, so
+// RCA can always attribute a candidate back to the queried service.
+func ensureServiceLabel(series []models.MetricSeries, service string) []models.MetricSeries {
+	for i := range series {
+		if _, ok := series[i].Labels["service"]; ok {
+			continue
+		}
+		if series[i].Labels == nil {
+			series[i].Labels = make(map[string]string, 1)
+		}
+		series[i].Labels["service"] = service
+	}
+	return series
 }
 
 // GetAlerts returns current active alerts from Prometheus.
