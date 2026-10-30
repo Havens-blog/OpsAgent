@@ -10,6 +10,7 @@
 package interfaces
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/chat"
+	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 )
 
@@ -178,6 +180,52 @@ func (s *APIServer) recordToolExecution(r *http.Request, ev chat.ToolEvidence) {
 			"source":          ev.Source,
 			"conversation_id": sessionIDFromCtx(r.Context()),
 			"evidence_id":     ev.EvidenceID,
+		},
+	})
+}
+
+// recordLLMCall records the summed token usage of one chat stream: in-memory
+// ring plus JSONL file append when audit_log_path is configured. It is gated on
+// security.enable_audit_log.
+func (s *APIServer) recordLLMCall(r *http.Request, usage llm.Usage) {
+	sec := s.settings.ToSecurityConfig()
+	if !sec.EnableAuditLog {
+		return
+	}
+
+	user := s.auditUser(r)
+	ip := clientIP(r)
+	entry := auditEntry{
+		Time:      time.Now(),
+		User:      user,
+		Operation: "llm_call",
+		IP:        ip,
+		Result:    "success",
+		Detail:    fmt.Sprintf("prompt=%d completion=%d total=%d", usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens),
+	}
+	s.auditLog.add(entry)
+
+	if sec.AuditLogPath == "" {
+		return
+	}
+	w, err := observability.NewFileAuditWriter(sec.AuditLogPath)
+	if err != nil {
+		s.logger.Warn("audit file writer unavailable",
+			observability.String("path", sec.AuditLogPath), observability.Err(err))
+		return
+	}
+	defer w.Close()
+	_ = w.Write(&observability.AuditEvent{
+		Timestamp: entry.Time,
+		EventType: observability.EventLLMCall,
+		Action:    "chat",
+		Result:    "success",
+		Metadata: map[string]interface{}{
+			"user":              user,
+			"ip":                ip,
+			"prompt_tokens":     usage.PromptTokens,
+			"completion_tokens": usage.CompletionTokens,
+			"total_tokens":      usage.TotalTokens,
 		},
 	})
 }

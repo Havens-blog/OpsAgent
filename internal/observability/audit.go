@@ -36,6 +36,8 @@ const (
 	EventConfigChange AuditEventType = "config_change"
 	// EventToolExecution represents a chat-stream tool execution event
 	EventToolExecution AuditEventType = "tool_execution"
+	// EventLLMCall represents a chat-stream LLM token usage event
+	EventLLMCall AuditEventType = "llm_call"
 )
 
 // AuditEvent represents an audit log entry.

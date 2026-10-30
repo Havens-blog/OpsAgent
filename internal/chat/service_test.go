@@ -160,6 +160,41 @@ func (c *toolLoopClient) ChatStream(ctx context.Context, messages []llm.Message,
 	return &llm.ChatResponse{}, nil
 }
 
+type usageClient struct {
+	toolCalls   []llm.ToolCall
+	chunks      []llm.ChatChunk
+	toolUsage   llm.Usage
+	streamUsage llm.Usage
+}
+
+func (c *usageClient) Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error) {
+	return &llm.ChatResponse{}, nil
+}
+
+func (c *usageClient) ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error) {
+	for _, m := range messages {
+		if m.Role == "tool" {
+			return &llm.ChatResponse{Choices: []llm.Choice{{Message: llm.ResponseMessage{Role: "assistant"}}}, Usage: c.toolUsage}, nil
+		}
+	}
+	if c.toolCalls == nil {
+		return &llm.ChatResponse{Choices: []llm.Choice{{Message: llm.ResponseMessage{Role: "assistant"}}}, Usage: c.toolUsage}, nil
+	}
+	return &llm.ChatResponse{Choices: []llm.Choice{{Message: llm.ResponseMessage{Role: "assistant", ToolCalls: c.toolCalls}}}, Usage: c.toolUsage}, nil
+}
+
+func (c *usageClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
+	for _, ch := range c.chunks {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		handler(ch)
+	}
+	return &llm.ChatResponse{Usage: c.streamUsage}, nil
+}
+
 func newStreamHandler() (StreamHandler, *strings.Builder) {
 	var got strings.Builder
 	h := StreamHandler{OnDelta: func(d string) error {
@@ -302,7 +337,7 @@ func TestStreamWithToolsGroundingGrounded(t *testing.T) {
 	})
 
 	h, got := newStreamHandler()
-	text, evidence, grounding, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "查询 WAF 日志"}}, h)
+	text, evidence, grounding, _, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "查询 WAF 日志"}}, h)
 	if err != nil {
 		t.Fatalf("StreamWithTools: %v", err)
 	}
@@ -336,7 +371,7 @@ func TestStreamWithToolsGroundingUnsupported(t *testing.T) {
 	})
 
 	h, _ := newStreamHandler()
-	text, evidence, grounding, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "查询 WAF 日志"}}, h)
+	text, evidence, grounding, _, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "查询 WAF 日志"}}, h)
 	if err != nil {
 		t.Fatalf("StreamWithTools: %v", err)
 	}
@@ -357,7 +392,7 @@ func TestStreamWithToolsGroundingNA(t *testing.T) {
 	}, "test")
 
 	h, _ := newStreamHandler()
-	text, evidence, grounding, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "你好"}}, h)
+	text, evidence, grounding, _, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "你好"}}, h)
 	if err != nil {
 		t.Fatalf("StreamWithTools: %v", err)
 	}
@@ -369,5 +404,34 @@ func TestStreamWithToolsGroundingNA(t *testing.T) {
 	}
 	if evidence != nil {
 		t.Fatalf("evidence = %+v, want nil", evidence)
+	}
+}
+
+func TestStreamWithToolsAccumulatesUsage(t *testing.T) {
+	args := `{"domain":"a.com"}`
+	client := &usageClient{
+		toolCalls: []llm.ToolCall{{ID: "c1", Type: "function", Function: llm.FunctionCall{Name: "query_waf_logs", Arguments: args}}},
+		chunks:    []llm.ChatChunk{{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "ok"}}}}},
+		toolUsage:   llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
+		streamUsage: llm.Usage{PromptTokens: 20, CompletionTokens: 10, TotalTokens: 30},
+	}
+	svc := NewServiceWithClient(client, "test")
+	svc.SetToolProvider(&fakeToolProvider{
+		specs:  []llm.Tool{{Type: "function", Function: llm.FunctionDefinition{Name: "query_waf_logs"}}},
+		source: map[string]string{"query_waf_logs": "aliyun_sls"},
+		results: map[string]fakeToolResult{
+			"query_waf_logs": {result: &models.WAFAttackFacts{Domain: "a.com", Matched: 3}},
+		},
+	})
+
+	h, _ := newStreamHandler()
+	_, _, _, usage, err := svc.StreamWithTools(context.Background(), []Message{{Role: "user", Content: "查询 WAF 日志"}}, h)
+	if err != nil {
+		t.Fatalf("StreamWithTools: %v", err)
+	}
+	// Two ChatWithTools rounds plus one final ChatStream.
+	want := llm.Usage{PromptTokens: 40, CompletionTokens: 20, TotalTokens: 60}
+	if usage != want {
+		t.Fatalf("usage = %+v, want %+v", usage, want)
 	}
 }
