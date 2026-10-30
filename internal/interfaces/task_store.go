@@ -3,7 +3,11 @@ package interfaces
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -49,15 +53,103 @@ type AgentTaskStore interface {
 	FindByClientTaskID(ctx context.Context, agentID, clientTaskID string) (*AgentTask, bool)
 }
 
-// MemoryAgentTaskStore is an in-memory, tenant-isolated AgentTaskStore.
+// MemoryAgentTaskStore is an in-memory, tenant-isolated AgentTaskStore. When
+// path is non-empty, mutations also write a full snapshot to disk.
 type MemoryAgentTaskStore struct {
 	mu    sync.RWMutex
+	path  string
 	items map[string]*AgentTask
+}
+
+// persistedTasks is the on-disk snapshot shape.
+type persistedTasks struct {
+	Items map[string]*AgentTask `json:"items"`
 }
 
 // NewMemoryAgentTaskStore creates an empty in-memory task store.
 func NewMemoryAgentTaskStore() *MemoryAgentTaskStore {
 	return &MemoryAgentTaskStore{items: make(map[string]*AgentTask)}
+}
+
+// NewFileBackedAgentTaskStore loads the snapshot at path, or starts empty when
+// it does not exist. A corrupt or unreadable file returns an error.
+func NewFileBackedAgentTaskStore(path string) (*MemoryAgentTaskStore, error) {
+	if path == "" {
+		return nil, fmt.Errorf("task store path is required")
+	}
+	s := &MemoryAgentTaskStore{path: path, items: make(map[string]*AgentTask)}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// load reads and decodes the snapshot. A missing file is the empty store.
+// Running and pending tasks are rewritten to failed because their execution
+// goroutines died with the previous process.
+func (s *MemoryAgentTaskStore) load() error {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read task store %s: %w", s.path, err)
+	}
+
+	var snapshot persistedTasks
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return fmt.Errorf("parse task store %s: %w", s.path, err)
+	}
+
+	now := time.Now()
+	for id, t := range snapshot.Items {
+		if t == nil {
+			continue
+		}
+		if t.Status == TaskStatusRunning || t.Status == TaskStatusPending {
+			t.Status = TaskStatusFailed
+			t.Error = "task interrupted by server restart"
+			t.UpdatedAt = now
+		}
+		s.items[id] = t
+	}
+	return nil
+}
+
+// persistLocked writes the current state to a temp file in the same directory
+// and atomically renames it over the target. Callers must hold the write lock.
+func (s *MemoryAgentTaskStore) persistLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create task store dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(persistedTasks{Items: s.items}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode task store: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(dir, filepath.Base(s.path)+".tmp*")
+	if err != nil {
+		return fmt.Errorf("create task store temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write task store temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close task store temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return fmt.Errorf("replace task store: %w", err)
+	}
+	return nil
 }
 
 // Create stores a task, stamping tenant/user from the request context so the
@@ -80,7 +172,7 @@ func (s *MemoryAgentTaskStore) Create(ctx context.Context, t *AgentTask) error {
 		t.UpdatedAt = now
 	}
 	s.items[t.ID] = t
-	return nil
+	return s.persistLocked()
 }
 
 // Get returns a copy of a task, enforcing tenant isolation (cross-tenant reads
@@ -134,7 +226,7 @@ func (s *MemoryAgentTaskStore) Update(ctx context.Context, t *AgentTask) error {
 	t.UserID = cur.UserID
 	t.UpdatedAt = time.Now()
 	s.items[t.ID] = t
-	return nil
+	return s.persistLocked()
 }
 
 // FindByClientTaskID returns a task matching agent + client_task_id within the

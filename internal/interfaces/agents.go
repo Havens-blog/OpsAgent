@@ -270,8 +270,8 @@ func (s *APIServer) executeAgentTask(w http.ResponseWriter, r *http.Request, age
 		"tools_used":  result.ToolsUsed,
 		"duration_ms": result.Duration.Milliseconds(),
 	}
-	if result.Error != nil {
-		resp["error"] = result.Error.Error()
+	if result.Error != "" {
+		resp["error"] = result.Error
 	}
 	s.writeJSONResponse(w, http.StatusOK, resp)
 }
@@ -411,8 +411,8 @@ func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
 		task.Status = TaskStatusFailed
 		task.Result = result
 		task.Error = "task execution failed"
-		if result != nil && result.Error != nil {
-			task.Error = result.Error.Error()
+		if result != nil && result.Error != "" {
+			task.Error = result.Error
 		}
 		_ = s.taskStore.Update(ctx, task)
 		return
@@ -520,8 +520,8 @@ func toAgentTaskDTO(t *AgentTask) *agentTaskDTO {
 			DurationMS: t.Result.Duration.Milliseconds(),
 			Metadata:   t.Result.Metadata,
 		}
-		if t.Result.Error != nil {
-			dto.Result.Error = t.Result.Error.Error()
+		if t.Result.Error != "" {
+			dto.Result.Error = t.Result.Error
 		}
 	}
 	return dto

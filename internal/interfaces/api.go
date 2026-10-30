@@ -246,6 +246,25 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	} else {
 		pendingApprovals = ps
 	}
+
+	// Agent task persistence: use the disk-backed store when the path is
+	// configured, falling back to memory so the server still starts without it
+	// or when the snapshot is corrupt/unwritable.
+	taskStore := AgentTaskStore(NewMemoryAgentTaskStore())
+	tasksPath := strings.TrimSpace(os.Getenv("OPSAGENT_TASKS_PATH"))
+	if tasksPath == "" {
+		logger.Warn("Agent task persistence disabled, using in-memory store",
+			observability.String("hint", "set OPSAGENT_TASKS_PATH to persist agent tasks across restarts"),
+		)
+	} else if ts, err := NewFileBackedAgentTaskStore(tasksPath); err != nil {
+		logger.Warn("Persistent agent task store unavailable, using in-memory fallback",
+			observability.String("path", tasksPath),
+			observability.Err(err),
+		)
+	} else {
+		taskStore = ts
+	}
+
 	// WAF facts querier (nil when e-cam is not configured): shared between the
 	// chat tool registry and the WatchAlert webhook. The chat tool PROVIDER is
 	// wired after initAgents — it needs the specialists' bound tools.
@@ -309,7 +328,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		chatService:       chatService,
 		approvalMgr:       approvalMgr,
 		pendingApprovals:  pendingApprovals,
-		taskStore:         NewMemoryAgentTaskStore(),
+		taskStore:         taskStore,
 		auditLog:          newRecentAuditLog(100),
 	}
 

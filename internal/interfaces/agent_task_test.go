@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -111,7 +110,7 @@ func TestSubmitAgentTaskFailedResultMapsToFailed(t *testing.T) {
 	server := newTaskServer(t, "coordinator", fakeExec(func(ctx context.Context, task *agent.Task) (*agent.ExecutionResult, error) {
 		return &agent.ExecutionResult{
 			Success:  false,
-			Error:    errors.New("unable to route task to a specialist agent"),
+			Error:    "unable to route task to a specialist agent",
 			Response: "无法将任务路由到可用专家",
 		}, nil
 	}))

@@ -309,7 +309,7 @@ func (i *InspectorAgent) executeInspectionTask(ctx context.Context, task *Task) 
 	if err != nil {
 		return &ExecutionResult{
 			Success:  false,
-			Error:    err,
+			Error:    errText(err),
 			Response: fmt.Sprintf("Inspection failed: %v", err),
 		}, nil
 	}

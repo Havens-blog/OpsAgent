@@ -409,7 +409,7 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 		if err != nil {
 			return &ExecutionResult{
 				Success: false,
-				Error:   fmt.Errorf("invalid start_time format: %w", err),
+				Error:   fmt.Sprintf("invalid start_time format: %v", err),
 			}, nil
 		}
 		start = t
@@ -421,7 +421,7 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 		if err != nil {
 			return &ExecutionResult{
 				Success: false,
-				Error:   fmt.Errorf("invalid end_time format: %w", err),
+				Error:   fmt.Sprintf("invalid end_time format: %v", err),
 			}, nil
 		}
 		end = t
@@ -432,7 +432,7 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 	if err != nil {
 		return &ExecutionResult{
 			Success:  false,
-			Error:    err,
+			Error:    errText(err),
 			Response: fmt.Sprintf("Log analysis failed: %v", err),
 		}, nil
 	}

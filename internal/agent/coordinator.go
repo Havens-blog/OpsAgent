@@ -43,7 +43,7 @@ type TaskSubmission struct {
 	Result      *ExecutionResult
 	SubmittedAt time.Time
 	CompletedAt time.Time
-	Error       error
+	Error       string
 }
 
 // NewCoordinatorAgent creates a new coordinator agent.
@@ -166,7 +166,7 @@ func (c *CoordinatorAgent) DelegateTask(ctx context.Context, agentName string, t
 	submission.Status = "completed"
 	submission.CompletedAt = time.Now()
 	submission.Result = result
-	submission.Error = err
+	submission.Error = errText(err)
 
 	if err != nil {
 		submission.Status = "failed"
@@ -246,7 +246,7 @@ func (c *CoordinatorAgent) Execute(ctx context.Context, task *Task) (*ExecutionR
 	if err != nil {
 		return &ExecutionResult{
 			Success: false,
-			Error:   err,
+			Error:   errText(err),
 			Response: fmt.Sprintf("Failed to create execution plan: %v", err),
 		}, nil
 	}
@@ -529,14 +529,14 @@ func (c *CoordinatorAgent) executePlan(ctx context.Context, originalTask *Task, 
 			if err != nil {
 				return &ExecutionResult{
 					Success: false,
-					Error:   err,
+					Error:   errText(err),
 					Response: fmt.Sprintf("Delegation to %s failed: %v", del.AgentName, err),
 				}
 			}
 			submissions = append(submissions, sub)
 
 			// Stop if task failed
-			if sub.Error != nil || (sub.Result != nil && !sub.Result.Success) {
+			if sub.Error != "" || (sub.Result != nil && !sub.Result.Success) {
 				return &ExecutionResult{
 					Success: false,
 					Error:   sub.Error,
@@ -550,7 +550,7 @@ func (c *CoordinatorAgent) executePlan(ctx context.Context, originalTask *Task, 
 
 		// Check if all succeeded
 		for _, sub := range submissions {
-			if sub.Error != nil || (sub.Result != nil && !sub.Result.Success) {
+			if sub.Error != "" || (sub.Result != nil && !sub.Result.Success) {
 				return &ExecutionResult{
 					Success: false,
 					Response: fmt.Sprintf("One or more parallel tasks failed"),
@@ -609,7 +609,7 @@ func (c *CoordinatorAgent) executeTask(ctx context.Context, task *Task) *Executi
 
 	return &ExecutionResult{
 		Success: false,
-		Error:   fmt.Errorf("unable to route task to a specialist agent"),
+		Error:   "unable to route task to a specialist agent",
 		Response: fmt.Sprintf("无法将任务路由到可用专家（可用：%v）。请提供明确的 type 参数（rca / log_analysis / inspection）或稍后重试。", availableAgents),
 		Data: map[string]interface{}{
 			"available_agents": availableAgents,
