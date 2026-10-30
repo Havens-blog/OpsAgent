@@ -223,17 +223,21 @@ func timelineFromReport(report *models.RCAReport) []incidentTimelineDTO {
 }
 
 // hypothesisTypeToEvidenceType maps the RCA hypothesis type onto the console's
-// evidence badge vocabulary (metric/log/trace/change/topology).
+// evidence badge vocabulary (metric/log/trace/change/topology/resource).
 func hypothesisTypeToEvidenceType(t models.HypothesisType) string {
 	switch t {
-	case models.HypothesisTypeMetricAnomaly, models.HypothesisTypeResource:
+	case models.HypothesisTypeMetricAnomaly:
 		return "metric"
+	case models.HypothesisTypeResource:
+		return "resource"
 	case models.HypothesisTypeErrorSpike, models.HypothesisTypeLatency:
 		return "log"
 	case models.HypothesisTypeChange:
 		return "change"
 	case models.HypothesisTypeDependency:
 		return "topology"
+	case models.HypothesisTypeWAFAttack:
+		return "waf"
 	default:
 		return "log"
 	}

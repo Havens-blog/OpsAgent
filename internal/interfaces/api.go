@@ -22,6 +22,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
 	"github.com/Havens-blog/OpsAgent/internal/tenant"
+	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
 
 // APIServer represents the REST API server.
@@ -56,18 +57,21 @@ type APIServer struct {
 	// RCA engine reasons over. Previously a separate mock topology.ARMSClient
 	// served this endpoint, so real topology never reached the console.
 	topologySource sources.TopologySource
+
 	// changeSource is the REAL change-event source shared with the RCA engine
 	// (K8s deployment conditions or e-cam k8s-events, whichever is configured
-	// and reachable). changeSourceReal mirrors active["changes"]: when false the
-	// dimension fell back to the honest empty source and /api/v1/changes MUST
-	// return an empty list with a hint — never query the fallback, never
-	// fabricate entries.
+	// and verified reachable). changeSourceReal mirrors active["changes"]:
+	// when false, the dimension fell back to the honest empty source and
+	// /api/v1/changes MUST return an empty list with an explanatory hint —
+	// never query the fallback, never fabricate entries. Both are injected by
+	// initAgents from the same CreateRCASourcesWithFallback result the agents
+	// use, so the console and the RCA engine see one identical change feed.
 	changeSource     sources.ChangeSource
 	changeSourceReal bool
 
 	// changeCache memoizes the (expensive) real-source query for a short TTL:
-	// the upstream event scan takes seconds, so console reloads would otherwise
-	// re-pay it on every visit. Keyed by the quantized window + source identity.
+	// the K8s event scan takes seconds, and console reloads/polling would
+	// otherwise re-pay it on every visit. Keyed by the quantized window.
 	changeCacheMu    sync.Mutex
 	changeCacheSrc   sources.ChangeSource
 	changeCacheKey   string
@@ -95,6 +99,11 @@ type APIServer struct {
 
 	// Async agent task records (tenant-scoped, in-memory).
 	taskStore AgentTaskStore
+
+	// agentTools holds the specialists' bound tools (collected by initAgents)
+	// so the chat assistant shares the SAME real tool implementations instead
+	// of unbound stubs.
+	agentTools []*tool.Tool
 
 	// agentMeta holds display metadata for registered agents (keyed by id).
 	agentMeta map[string]*agentEntry
@@ -149,13 +158,26 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		traceSource = sources.NewEmptyTraceSource()
 	}
 
-	rcaEngine, err := engine.NewEngine(
+	engineOpts := []engine.Option{
 		engine.WithLogSource(rcaSources.LogSource),
 		engine.WithMetricSource(rcaSources.MetricSource),
 		engine.WithTraceSource(traceSource),
 		engine.WithTopologySource(rcaSources.TopologySource),
 		engine.WithChangeSource(rcaSources.ChangeSource),
-	)
+	}
+	if rcaSources.WAFSource != nil {
+		engineOpts = append(engineOpts, engine.WithWAFSource(rcaSources.WAFSource))
+	}
+	if rcaSources.BackendResolver != nil {
+		engineOpts = append(engineOpts, engine.WithDomainBackendResolver(rcaSources.BackendResolver))
+	}
+	if rcaSources.SLBEdgeResolver != nil {
+		engineOpts = append(engineOpts, engine.WithSLBEdgeResolver(rcaSources.SLBEdgeResolver))
+	}
+	if rcaSources.CDNEdgeResolver != nil {
+		engineOpts = append(engineOpts, engine.WithCDNEdgeResolver(rcaSources.CDNEdgeResolver))
+	}
+	rcaEngine, err := engine.NewEngine(engineOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create RCA engine: %w", err)
 	}
@@ -164,6 +186,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		observability.Bool("topology_real", dsActive["topology"]),
 		observability.Bool("changes_real", dsActive["changes"]),
 		observability.Bool("logs_real", dsActive["logs"]),
+		observability.Bool("waf_real", dsActive["waf"]),
 	)
 
 	// Initialize RCA report store
@@ -192,10 +215,10 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	// tool-execution path and the approval HTTP endpoints.
 	approvalMgr := guardrails.NewApprovalManager(nil)
 	pendingApprovals := NewPendingApprovalStore()
-	if chatService != nil {
-		provider := newRegistryToolProvider(buildChatToolRegistry(), settings.DataSources, approvalMgr)
-		chatService.SetToolProvider(provider)
-	}
+	// WAF facts querier (nil when e-cam is not configured): shared between the
+	// chat tool registry and the WatchAlert webhook. The chat tool PROVIDER is
+	// wired after initAgents — it needs the specialists' bound tools.
+	wafQ := newWAFQuerier(dsCfg)
 
 	// Bearer token for /api/v1/* access. Read from env (single source of
 	// truth shared with the frontend proxy). Empty => enforcement disabled.
@@ -262,6 +285,14 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	// Construct and register the coordinator + specialist agents (nil-safe:
 	// a failed construction simply omits that agent).
 	server.initAgents()
+
+	// Chat tool provider: the SAME bound specialist tools the agents use
+	// (collected by initAgents) plus the WAF facts tool and the mock
+	// approval-path tool. Wired here because bound tools need live agents.
+	if chatService != nil {
+		provider := newRegistryToolProvider(buildChatToolRegistry(server.agentTools, wafQ), settings.DataSources, approvalMgr)
+		chatService.SetToolProvider(provider)
+	}
 
 	server.setupRoutes()
 
@@ -925,14 +956,13 @@ type topologyNodeDTO struct {
 	Throughput float64 `json:"throughput"`
 }
 
+// topologyEdgeDTO carries only what the console consumes (from/to/type). The
+// old "id" was a synthetic index and error_rate/latency/throughput were always
+// zero (never populated), so they were ~40 bytes of dead weight per edge.
 type topologyEdgeDTO struct {
-	ID         string  `json:"id"`
-	FromNodeID string  `json:"from_node_id"`
-	ToNodeID   string  `json:"to_node_id"`
-	Type       string  `json:"type"`
-	ErrorRate  float64 `json:"error_rate"`
-	Latency    float64 `json:"latency"`
-	Throughput float64 `json:"throughput"`
+	FromNodeID string `json:"from_node_id"`
+	ToNodeID   string `json:"to_node_id"`
+	Type       string `json:"type"`
 }
 
 // topologyHandler returns the service dependency graph from the SAME topology
@@ -1008,9 +1038,8 @@ func (s *APIServer) topologyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	edges := make([]topologyEdgeDTO, 0, len(topo.Edges))
-	for i, e := range topo.Edges {
+	for _, e := range topo.Edges {
 		edges = append(edges, topologyEdgeDTO{
-			ID:         fmt.Sprintf("e%d", i),
 			FromNodeID: e.From,
 			ToNodeID:   e.To,
 			Type:       e.Type,

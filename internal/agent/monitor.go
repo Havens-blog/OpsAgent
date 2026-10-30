@@ -55,10 +55,6 @@ When analyzing an incident:
 		return nil, err
 	}
 
-	if err := base.Initialize(CreateMonitorTools()); err != nil {
-		return nil, err
-	}
-
 	agent := &MonitorAgent{
 		BaseAgent: base,
 	}

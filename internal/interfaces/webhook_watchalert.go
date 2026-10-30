@@ -139,6 +139,7 @@ func (s *APIServer) watchAlertWebhookHandler(w http.ResponseWriter, r *http.Requ
 	// treats a non-200 as a delivery failure and would retry).
 	go func() {
 		ctx := tenant.WithID(context.Background(), tid)
+
 		report, err := s.rcaEngine.Analyze(ctx, incident)
 		if err != nil {
 			s.logger.Error("WatchAlert-triggered RCA failed",
@@ -165,7 +166,14 @@ func (s *APIServer) watchAlertWebhookHandler(w http.ResponseWriter, r *http.Requ
 		)
 
 		// P0.2: close the loop — push the completed analysis to IM.
-		s.notifyRCACompleted(report)
+		facts := wafNoticeExtra(report)
+		if facts != "" {
+			s.logger.Info("WAF facts attached to RCA notification",
+				observability.String("incident_id", incident.ID),
+				observability.String("facts", facts),
+			)
+		}
+		s.notifyRCACompleted(report, facts)
 	}()
 
 	// Return 200 (not 202) — watch-alert's WebHookSender treats any non-200 as
@@ -330,7 +338,7 @@ func extractServices(labels map[string]interface{}, ruleName, datasourceType str
 // notifyRCACompleted sends a best-effort IM summary after RCA finishes, using
 // the stored notification config. Empty webhook/platform silently no-ops so an
 // unconfigured notification channel never breaks the analysis path.
-func (s *APIServer) notifyRCACompleted(report *models.RCAReport) {
+func (s *APIServer) notifyRCACompleted(report *models.RCAReport, extra string) {
 	cfg := s.settings.ToNotificationConfig()
 	if cfg.WebhookURL == "" {
 		return
@@ -346,8 +354,19 @@ func (s *APIServer) notifyRCACompleted(report *models.RCAReport) {
 		incidentID = report.Incident.ID
 		severity = report.Incident.Severity
 	}
-	text := fmt.Sprintf("[%s] 告警 #%s RCA 完成\n%s",
-		severity, incidentID, report.GetSummary())
+	// WAF attack facts first: they directly answer the alarm's ask (attack
+	// types + sources), while the engine's cross-dimension hypotheses are
+	// supporting signals (the engine itself has no WAF dimension).
+	text := fmt.Sprintf("[%s] 告警 #%s RCA 完成", severity, incidentID)
+	if extra != "" {
+		text += "\n\n" + extra
+	}
+	text += "\n\n" + report.GetSummary()
+
+	s.logger.Info("RCA completion notification",
+		observability.String("incident_id", incidentID),
+		observability.String("text", text),
+	)
 
 	_, _, err := deliverIMMessage(platform, cfg.WebhookURL, cfg.Secret, text)
 	if err != nil {
@@ -371,4 +390,21 @@ func joinNonEmpty(parts []string, sep string) string {
 		out += p
 	}
 	return out
+}
+
+// wafNoticeExtra surfaces the engine's WAF facts in the IM notice only when
+// the summary would not already carry them. WAF is a scored RCA dimension now,
+// so the engine fetches these facts itself — re-querying here would duplicate
+// both the call and the text on-call has to read.
+func wafNoticeExtra(report *models.RCAReport) string {
+	if report == nil || report.Signals == nil || report.Signals.WAFFacts == nil {
+		return ""
+	}
+	if report.TopCandidate != nil &&
+		report.TopCandidate.Hypothesis.Type == models.HypothesisTypeWAFAttack {
+		return "" // the top candidate's evidence already lists these facts
+	}
+	// Includes the honest "window held no attack entries" case, which the
+	// root-cause section cannot express (no hypothesis is generated for it).
+	return report.Signals.WAFFacts.Text()
 }

@@ -4,6 +4,7 @@ package interfaces
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 	"github.com/Havens-blog/OpsAgent/internal/tenant"
+	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
 
 // executableAgent is the narrow interface the API layer needs: run a task.
@@ -53,17 +55,10 @@ func (s *APIServer) initAgents() {
 		return exec
 	}
 
-	// Specialist agents.
-	logAnalyst, laErr := agent.NewLogAnalystAgent(s.settings)
-	register("log_analyst", "LogAnalyst", "log_analyst",
-		"日志模式识别与错误关联分析",
-		[]string{"log_analysis", "pattern_detection", "error_correlation"},
-		wrapLogAnalyst(logAnalyst), laErr)
-
-	// Build RCA data sources with progressive enhancement: real integrations
-	// where credentials are present (from env), mock for every other
-	// dimension. The system is always functional and upgrades per-dimension as
-	// credentials are supplied.
+	// Build RCA data sources FIRST: the log analyst needs the shared log
+	// source and the monitor needs the full set for its RCA engine.
+	// Progressive enhancement: real integrations where credentials are present
+	// (from env), honest empty sources otherwise.
 	dsCfg := agent.NewDataSourceConfigFromEnv()
 	rcaSources, active := agent.CreateRCASourcesWithFallback(dsCfg)
 	s.dataSourceStatus = active
@@ -80,6 +75,18 @@ func (s *APIServer) initAgents() {
 		observability.Bool("logs_real", active["logs"]),
 	)
 
+	// Specialist agents.
+	logAnalyst, laErr := agent.NewLogAnalystAgent(s.settings)
+	if laErr == nil && logAnalyst != nil {
+		// Without this the analyst dead-ends on "log source not configured" —
+		// it has no source of its own and must share the RCA log source.
+		logAnalyst.SetLogSource(rcaSources.LogSource)
+	}
+	register("log_analyst", "LogAnalyst", "log_analyst",
+		"日志模式识别与错误关联分析",
+		[]string{"log_analysis", "pattern_detection", "error_correlation"},
+		wrapLogAnalyst(logAnalyst), laErr)
+
 	monitor, mErr := agent.NewMonitorAgent(s.settings, rcaSources)
 	register("monitor", "Monitor", "monitor",
 		"APM 指标分析与根因分析",
@@ -92,7 +99,51 @@ func (s *APIServer) initAgents() {
 		[]string{"inspection", "compliance_check", "resource_audit"},
 		wrapInspector(inspector), iErr)
 
-	// Coordinator orchestrates the specialists.
+	// Resource-topology specialist over the e-cmdb + SLB access logs. Real only
+	// when its data sources are configured; otherwise the agent is absent
+	// (honest absence, not a mock).
+	cmdbSource := agent.NewCMDBDataSourceFromConfig(dsCfg)
+	slbSource := agent.NewECamSLBSourceFromConfig(dsCfg)
+	topologyAgent, tErr := agent.NewTopologyAgent(s.settings, cmdbSource, slbSource, dsCfg.ECamTenantID)
+	if cmdbSource == nil && slbSource == nil {
+		tErr = fmt.Errorf("CMDB/SLB source not configured")
+	}
+	register("resource_topology", "Topology", "resource_topology",
+		"CMDB 资源拓扑与域名源站查询",
+		[]string{"cmdb", "resource_topology", "domain_origin", "inventory"},
+		wrapTopology(topologyAgent), tErr)
+
+	// Bind each specialist's real tools: into the agent's own registry (its LLM
+	// path can call them) and into s.agentTools for the chat tool registry —
+	// one source of truth; chat used to get unbound "use method directly" stubs.
+	bind := func(name string, tools []*tool.Tool, initialize func([]*tool.Tool) error) {
+		if len(tools) == 0 {
+			return
+		}
+		if err := initialize(tools); err != nil {
+			s.logger.Warn("Agent tool registration failed",
+				observability.String("agent", name),
+				observability.Err(err),
+			)
+		}
+		s.agentTools = append(s.agentTools, tools...)
+	}
+	if logAnalyst != nil {
+		bind("log_analyst", logAnalyst.BoundTools(), logAnalyst.Initialize)
+	}
+	if monitor != nil {
+		bind("monitor", monitor.BoundTools(), monitor.Initialize)
+	}
+	if inspector != nil {
+		bind("inspector", inspector.BoundTools(), inspector.Initialize)
+	}
+	if topologyAgent != nil {
+		bind("resource_topology", topologyAgent.BoundTools(), topologyAgent.Initialize)
+	}
+
+	// Coordinator orchestrates the specialists. Register the TYPED agents (not
+	// their embedded *BaseAgent): Go dispatches statically, and only the typed
+	// Execute carries the task-type routing into the real capabilities.
 	coordinator, cErr := agent.NewCoordinatorAgent(s.settings)
 	if cErr == nil {
 		// Register specialists for delegation (best-effort).
@@ -104,6 +155,9 @@ func (s *APIServer) initAgents() {
 		}
 		if inspector != nil {
 			_ = coordinator.RegisterAgent("inspector", inspector)
+		}
+		if topologyAgent != nil {
+			_ = coordinator.RegisterAgent("resource_topology", topologyAgent)
 		}
 	}
 	register("coordinator", "Coordinator", "coordinator",
@@ -128,6 +182,12 @@ func wrapMonitor(a *agent.MonitorAgent) executableAgent {
 	return a
 }
 func wrapInspector(a *agent.InspectorAgent) executableAgent {
+	if a == nil {
+		return nil
+	}
+	return a
+}
+func wrapTopology(a *agent.TopologyAgent) executableAgent {
 	if a == nil {
 		return nil
 	}

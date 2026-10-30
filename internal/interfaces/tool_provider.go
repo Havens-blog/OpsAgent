@@ -4,7 +4,6 @@ package interfaces
 import (
 	"context"
 
-	"github.com/Havens-blog/OpsAgent/internal/agent"
 	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/tool"
@@ -92,19 +91,16 @@ func approvalScope(s string) guardrails.ApprovalScope {
 	return guardrails.ScopeOneShot
 }
 
-// buildChatToolRegistry registers the read-only specialist tools plus a mock
-// confirmation-required tool so the approval path is reachable end-to-end.
-func buildChatToolRegistry() *tool.Registry {
+// buildChatToolRegistry registers the specialists' BOUND tools (real
+// implementations collected from the live agents by initAgents), the factual
+// WAF query tool, plus a mock confirmation-required tool so the approval path
+// is reachable end-to-end.
+func buildChatToolRegistry(specialistTools []*tool.Tool, wq *wafQuerier) *tool.Registry {
 	reg := tool.NewRegistry()
-	for _, t := range agent.CreateLogAnalystTools() {
+	for _, t := range specialistTools {
 		_ = reg.Register(t)
 	}
-	for _, t := range agent.CreateMonitorTools() {
-		_ = reg.Register(t)
-	}
-	for _, t := range agent.CreateInspectorTools() {
-		_ = reg.Register(t)
-	}
+	_ = reg.Register(createWAFLogQueryTool(wq))
 	_ = reg.Register(mockRestartServiceTool())
 	return reg
 }

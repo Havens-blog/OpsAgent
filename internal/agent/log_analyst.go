@@ -52,10 +52,6 @@ When analyzing logs:
 		return nil, err
 	}
 
-	if err := base.Initialize(CreateLogAnalystTools()); err != nil {
-		return nil, err
-	}
-
 	return &LogAnalystAgent{
 		BaseAgent: base,
 	}, nil

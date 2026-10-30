@@ -43,7 +43,7 @@ func TestSpecialistAgentsRegisterTools(t *testing.T) {
 		}
 		defer agent.Shutdown(context.Background())
 
-		tools := CreateMonitorTools()
+		tools := agent.BoundTools()
 		available := agent.GetAvailableTools()
 		if len(available) != len(tools) {
 			t.Fatalf("expected %d available tools, got %d (%v)", len(tools), len(available), available)
@@ -64,7 +64,7 @@ func TestSpecialistAgentsRegisterTools(t *testing.T) {
 		}
 		defer agent.Shutdown(context.Background())
 
-		tools := CreateLogAnalystTools()
+		tools := agent.BoundTools()
 		available := agent.GetAvailableTools()
 		if len(available) != len(tools) {
 			t.Fatalf("expected %d available tools, got %d (%v)", len(tools), len(available), available)
@@ -83,7 +83,7 @@ func TestSpecialistAgentsRegisterTools(t *testing.T) {
 		}
 		defer agent.Shutdown(context.Background())
 
-		tools := CreateInspectorTools()
+		tools := agent.BoundTools()
 		available := agent.GetAvailableTools()
 		if len(available) != len(tools) {
 			t.Fatalf("expected %d available tools, got %d (%v)", len(tools), len(available), available)
