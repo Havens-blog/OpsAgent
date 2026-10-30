@@ -474,6 +474,8 @@ export interface RCAReport {
   confidence: number
   duration_ms?: number
   generated_at?: string
+  /** 各数据源采集失败的告警，为空数组表示无告警。 */
+  warnings?: string[]
 }
 
 /* ---------- Chat types ---------- */
