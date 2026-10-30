@@ -3,8 +3,12 @@ package interfaces
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -33,15 +37,105 @@ type PendingApproval struct {
 	ClientMessageID string `json:"client_message_id,omitempty"`
 }
 
-// PendingApprovalStore keeps in-memory pending approvals for the HTTP layer.
+// PendingApprovalStore keeps pending approvals for the HTTP layer. When path
+// is non-empty, mutations write a full snapshot to disk after each change.
 type PendingApprovalStore struct {
 	mu    sync.RWMutex
+	path  string
 	items map[string]*PendingApproval
 }
 
-// NewPendingApprovalStore creates an empty pending approval store.
+// persistedApprovals is the on-disk snapshot shape. The loader also accepts a
+// bare map[string]*PendingApproval for older snapshots.
+type persistedApprovals struct {
+	Items map[string]*PendingApproval `json:"items"`
+}
+
+// NewPendingApprovalStore creates an empty in-memory pending approval store.
 func NewPendingApprovalStore() *PendingApprovalStore {
 	return &PendingApprovalStore{items: make(map[string]*PendingApproval)}
+}
+
+// NewFileBackedPendingApprovalStore loads the snapshot at path, or starts
+// empty when it does not exist. A corrupt or unreadable file returns an error.
+func NewFileBackedPendingApprovalStore(path string) (*PendingApprovalStore, error) {
+	if path == "" {
+		return nil, fmt.Errorf("pending approval store path is required")
+	}
+	s := &PendingApprovalStore{path: path, items: make(map[string]*PendingApproval)}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// load reads and decodes the snapshot. A missing file is the empty store. Only
+// pending, unexpired entries are restored so handled or stale approvals do not
+// come back to life after a restart.
+func (s *PendingApprovalStore) load() error {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read approval store %s: %w", s.path, err)
+	}
+
+	var withItems persistedApprovals
+	if err := json.Unmarshal(data, &withItems); err != nil {
+		return fmt.Errorf("parse approval store %s: %w", s.path, err)
+	}
+	items := withItems.Items
+	if items == nil {
+		items = make(map[string]*PendingApproval)
+		if err := json.Unmarshal(data, &items); err != nil {
+			return fmt.Errorf("parse approval store %s: %w", s.path, err)
+		}
+	}
+
+	now := time.Now()
+	for id, p := range items {
+		if p != nil && p.Status == "pending" && now.Before(p.ExpiresAt) {
+			s.items[id] = p
+		}
+	}
+	return nil
+}
+
+// persistLocked writes the current state to a temp file in the same directory
+// and atomically renames it over the target. Callers must hold the write lock.
+func (s *PendingApprovalStore) persistLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create approval store dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(persistedApprovals{Items: s.items}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode approval store: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(dir, filepath.Base(s.path)+".tmp*")
+	if err != nil {
+		return fmt.Errorf("create approval store temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write approval store temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close approval store temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return fmt.Errorf("replace approval store: %w", err)
+	}
+	return nil
 }
 
 // Create stores a pending approval.
@@ -52,7 +146,7 @@ func (s *PendingApprovalStore) Create(p *PendingApproval) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items[p.ApprovalID] = p
-	return nil
+	return s.persistLocked()
 }
 
 // Get returns a pending approval by id.
@@ -125,7 +219,7 @@ func (s *PendingApprovalStore) SetStatus(id, status string) error {
 		return fmt.Errorf("approval not found: %s", id)
 	}
 	p.Status = status
-	return nil
+	return s.persistLocked()
 }
 
 // approvalsHandler handles GET /api/v1/approvals.
