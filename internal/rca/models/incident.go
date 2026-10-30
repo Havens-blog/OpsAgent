@@ -79,28 +79,32 @@ type Signals struct {
 	Traces   []TraceSummary
 	Topology *Topology
 	Changes  []Change
+
+	// SourceErrors records per-source collection failures so the report can
+	// surface them without failing the whole analysis.
+	SourceErrors map[string]string
 }
 
 // NormalizedSignals contains time-aligned signals for correlation.
 type NormalizedSignals struct {
-	TimeWindows    []TimeWindow
-	LogByWindow    map[int][]LogEntry
-	MetricTrends   map[string]map[int]Trend
-	TraceByWindow  map[int][]TraceSummary
-	Changes        []Change
-	Topology       *Topology
+	TimeWindows   []TimeWindow
+	LogByWindow   map[int][]LogEntry
+	MetricTrends  map[string]map[int]Trend
+	TraceByWindow map[int][]TraceSummary
+	Changes       []Change
+	Topology      *Topology
 }
 
 // LogEntry represents a single log record.
 type LogEntry struct {
-	Timestamp   time.Time
-	Service     string
-	Level       string
-	Message     string
-	TraceID     string
-	SpanID      string
-	Labels      map[string]string
-	IsError     bool
+	Timestamp time.Time
+	Service   string
+	Level     string
+	Message   string
+	TraceID   string
+	SpanID    string
+	Labels    map[string]string
+	IsError   bool
 }
 
 // MetricSeries represents a time series of metric values.
@@ -119,14 +123,14 @@ type DataPoint struct {
 
 // TraceSummary represents a distributed trace summary.
 type TraceSummary struct {
-	TraceID      string
-	StartTime    time.Time
-	Duration     time.Duration
-	ServiceName  string
+	TraceID       string
+	StartTime     time.Time
+	Duration      time.Duration
+	ServiceName   string
 	OperationName string
-	HasError     bool
-	SpanCount    int
-	Spans        []Span
+	HasError      bool
+	SpanCount     int
+	Spans         []Span
 }
 
 // Span represents a single span in a trace.
