@@ -23,10 +23,10 @@ export function timeAgo(iso?: string): string {
   const d = new Date(iso).getTime()
   if (Number.isNaN(d)) return iso
   const sec = Math.round((Date.now() - d) / 1000)
-  if (sec < 60) return `${sec}s ago`
-  if (sec < 3600) return `${Math.round(sec / 60)}m ago`
-  if (sec < 86400) return `${Math.round(sec / 3600)}h ago`
-  return `${Math.round(sec / 86400)}d ago`
+  if (sec < 60) return `${sec} 秒前`
+  if (sec < 3600) return `${Math.round(sec / 60)} 分钟前`
+  if (sec < 86400) return `${Math.round(sec / 3600)} 小时前`
+  return `${Math.round(sec / 86400)} 天前`
 }
 
 /** Format a 0-1 confidence as a percentage. */
