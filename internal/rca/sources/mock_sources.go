@@ -81,6 +81,23 @@ func (m *MockLogSource) QueryErrors(ctx context.Context, start, end time.Time) (
 	return logs, nil
 }
 
+// QueryErrorsByService retrieves mock error logs for a specific service.
+func (m *MockLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	allLogs, err := m.QueryErrors(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	var filtered []models.LogEntry
+	for _, entry := range allLogs {
+		if entry.Service == service {
+			filtered = append(filtered, entry)
+		}
+	}
+
+	return filtered, nil
+}
+
 // QueryLogsByService retrieves mock logs for a specific service.
 func (m *MockLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	allLogs, err := m.QueryErrors(ctx, start, end)
@@ -211,6 +228,12 @@ func (m *MockMetricSource) QueryMetricsForService(ctx context.Context, service s
 // GetAlerts returns current active alerts (mock).
 func (m *MockMetricSource) GetAlerts(ctx context.Context) ([]Alert, error) {
 	return []Alert{}, nil
+}
+
+// QueryMetricRange returns the same fabricated series as QueryAnomalies.
+// TEST-ONLY: it does not contact a real backend and ignores the query/step.
+func (m *MockMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	return m.QueryAnomalies(ctx, start, end)
 }
 
 // MockChangeSource provides a mock implementation of ChangeSource.
@@ -458,9 +481,3 @@ var _ MetricSource = (*MockMetricSource)(nil)
 var _ TraceSource = (*MockTraceSource)(nil)
 var _ TopologySource = (*MockTopologySource)(nil)
 var _ ChangeSource = (*MockChangeSource)(nil)
-
-// QueryMetricRange returns the same fabricated series as QueryAnomalies.
-// TEST-ONLY: it does not contact a real backend and ignores the query/step.
-func (m *MockMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
-	return m.QueryAnomalies(ctx, start, end)
-}

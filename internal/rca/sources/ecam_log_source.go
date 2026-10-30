@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,12 +81,16 @@ type ecamFieldFilter struct {
 
 // ecamSearchRequest is the /api/v1/cam/logs/search body. Timestamps are Unix
 // MILLISECONDS (the federation passes them through to the SDK unchanged).
+// Resources scopes the query to specific federation resources (for app logs:
+// store names) — a store-level scope is far cheaper than a field filter,
+// which fans out over every store.
 type ecamSearchRequest struct {
 	LogType   string            `json:"log_type"`
 	StartTime int64             `json:"start_time"`
 	EndTime   int64             `json:"end_time"`
 	Query     string            `json:"query"`
 	Filters   []ecamFieldFilter `json:"filters,omitempty"`
+	Resources []string          `json:"resources,omitempty"`
 	Limit     int               `json:"limit"`
 }
 
@@ -111,10 +117,13 @@ type ecamEntryMeta struct {
 	Source      string `json:"source"`
 }
 
-// ecamSearchData is the search response payload.
+// ecamSearchData is the search response payload. Truncated marks that the
+// federation merge cap cut the result set — counts derived from a truncated
+// page under-report, so it is surfaced instead of silently ignored.
 type ecamSearchData struct {
-	Total   int64          `json:"total"`
-	Entries []ecamLogEntry `json:"entries"`
+	Total     int64          `json:"total"`
+	Entries   []ecamLogEntry `json:"entries"`
+	Truncated bool           `json:"truncated"`
 }
 
 // ecamAggregateRequest is the /api/v1/cam/logs/aggregate body (count metric).
@@ -160,19 +169,50 @@ func (s *ECamLogSource) QueryErrors(ctx context.Context, start, end time.Time) (
 	})
 }
 
-// QueryLogsByService implements LogSource: logs of one service in the window.
-func (s *ECamLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
-	if strings.TrimSpace(service) == "" {
-		return nil, fmt.Errorf("ecam log source: empty service name")
-	}
-	return s.search(ctx, ecamSearchRequest{
+// appStoreSuffix is the federation's app-log store naming: one SLS store per
+// service, "<service>-business". Scoping a query with resources=[store] hits
+// that single store (~0.7s measured); a service field FILTER instead fans out
+// over all ~800 stores (~26s+) because filters don't select stores.
+const appStoreSuffix = "-business"
+
+// serviceRequest builds a store-scoped search for one service. errorsOnly adds
+// the level=error pushdown. Non-app log types have no per-service stores, so
+// they keep the filter-based scoping.
+func (s *ECamLogSource) serviceRequest(service string, start, end time.Time, errorsOnly bool) ecamSearchRequest {
+	req := ecamSearchRequest{
 		LogType:   s.logType,
 		StartTime: start.UnixMilli(),
 		EndTime:   end.UnixMilli(),
 		Query:     "*",
-		Filters:   []ecamFieldFilter{{Field: "service", Op: "eq", Value: service}},
 		Limit:     ecamQueryLimit,
-	})
+	}
+	if errorsOnly {
+		req.Filters = append(req.Filters, ecamFieldFilter{Field: "level", Op: "eq", Value: "error"})
+	}
+	if s.logType == "app" {
+		req.Resources = []string{service + appStoreSuffix}
+	} else {
+		req.Filters = append(req.Filters, ecamFieldFilter{Field: "service", Op: "eq", Value: service})
+	}
+	return req
+}
+
+// QueryErrorsByService implements LogSource: error-level logs of one service,
+// store-scoped (see appStoreSuffix).
+func (s *ECamLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	if strings.TrimSpace(service) == "" {
+		return nil, fmt.Errorf("ecam log source: empty service name")
+	}
+	return s.search(ctx, s.serviceRequest(service, start, end, true))
+}
+
+// QueryLogsByService implements LogSource: logs of one service in the window,
+// store-scoped (see appStoreSuffix).
+func (s *ECamLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	if strings.TrimSpace(service) == "" {
+		return nil, fmt.Errorf("ecam log source: empty service name")
+	}
+	return s.search(ctx, s.serviceRequest(service, start, end, false))
 }
 
 // GetLogCount implements LogSource: exact window count for a service, pushed
@@ -240,6 +280,9 @@ func (s *ECamLogSource) search(ctx context.Context, body ecamSearchRequest) ([]m
 	var data ecamSearchData
 	if err := s.post(ctx, s.pathPrefix+"/search", body, &data); err != nil {
 		return nil, err
+	}
+	if data.Truncated {
+		log.Printf("[ecam-log-source] WARN: search truncated at the federation merge cap (total=%d, returned=%d); error counts may under-report", data.Total, len(data.Entries))
 	}
 	out := make([]models.LogEntry, 0, len(data.Entries))
 	for _, e := range data.Entries {
@@ -323,4 +366,219 @@ func nonEmpty(vals ...string) []string {
 		}
 	}
 	return out
+}
+
+// ecamSLBEntry is the SLB/ALB access-log entry subset that maps a host to its
+// backend: target_ip (upstream) and raw.server_group_name (which names the k8s
+// Service when the backend is a cluster workload).
+type ecamSLBEntry struct {
+	Host       string         `json:"host"`
+	TargetIP   string         `json:"target_ip"`
+	TargetPort int            `json:"target_port"`
+	Status     int            `json:"status"`
+	Raw        map[string]any `json:"raw"`
+}
+
+// SLBBackend is one resolved backend of a domain from the SLB access log.
+type SLBBackend struct {
+	Domain   string `json:"domain"`
+	TargetIP string `json:"target_ip"`
+	Service  string `json:"service"` // k8s Service name from server_group_name
+	Port     int    `json:"port"`
+}
+
+// DomainBackendResolver resolves a host to its backend k8s services. The RCA
+// engine uses it to anchor a domain-scoped (dial-test) alarm on the real
+// backend instead of a business-unit token guess.
+type DomainBackendResolver interface {
+	QueryDomainBackends(ctx context.Context, domain string, start, end time.Time) ([]SLBBackend, error)
+}
+
+// SLBEdgeResolver returns window-scoped SLB access-log facts for a domain:
+// total requests, sampled 5xx count, and the resolved backends. The engine
+// renders these as edge reference facts (never root-cause candidates) so a
+// dial-test "unavailable rate" alarm can show whether the SLB actually
+// forwarded 5xx in the window, instead of leaving "edge suspicion" unsupported.
+type SLBEdgeResolver interface {
+	QueryDomainSLB(ctx context.Context, domain string, start, end time.Time) (*models.SLBEdgeFacts, error)
+}
+
+// CDNEdgeResolver returns window-scoped CDN facts for a domain: the CMDB CDN
+// hop (provider/CNAME/origin) plus the e-cam CDN access-log edge-5xx count. The
+// engine renders these as edge reference facts so a dial-test alarm can show
+// the CDN hop and whether its logs are even collected (Total == 0 means no
+// data, stated honestly rather than passed off as "CDN healthy").
+type CDNEdgeResolver interface {
+	QueryDomainCDN(ctx context.Context, domain string, start, end time.Time) (*models.CDNEdgeFacts, error)
+}
+
+// QueryDomainBackends resolves a domain to its backend services by reading the
+// SLB access log: host -> server_group_name -> "<service>-svc" (and the target
+// IP). An empty result is honest "no recorded traffic", not an error.
+func (s *ECamLogSource) QueryDomainBackends(ctx context.Context, domain string, start, end time.Time) ([]SLBBackend, error) {
+	var data struct {
+		Total     int64          `json:"total"`
+		Entries   []ecamSLBEntry `json:"entries"`
+		Truncated bool           `json:"truncated"`
+	}
+	body := ecamSearchRequest{
+		LogType:   "slb",
+		StartTime: start.UnixMilli(),
+		EndTime:   end.UnixMilli(),
+		Query:     "*",
+		Filters:   []ecamFieldFilter{{Field: "host", Op: "contains", Value: domain}},
+		Limit:     200,
+	}
+	if err := s.post(ctx, s.pathPrefix+"/search", body, &data); err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	out := make([]SLBBackend, 0, 4)
+	for _, e := range data.Entries {
+		svc, port := parseServerGroup(strAttr(e.Raw, "server_group_name"))
+		if svc == "" && e.TargetIP == "" {
+			continue
+		}
+		key := svc + "|" + e.TargetIP
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, SLBBackend{Domain: domain, TargetIP: e.TargetIP, Service: svc, Port: port})
+	}
+	return out, nil
+}
+
+// QueryDomainSLB returns the domain's SLB/ALB access-log facts for the window:
+// total matched requests, the sampled 5xx count, and the resolved backends. It
+// reads the same slb store as QueryDomainBackends but with a larger sample so
+// the 5xx ratio is meaningful; the two share the host-contains filter.
+func (s *ECamLogSource) QueryDomainSLB(ctx context.Context, domain string, start, end time.Time) (*models.SLBEdgeFacts, error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return nil, fmt.Errorf("ecam log source: empty domain")
+	}
+	const sampleLimit = 500
+	var data struct {
+		Total     int64          `json:"total"`
+		Entries   []ecamSLBEntry `json:"entries"`
+		Truncated bool           `json:"truncated"`
+	}
+	body := ecamSearchRequest{
+		LogType:   "slb",
+		StartTime: start.UnixMilli(),
+		EndTime:   end.UnixMilli(),
+		Query:     "*",
+		Filters:   []ecamFieldFilter{{Field: "host", Op: "contains", Value: domain}},
+		Limit:     sampleLimit,
+	}
+	if err := s.post(ctx, s.pathPrefix+"/search", body, &data); err != nil {
+		return nil, err
+	}
+
+	facts := &models.SLBEdgeFacts{
+		Total:      data.Total,
+		SampleSize: len(data.Entries),
+	}
+	seen := map[string]bool{}
+	for _, e := range data.Entries {
+		if e.Status >= 500 && e.Status < 600 {
+			facts.Status5xx++
+		}
+		svc, port := parseServerGroup(strAttr(e.Raw, "server_group_name"))
+		if svc == "" && e.TargetIP == "" {
+			continue
+		}
+		key := svc + "|" + e.TargetIP
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		facts.Backends = append(facts.Backends, models.EdgeBackend{
+			Service:  svc,
+			TargetIP: e.TargetIP,
+			Port:     port,
+		})
+	}
+	return facts, nil
+}
+
+// ecamCDNEntry is the subset of the CDN/DCDN access-log entry the edge section
+// needs: the edge response status. DCDN realtime logs carry no origin status
+// field, so only the edge 5xx is derivable — reported as such, never invented.
+type ecamCDNEntry struct {
+	Status int `json:"status"`
+}
+
+// QueryDomainCDNLog returns the domain's CDN access-log totals for the window:
+// federation match count, the sampled edge-5xx count, and the sample size. The
+// CDN federation is per-domain configured, so a domain whose collection is not
+// enabled comes back 0 with no error — the caller must distinguish "no traffic"
+// from "not collected" when reporting.
+func (s *ECamLogSource) QueryDomainCDNLog(ctx context.Context, domain string, start, end time.Time) (total int64, status5xx int, sampleSize int, err error) {
+	domain = strings.ToLower(strings.TrimSpace(domain))
+	if domain == "" {
+		return 0, 0, 0, fmt.Errorf("ecam log source: empty domain")
+	}
+	const sampleLimit = 500
+	var data struct {
+		Total     int64          `json:"total"`
+		Entries   []ecamCDNEntry `json:"entries"`
+		Truncated bool           `json:"truncated"`
+	}
+	body := ecamSearchRequest{
+		LogType:   "cdn",
+		StartTime: start.UnixMilli(),
+		EndTime:   end.UnixMilli(),
+		Query:     "*",
+		Filters:   []ecamFieldFilter{{Field: "host", Op: "contains", Value: domain}},
+		Limit:     sampleLimit,
+	}
+	if err := s.post(ctx, s.pathPrefix+"/search", body, &data); err != nil {
+		return 0, 0, 0, err
+	}
+	for _, e := range data.Entries {
+		if e.Status >= 500 && e.Status < 600 {
+			status5xx++
+		}
+	}
+	return data.Total, status5xx, len(data.Entries), nil
+}
+
+// parseServerGroup extracts the backend name + port from an ALB server group
+// name. k8s groups are "k8s_<cluster>_<ns>_<service>-svc_<port>"; the service
+// is NORMALIZED to the app-log naming (env prefix and "-svc" stripped), because
+// the SLB group ("prod-electronic-access-gateway-svc") must match the app
+// service field ("electronic-access-gateway") for the RCA log scope to hit.
+// Anything else (e.g. a bare "prod-eureka-xxx") is returned verbatim.
+func parseServerGroup(sgn string) (string, int) {
+	if sgn == "" {
+		return "", 0
+	}
+	if !strings.HasPrefix(sgn, "k8s_") {
+		return sgn, 0
+	}
+	parts := strings.Split(sgn, "_")
+	if len(parts) < 4 {
+		return sgn, 0
+	}
+	port := 0
+	if len(parts) >= 5 {
+		port, _ = strconv.Atoi(parts[4])
+	}
+	return normalizeSLBService(parts[3]), port
+}
+
+// normalizeSLBService maps a k8s service name to the app-log service field:
+// "<env>-<name>-svc" -> "<name>".
+func normalizeSLBService(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{"prod-", "uat-", "fat-", "dev-", "test-", "pre-", "gray-", "sim-", "daily-", "stable-"} {
+		if strings.HasPrefix(n, prefix) {
+			n = n[len(prefix):]
+			break
+		}
+	}
+	return strings.TrimSuffix(n, "-svc")
 }

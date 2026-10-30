@@ -45,6 +45,23 @@ func (s *DSLogSource) QueryErrors(ctx context.Context, start, end time.Time) ([]
 	return s.convertToModelLogs(resp.Logs), nil
 }
 
+// QueryErrorsByService retrieves error logs for a specific service.
+func (s *DSLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	req := &core.LogQueryRequest{
+		StartTime: start,
+		EndTime:   end,
+		Intent:    &core.QueryIntent{ErrorsOnly: true, ServiceName: service},
+		Limit:     1000,
+	}
+
+	resp, err := s.logDS.QueryLogs(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query error logs for service %s: %w", service, err)
+	}
+
+	return s.convertToModelLogs(resp.Logs), nil
+}
+
 // QueryLogsByService retrieves logs for a specific service.
 func (s *DSLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	req := &core.LogQueryRequest{
@@ -263,6 +280,58 @@ func (s *DSMetricSource) extractMetricName(query string) string {
 	}
 
 	return query
+}
+
+// QueryMetricRange executes an arbitrary range query and returns every
+// matching series, honouring the requested step. It is the multi-series
+// counterpart to QueryMetric, used by the MCP metrics tool.
+func (s *DSMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	req := &core.MetricsQueryRequest{
+		StartTime: start,
+		EndTime:   end,
+		Query:     query,
+		Step:      parseStepDuration(step),
+	}
+
+	resp, err := s.metricDS.QueryMetrics(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query metrics: %w", err)
+	}
+
+	result := make([]models.MetricSeries, 0, len(resp.Series))
+	for _, series := range resp.Series {
+		modelSeries := models.MetricSeries{
+			Name:       s.extractMetricName(query),
+			Labels:     series.Labels,
+			Unit:       "unknown",
+			DataPoints: make([]models.DataPoint, 0, len(series.DataPoints)),
+		}
+
+		for _, dp := range series.DataPoints {
+			modelSeries.DataPoints = append(modelSeries.DataPoints, models.DataPoint{
+				Timestamp: dp.Timestamp,
+				Value:     dp.Value,
+			})
+		}
+
+		result = append(result, modelSeries)
+	}
+
+	return result, nil
+}
+
+// parseStepDuration converts a Prometheus-style step string into a duration.
+// An empty or unparseable value falls back to one minute, matching the MCP
+// tool's default step.
+func parseStepDuration(step string) time.Duration {
+	step = strings.TrimSpace(step)
+	if step == "" {
+		return time.Minute
+	}
+	if d, err := time.ParseDuration(step); err == nil && d > 0 {
+		return d
+	}
+	return time.Minute
 }
 
 // DSTraceSource implements TraceSource using an APMDataSource.
@@ -505,55 +574,3 @@ var _ MetricSource = (*DSMetricSource)(nil)
 var _ TraceSource = (*DSTraceSource)(nil)
 var _ ChangeSource = (*CDChangeSource)(nil)
 var _ TopologySource = (*ARMASTopologySource)(nil)
-
-// QueryMetricRange executes an arbitrary range query and returns every
-// matching series, honouring the requested step. It is the multi-series
-// counterpart to QueryMetric, used by the MCP metrics tool.
-func (s *DSMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
-	req := &core.MetricsQueryRequest{
-		StartTime: start,
-		EndTime:   end,
-		Query:     query,
-		Step:      parseStepDuration(step),
-	}
-
-	resp, err := s.metricDS.QueryMetrics(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query metrics: %w", err)
-	}
-
-	result := make([]models.MetricSeries, 0, len(resp.Series))
-	for _, series := range resp.Series {
-		modelSeries := models.MetricSeries{
-			Name:       s.extractMetricName(query),
-			Labels:     series.Labels,
-			Unit:       "unknown",
-			DataPoints: make([]models.DataPoint, 0, len(series.DataPoints)),
-		}
-
-		for _, dp := range series.DataPoints {
-			modelSeries.DataPoints = append(modelSeries.DataPoints, models.DataPoint{
-				Timestamp: dp.Timestamp,
-				Value:     dp.Value,
-			})
-		}
-
-		result = append(result, modelSeries)
-	}
-
-	return result, nil
-}
-
-// parseStepDuration converts a Prometheus-style step string into a duration.
-// An empty or unparseable value falls back to one minute, matching the MCP
-// tool's default step.
-func parseStepDuration(step string) time.Duration {
-	step = strings.TrimSpace(step)
-	if step == "" {
-		return time.Minute
-	}
-	if d, err := time.ParseDuration(step); err == nil && d > 0 {
-		return d
-	}
-	return time.Minute
-}

@@ -142,9 +142,41 @@ func TestECamQueryLogsByServiceContract(t *testing.T) {
 	if entries == nil || len(entries) != 0 {
 		t.Fatalf("空结果应返回空切片(诚实空), got %v", entries)
 	}
-	f := (*reqs)[0].Body["filters"].([]any)[0].(map[string]any)
-	if f["field"] != "service" || f["value"] != "cnc-sorter-center" {
-		t.Errorf("filter = %v, want service eq cnc-sorter-center", f)
+	// store 级收敛:app 日志走 resources=[<service>-business](单店直查),
+	// 不再下 service 字段过滤(那会扇出全部 ~800 店)
+	res, _ := (*reqs)[0].Body["resources"].([]any)
+	if len(res) != 1 || res[0] != "cnc-sorter-center-business" {
+		t.Errorf("resources = %v, want [cnc-sorter-center-business]", (*reqs)[0].Body["resources"])
+	}
+	if filters, ok := (*reqs)[0].Body["filters"].([]any); ok && len(filters) != 0 {
+		t.Errorf("app 类型不应携带 service 过滤, got %v", filters)
+	}
+}
+
+func TestECamQueryErrorsByServiceContract(t *testing.T) {
+	src, reqs := newECamStub(t, func(w http.ResponseWriter, r *http.Request) {
+		envelope(w, map[string]any{"total": 0, "entries": []any{}})
+	})
+	start := time.Now().Add(-time.Hour)
+	if _, err := src.QueryErrorsByService(context.Background(), "cnc-sorter-center", start, time.Now()); err != nil {
+		t.Fatalf("QueryErrorsByService: %v", err)
+	}
+	// 引擎按事发服务收敛日志的主路径:store 圈定 + level=error 下推
+	res, _ := (*reqs)[0].Body["resources"].([]any)
+	if len(res) != 1 || res[0] != "cnc-sorter-center-business" {
+		t.Errorf("resources = %v, want [cnc-sorter-center-business]", (*reqs)[0].Body["resources"])
+	}
+	filters, _ := (*reqs)[0].Body["filters"].([]any)
+	if len(filters) != 1 {
+		t.Fatalf("filters = %v, want single level=error", (*reqs)[0].Body["filters"])
+	}
+	f := filters[0].(map[string]any)
+	if f["field"] != "level" || f["op"] != "eq" || f["value"] != "error" {
+		t.Errorf("filter = %v, want level eq error", f)
+	}
+	// 空服务名必须报错,不许静默全量
+	if _, err := src.QueryErrorsByService(context.Background(), " ", start, time.Now()); err == nil {
+		t.Error("空服务名应报错")
 	}
 }
 

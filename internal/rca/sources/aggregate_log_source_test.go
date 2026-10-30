@@ -23,6 +23,13 @@ func (f *fakeLogSource) QueryErrors(ctx context.Context, start, end time.Time) (
 	return f.entries, nil
 }
 
+func (f *fakeLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.entries, nil
+}
+
 func (f *fakeLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	if f.err != nil {
 		return nil, f.err

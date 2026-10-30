@@ -18,6 +18,12 @@ func (m *MockLogSourceForTest) QueryErrors(ctx context.Context, start, end time.
 	}, nil
 }
 
+func (m *MockLogSourceForTest) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	return []models.LogEntry{
+		{Timestamp: start, Service: service, Level: "error", Message: "Test error"},
+	}, nil
+}
+
 func (m *MockLogSourceForTest) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	return []models.LogEntry{
 		{Timestamp: start, Service: service, Level: "info", Message: "Test log"},

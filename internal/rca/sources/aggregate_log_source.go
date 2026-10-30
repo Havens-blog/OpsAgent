@@ -126,6 +126,14 @@ func (a *AggregateLogSource) QueryErrors(ctx context.Context, start, end time.Ti
 	return a.merge(results, "query_errors")
 }
 
+// QueryErrorsByService retrieves error logs for a service across all sources.
+func (a *AggregateLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	results := a.fanOut(ctx, func(ctx context.Context, src LogSource) ([]models.LogEntry, error) {
+		return src.QueryErrorsByService(ctx, service, start, end)
+	})
+	return a.merge(results, "query_errors_by_service")
+}
+
 // QueryLogsByService retrieves logs for a service across all sources.
 func (a *AggregateLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	results := a.fanOut(ctx, func(ctx context.Context, src LogSource) ([]models.LogEntry, error) {

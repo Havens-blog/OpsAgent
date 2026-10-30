@@ -29,6 +29,10 @@ func (EmptyLogSource) QueryErrors(ctx context.Context, start, end time.Time) ([]
 	return nil, nil
 }
 
+func (EmptyLogSource) QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
+	return nil, nil
+}
+
 func (EmptyLogSource) QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error) {
 	return nil, nil
 }
@@ -99,6 +103,12 @@ func (EmptyMetricSource) GetAlerts(ctx context.Context) ([]Alert, error) {
 	return nil, nil
 }
 
+// QueryMetricRange returns an honest empty slice: no real metric backend is
+// configured, so there is nothing to query and no series to fabricate.
+func (EmptyMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
+	return []models.MetricSeries{}, nil
+}
+
 // ---- Topology ----
 
 type EmptyTopologySource struct{}
@@ -127,9 +137,3 @@ var (
 	_ MetricSource   = (*EmptyMetricSource)(nil)
 	_ TopologySource = (*EmptyTopologySource)(nil)
 )
-
-// QueryMetricRange returns an honest empty slice: no real metric backend is
-// configured, so there is nothing to query and no series to fabricate.
-func (EmptyMetricSource) QueryMetricRange(ctx context.Context, query string, start, end time.Time, step string) ([]models.MetricSeries, error) {
-	return []models.MetricSeries{}, nil
-}

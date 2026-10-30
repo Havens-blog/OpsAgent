@@ -13,6 +13,12 @@ type LogSource interface {
 	// QueryErrors retrieves error logs within the time window.
 	QueryErrors(ctx context.Context, start, end time.Time) ([]models.LogEntry, error)
 
+	// QueryErrorsByService retrieves error logs of one service within the
+	// time window. Backends with per-service stores scope the query to that
+	// store (far cheaper than a fleet-wide QueryErrors); others filter a
+	// full query by service.
+	QueryErrorsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error)
+
 	// QueryLogsByService retrieves logs for a specific service.
 	QueryLogsByService(ctx context.Context, service string, start, end time.Time) ([]models.LogEntry, error)
 
