@@ -4,6 +4,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -272,12 +273,12 @@ func TestNewEngine(t *testing.T) {
 func TestEngineAnalyze(t *testing.T) {
 	// Create test incident
 	incident := &models.Incident{
-		ID:              "test-incident-001",
-		StartTime:       time.Now().Add(-2 * time.Hour),
-		EndTime:         time.Now(),
-		Severity:        "P1",
+		ID:               "test-incident-001",
+		StartTime:        time.Now().Add(-2 * time.Hour),
+		EndTime:          time.Now(),
+		Severity:         "P1",
 		AffectedServices: []string{"api-service", "database"},
-		Description:     "High error rate in api-service",
+		Description:      "High error rate in api-service",
 	}
 
 	// Create test data
@@ -345,7 +346,8 @@ func TestEngineAnalyze(t *testing.T) {
 		{
 			name: "successful analysis with all signals",
 			logSource: &mockLogSource{
-				logs: testLogs,
+				logs:  testLogs,
+				delay: time.Millisecond,
 			},
 			metricSource: &mockMetricSource{
 				metrics: testMetrics,
@@ -377,6 +379,9 @@ func TestEngineAnalyze(t *testing.T) {
 				}
 				if report.GeneratedAt.IsZero() {
 					t.Errorf("GeneratedAt not set")
+				}
+				if report.Warnings == nil || len(report.Warnings) != 0 {
+					t.Errorf("Warnings = %#v, want non-nil empty slice", report.Warnings)
 				}
 			},
 		},
@@ -413,6 +418,18 @@ func TestEngineAnalyze(t *testing.T) {
 					t.Fatal("report is nil")
 				}
 				// Should still work with partial data
+				if len(report.Warnings) == 0 {
+					t.Fatal("Warnings should expose the failed log source")
+				}
+				found := false
+				for _, w := range report.Warnings {
+					if strings.Contains(w, "logs") && strings.Contains(w, "log source unavailable") {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("Warnings = %v, want an entry for logs with the source error", report.Warnings)
+				}
 			},
 		},
 		{
@@ -512,10 +529,10 @@ func TestEngineAnalyze(t *testing.T) {
 
 func TestGenerateHypotheses(t *testing.T) {
 	incident := &models.Incident{
-		ID:        "test-001",
-		StartTime: time.Now().Add(-1 * time.Hour),
-		EndTime:   time.Now(),
-		Severity:  "P1",
+		ID:               "test-001",
+		StartTime:        time.Now().Add(-1 * time.Hour),
+		EndTime:          time.Now(),
+		Severity:         "P1",
 		AffectedServices: []string{"service-a"},
 	}
 
@@ -543,16 +560,16 @@ func TestGenerateHypotheses(t *testing.T) {
 			{Start: incident.StartTime.Add(subWindow), End: incident.StartTime.Add(2 * subWindow)},
 		},
 		LogByWindow: map[int][]models.LogEntry{
-			0: {}, // baseline - empty
-			1: {}, // baseline - empty
-			2: {}, // baseline - empty
-			3: incidentWindowLogs[:6],  // incident window - 6 errors
-			4: incidentWindowLogs[6:],  // incident window - 6 errors, total 12 > 2*0=0 and > 10
+			0: {},                     // baseline - empty
+			1: {},                     // baseline - empty
+			2: {},                     // baseline - empty
+			3: incidentWindowLogs[:6], // incident window - 6 errors
+			4: incidentWindowLogs[6:], // incident window - 6 errors, total 12 > 2*0=0 and > 10
 		},
 		MetricTrends: map[string]map[int]models.Trend{
 			"http_errors": {
 				2: models.TrendStable,
-				3: models.TrendUp,    // last 3 windows include this
+				3: models.TrendUp, // last 3 windows include this
 			},
 		},
 		Changes: []models.Change{
@@ -567,17 +584,17 @@ func TestGenerateHypotheses(t *testing.T) {
 	}
 
 	tests := []struct {
-		name              string
-		normalized        *models.NormalizedSignals
-		minCandidates     int
-		expectedTypes     map[models.HypothesisType]bool
+		name          string
+		normalized    *models.NormalizedSignals
+		minCandidates int
+		expectedTypes map[models.HypothesisType]bool
 	}{
 		{
 			name:          "generates multiple hypothesis types",
 			normalized:    normalized,
 			minCandidates: 2,
 			expectedTypes: map[models.HypothesisType]bool{
-				models.HypothesisTypeErrorSpike:     false,
+				models.HypothesisTypeErrorSpike:    false,
 				models.HypothesisTypeMetricAnomaly: false,
 				models.HypothesisTypeChange:        false,
 			},
@@ -719,45 +736,45 @@ func TestErrorSpikeIsPerService(t *testing.T) {
 func TestRankAndFilter(t *testing.T) {
 	scored := []models.ScoredHypothesis{
 		{
-			Hypothesis:  models.Hypothesis{Type: models.HypothesisTypeChange, Description: "High scoring"},
-			Score:       0.9,
-			Confidence:  0.85,
+			Hypothesis: models.Hypothesis{Type: models.HypothesisTypeChange, Description: "High scoring"},
+			Score:      0.9,
+			Confidence: 0.85,
 		},
 		{
-			Hypothesis:  models.Hypothesis{Type: models.HypothesisTypeErrorSpike, Description: "Medium scoring"},
-			Score:       0.6,
-			Confidence:  0.55,
+			Hypothesis: models.Hypothesis{Type: models.HypothesisTypeErrorSpike, Description: "Medium scoring"},
+			Score:      0.6,
+			Confidence: 0.55,
 		},
 		{
-			Hypothesis:  models.Hypothesis{Type: models.HypothesisTypeMetricAnomaly, Description: "Low scoring"},
-			Score:       0.3,
-			Confidence:  0.25,
+			Hypothesis: models.Hypothesis{Type: models.HypothesisTypeMetricAnomaly, Description: "Low scoring"},
+			Score:      0.3,
+			Confidence: 0.25,
 		},
 	}
 
 	tests := []struct {
-		name         string
+		name          string
 		minConfidence float64
-		wantCount    int
-		topScore     float64
+		wantCount     int
+		topScore      float64
 	}{
 		{
-			name:         "filter at 0.5 threshold",
+			name:          "filter at 0.5 threshold",
 			minConfidence: 0.5,
-			wantCount:    2,
-			topScore:     0.9,
+			wantCount:     2,
+			topScore:      0.9,
 		},
 		{
-			name:         "filter at 0.3 threshold",
+			name:          "filter at 0.3 threshold",
 			minConfidence: 0.3,
-			wantCount:    2, // 0.25 < 0.3 so only top 2 pass
-			topScore:     0.9,
+			wantCount:     2, // 0.25 < 0.3 so only top 2 pass
+			topScore:      0.9,
 		},
 		{
-			name:         "filter at 0.9 threshold",
+			name:          "filter at 0.9 threshold",
 			minConfidence: 0.9,
-			wantCount:    0,
-			topScore:     0,
+			wantCount:     0,
+			topScore:      0,
 		},
 	}
 
@@ -901,6 +918,32 @@ func TestCalculateMetricTrends(t *testing.T) {
 		if !foundDown {
 			t.Errorf("decreasing_metric not detected as trending down")
 		}
+	}
+}
+
+func TestBuildWarningsSortedAndNormalized(t *testing.T) {
+	got := buildWarnings(map[string]string{
+		"traces":  "trace backend down",
+		"logs":    "connection refused",
+		"metrics": "metric query failed",
+	})
+
+	want := []string{
+		"logs: connection refused",
+		"metrics: metric query failed",
+		"traces: trace backend down",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("buildWarnings() len = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("buildWarnings()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if empty := buildWarnings(nil); empty == nil || len(empty) != 0 {
+		t.Errorf("buildWarnings(nil) = %#v, want non-nil empty slice", empty)
 	}
 }
 

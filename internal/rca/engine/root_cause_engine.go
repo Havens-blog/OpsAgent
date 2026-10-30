@@ -103,23 +103,31 @@ func (e *Engine) Analyze(ctx context.Context, incident *models.Incident) (*model
 
 	// Step 5: Generate report
 	report := &models.RCAReport{
-		Incident:        incident,
-		Signals:         signals,
-		Candidates:      ranked,
-		TopCandidate:    getTopCandidate(ranked),
-		Confidence:      getOverallConfidence(ranked),
-		AnalysisWindow:  getAnalysisWindow(incident, e.windowSize),
-		Duration:        time.Since(startTime),
-		GeneratedAt:     time.Now(),
+		Incident:       incident,
+		Signals:        signals,
+		Candidates:     ranked,
+		TopCandidate:   getTopCandidate(ranked),
+		Confidence:     getOverallConfidence(ranked),
+		AnalysisWindow: getAnalysisWindow(incident, e.windowSize),
+		Duration:       time.Since(startTime),
+		GeneratedAt:    time.Now(),
+		Warnings:       buildWarnings(signals.SourceErrors),
 	}
 
 	return report, nil
 }
 
+// srcErr records a single source collection failure. A buffered channel of
+// these lets goroutines report errors without sharing and mutating one map.
+type srcErr struct {
+	name string
+	msg  string
+}
+
 // gatherSignals collects data from all sources in parallel.
 func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (*models.Signals, error) {
-	signals := &models.Signals{}
-	errChan := make(chan error, 5)
+	signals := &models.Signals{SourceErrors: map[string]string{}}
+	srcErrChan := make(chan srcErr, 5)
 	doneChan := make(chan struct{}, 5)
 
 	// Collect logs
@@ -127,6 +135,8 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 		logs, err := e.logSource.QueryErrors(ctx, incident.StartTime.Add(-e.windowSize), incident.EndTime)
 		if err == nil {
 			signals.Logs = logs
+		} else {
+			srcErrChan <- srcErr{name: "logs", msg: err.Error()}
 		}
 		doneChan <- struct{}{}
 	}()
@@ -136,6 +146,8 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 		metrics, err := e.metricSource.QueryAnomalies(ctx, incident.StartTime.Add(-e.windowSize), incident.EndTime)
 		if err == nil {
 			signals.Metrics = metrics
+		} else {
+			srcErrChan <- srcErr{name: "metrics", msg: err.Error()}
 		}
 		doneChan <- struct{}{}
 	}()
@@ -146,6 +158,8 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 			traces, err := e.traceSource.QueryErrorTraces(ctx, incident.StartTime, incident.EndTime)
 			if err == nil {
 				signals.Traces = traces
+			} else {
+				srcErrChan <- srcErr{name: "traces", msg: err.Error()}
 			}
 			doneChan <- struct{}{}
 		}()
@@ -159,6 +173,8 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 			topo, err := e.topologySource.GetTopology(ctx)
 			if err == nil {
 				signals.Topology = topo
+			} else {
+				srcErrChan <- srcErr{name: "topology", msg: err.Error()}
 			}
 			doneChan <- struct{}{}
 		}()
@@ -172,6 +188,8 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 			changes, err := e.changeSource.QueryChanges(ctx, incident.StartTime.Add(-e.windowSize), incident.EndTime)
 			if err == nil {
 				signals.Changes = changes
+			} else {
+				srcErrChan <- srcErr{name: "changes", msg: err.Error()}
 			}
 			doneChan <- struct{}{}
 		}()
@@ -185,12 +203,37 @@ func (e *Engine) gatherSignals(ctx context.Context, incident *models.Incident) (
 		case <-doneChan:
 		case <-ctx.Done():
 			return signals, ctx.Err()
-		case err := <-errChan:
-			return signals, err
 		}
 	}
 
+	// Every source has reported completion, so the buffered error channel now
+	// holds all (at most 5) source errors. Drain it into the map without a lock.
+	for len(srcErrChan) > 0 {
+		se := <-srcErrChan
+		signals.SourceErrors[se.name] = se.msg
+	}
+
 	return signals, nil
+}
+
+// buildWarnings converts source errors into a stable-ordered, human-readable
+// warning list. A nil result is normalized to an empty slice for the HTTP DTO.
+func buildWarnings(sourceErrors map[string]string) []string {
+	if len(sourceErrors) == 0 {
+		return []string{}
+	}
+
+	names := make([]string, 0, len(sourceErrors))
+	for name := range sourceErrors {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	warnings := make([]string, 0, len(names))
+	for _, name := range names {
+		warnings = append(warnings, fmt.Sprintf("%s: %s", name, sourceErrors[name]))
+	}
+	return warnings
 }
 
 // normalizeTimeWindows performs trend-based time alignment.

@@ -55,8 +55,9 @@ func (f *failOnSecondStore) Store(ctx context.Context, report *models.RCAReport)
 }
 
 type rcaReportStatusDTO struct {
-	IncidentID string `json:"incident_id"`
-	Status     string `json:"status"`
+	IncidentID string   `json:"incident_id"`
+	Status     string   `json:"status"`
+	Warnings   []string `json:"warnings"`
 }
 
 type rcaListResponseDTO struct {
@@ -173,6 +174,59 @@ func TestRCARunningReportVisibleInGetAndList(t *testing.T) {
 	}
 	if code != http.StatusOK || got.Status != "completed" {
 		t.Fatalf("after release, GET status = %d / %q, want %d / %q", code, got.Status, http.StatusOK, "completed")
+	}
+}
+
+// TestRCAAnalysisResponseIncludesWarnings proves both the report detail and
+// list responses expose the warnings field as an empty JSON array for a
+// successful analysis. Non-empty warnings are covered at the engine layer.
+func TestRCAAnalysisResponseIncludesWarnings(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+
+	const incidentID = "INC-WARNINGS-1"
+	postRCAAnalysis(t, server, incidentID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var code int
+	var got rcaReportStatusDTO
+	for time.Now().Before(deadline) {
+		code, got = getRCAReport(t, server, incidentID)
+		if code == http.StatusOK && got.Status == "completed" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if code != http.StatusOK || got.Status != "completed" {
+		t.Fatalf("GET status = %d / %q, want %d / %q", code, got.Status, http.StatusOK, "completed")
+	}
+	if got.Warnings == nil {
+		t.Fatalf("GET warnings field missing; got nil, want empty array")
+	}
+	if len(got.Warnings) != 0 {
+		t.Fatalf("GET warnings = %v, want empty array", got.Warnings)
+	}
+
+	listCode, list := listRCAReports(t, server)
+	if listCode != http.StatusOK {
+		t.Fatalf("LIST status = %d, want %d", listCode, http.StatusOK)
+	}
+	found := false
+	for _, report := range list.Reports {
+		if report.IncidentID == incidentID {
+			found = true
+			if report.Warnings == nil {
+				t.Fatalf("LIST warnings field missing; got nil, want empty array")
+			}
+			if len(report.Warnings) != 0 {
+				t.Fatalf("LIST warnings = %v, want empty array", report.Warnings)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("LIST did not contain %s", incidentID)
 	}
 }
 

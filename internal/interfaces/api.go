@@ -725,6 +725,7 @@ func (s *APIServer) listRCAHandler(w http.ResponseWriter, r *http.Request) {
 		Confidence       float64         `json:"confidence"`
 		DurationMS       int64           `json:"duration_ms,omitempty"`
 		GeneratedAt      string          `json:"generated_at,omitempty"`
+		Warnings         []string        `json:"warnings"`
 	}
 
 	result := make([]reportResponse, 0, len(reports))
@@ -758,6 +759,7 @@ func (s *APIServer) listRCAHandler(w http.ResponseWriter, r *http.Request) {
 			Confidence:       report.Confidence,
 			DurationMS:       int64(report.Duration.Seconds() * 1000),
 			GeneratedAt:      formatTimePtr(report.GeneratedAt),
+			Warnings:         normalizeWarnings(report.Warnings),
 		})
 	}
 
@@ -815,6 +817,7 @@ func (s *APIServer) getRCAHandler(w http.ResponseWriter, r *http.Request) {
 		"confidence":        report.Confidence,
 		"duration_ms":       int64(report.Duration.Seconds() * 1000),
 		"generated_at":      formatTimePtr(report.GeneratedAt),
+		"warnings":          normalizeWarnings(report.Warnings),
 	}
 
 	s.writeJSONResponse(w, http.StatusOK, result)
@@ -826,6 +829,14 @@ func formatTimePtr(t time.Time) string {
 		return ""
 	}
 	return t.Format(time.RFC3339)
+}
+
+// normalizeWarnings ensures the warnings field is always a JSON array, never null.
+func normalizeWarnings(warnings []string) []string {
+	if warnings == nil {
+		return []string{}
+	}
+	return warnings
 }
 
 // rcaStatusHandler handles RCA status requests.

@@ -10,12 +10,12 @@ import (
 type HypothesisType string
 
 const (
-	HypothesisTypeErrorSpike     HypothesisType = "error_spike"
+	HypothesisTypeErrorSpike    HypothesisType = "error_spike"
 	HypothesisTypeMetricAnomaly HypothesisType = "metric_anomaly"
-	HypothesisTypeChange         HypothesisType = "change"
-	HypothesisTypeDependency     HypothesisType = "dependency"
-	HypothesisTypeLatency        HypothesisType = "latency"
-	HypothesisTypeResource       HypothesisType = "resource"
+	HypothesisTypeChange        HypothesisType = "change"
+	HypothesisTypeDependency    HypothesisType = "dependency"
+	HypothesisTypeLatency       HypothesisType = "latency"
+	HypothesisTypeResource      HypothesisType = "resource"
 )
 
 // Hypothesis represents a potential root cause candidate.
@@ -31,20 +31,20 @@ type Hypothesis struct {
 
 // ScoreBreakdown represents the score components for a hypothesis.
 type ScoreBreakdown struct {
-	TimeCorrelation  float64 // How well the timing matches the incident
-	TopologyScore    float64 // Topology proximity to affected services
-	ChangeProximity  float64 // Proximity to recent changes
-	MetricSeverity   float64 // Severity of metric anomalies
-	ErrorFrequency   float64 // Frequency of error logs
-	TraceEvidence    float64 // Evidence from traces
+	TimeCorrelation float64 // How well the timing matches the incident
+	TopologyScore   float64 // Topology proximity to affected services
+	ChangeProximity float64 // Proximity to recent changes
+	MetricSeverity  float64 // Severity of metric anomalies
+	ErrorFrequency  float64 // Frequency of error logs
+	TraceEvidence   float64 // Evidence from traces
 }
 
 // ScoredHypothesis is a hypothesis with its computed score.
 type ScoredHypothesis struct {
-	Hypothesis  Hypothesis
-	Score       float64
-	Confidence  float64 // Normalized 0-1
-	Breakdown   ScoreBreakdown
+	Hypothesis Hypothesis
+	Score      float64
+	Confidence float64 // Normalized 0-1
+	Breakdown  ScoreBreakdown
 }
 
 // RCAReport represents the complete root cause analysis report.
@@ -57,6 +57,9 @@ type RCAReport struct {
 	AnalysisWindow TimeWindow
 	Duration       time.Duration
 	GeneratedAt    time.Time
+
+	// Warnings are human-readable, stable-ordered source errors for the HTTP DTO.
+	Warnings []string
 }
 
 // GetSummary returns a human-readable summary of the RCA report.
