@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"time"
 
@@ -352,14 +353,18 @@ func (p *PrometheusMetricSource) executeQuery(ctx context.Context, query string,
 func buildQuery(metricName string, filters map[string]string) string {
 	query := metricName
 	if len(filters) > 0 {
+		keys := make([]string, 0, len(filters))
+		for k := range filters {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
 		query += "{"
-		first := true
-		for k, v := range filters {
-			if !first {
+		for i, k := range keys {
+			if i > 0 {
 				query += ","
 			}
-			query += fmt.Sprintf(`%s="%s"`, k, v)
-			first = false
+			query += fmt.Sprintf(`%s="%s"`, k, filters[k])
 		}
 		query += "}"
 	}
