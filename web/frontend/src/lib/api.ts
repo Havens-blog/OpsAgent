@@ -207,6 +207,8 @@ export interface Incident {
   evidence?: Evidence[]
   root_cause?: string
   confidence?: number
+  /** 各数据源采集失败的告警，为空数组表示无告警。 */
+  warnings?: string[]
 }
 
 export interface Evidence {

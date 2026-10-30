@@ -23,6 +23,7 @@ type incidentDTO struct {
 	AffectedServices []string `json:"affected_services,omitempty"`
 	RootCause        string   `json:"root_cause,omitempty"`
 	Confidence       float64  `json:"confidence,omitempty"`
+	Warnings         []string `json:"warnings,omitempty"`
 }
 
 // incidentDetailDTO adds evidence + timeline for the detail page.
@@ -113,6 +114,7 @@ func reportToIncidentDTO(report *models.RCAReport) incidentDTO {
 		EndTime:          formatTimePtr(inc.EndTime),
 		Status:           incidentStatus(inc),
 		AffectedServices: inc.AffectedServices,
+		Warnings:         normalizeWarnings(report.Warnings),
 	}
 	if report.TopCandidate != nil {
 		dto.RootCause = report.TopCandidate.Hypothesis.Description
