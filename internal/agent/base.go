@@ -502,7 +502,9 @@ func (a *BaseAgent) executeTask(ctx context.Context, task *Task) (*ExecutionResu
 		for _, spec := range toolSpecs {
 			toolName, _ := spec["name"].(string)
 			toolDesc, _ := spec["description"].(string)
-			inputSchema := spec["parameters"]
+			// GetToolSpecsForLLM exposes the schema under "input_schema";
+			// "parameters" does not exist and would leave InputSchema nil.
+			inputSchema := spec["input_schema"]
 
 			// Create tool handler
 			handler := func(ctx context.Context, input map[string]interface{}) (string, error) {
