@@ -345,6 +345,19 @@ func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
 		return
 	}
 
+	// A successful call that returned a failed result must be surfaced as a
+	// failed task, not a completed one.
+	if result == nil || !result.Success {
+		task.Status = TaskStatusFailed
+		task.Result = result
+		task.Error = "task execution failed"
+		if result != nil && result.Error != nil {
+			task.Error = result.Error.Error()
+		}
+		_ = s.taskStore.Update(ctx, task)
+		return
+	}
+
 	task.Status = TaskStatusCompleted
 	task.Result = result
 	task.Error = ""
