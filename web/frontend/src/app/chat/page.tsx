@@ -533,6 +533,7 @@ export default function ChatPage() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState("")
   const [search, setSearch] = useState("")
+  const [copiedId, setCopiedId] = useState<string | null>(null)
 
   const abortRef = useRef<AbortController | null>(null)
   const renamingRef = useRef(false)
@@ -967,6 +968,13 @@ export default function ChatPage() {
   const activeTitle =
     conversations.find((c) => c.id === activeId)?.title ?? "新对话"
 
+  function copyMessage(content: string, id: string) {
+    void navigator.clipboard.writeText(content).then(() => {
+      setCopiedId(id)
+      window.setTimeout(() => setCopiedId((c) => (c === id ? null : c)), 1500)
+    })
+  }
+
   function renderMessage(msg: UiMessage) {
     if (msg.role === "user") {
       return (
@@ -975,6 +983,18 @@ export default function ChatPage() {
             <div className="flex items-center gap-1 text-[11px] text-text-tertiary">
               <User className="h-3 w-3" />
               <span>我</span>
+              <button
+                type="button"
+                aria-label="复制消息"
+                onClick={() => void copyMessage(msg.content, msg.id)}
+                className="rounded p-0.5 transition-colors hover:text-foreground"
+              >
+                {copiedId === msg.id ? (
+                  <Check className="h-3 w-3" />
+                ) : (
+                  <Copy className="h-3 w-3" />
+                )}
+              </button>
             </div>
             <div className="rounded-xl bg-primary px-4 py-2.5 text-sm text-primary-foreground">
               {msg.content}
@@ -994,7 +1014,23 @@ export default function ChatPage() {
           <Bot className="h-4 w-4 text-primary-foreground" />
         </div>
         <div className="flex min-w-0 max-w-[85%] flex-col gap-1.5">
-          <span className="text-[13px] font-medium text-foreground">OpsAgent</span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[13px] font-medium text-foreground">OpsAgent</span>
+            {msg.content && !msg.streaming && (
+              <button
+                type="button"
+                aria-label="复制回答"
+                onClick={() => void copyMessage(msg.content, msg.id)}
+                className="rounded p-0.5 text-text-tertiary transition-colors hover:text-foreground"
+              >
+                {copiedId === msg.id ? (
+                  <Check className="h-3 w-3" />
+                ) : (
+                  <Copy className="h-3 w-3" />
+                )}
+              </button>
+            )}
+          </div>
 
           {msg.toolCalls && msg.toolCalls.length > 0 && (
             <ToolCallGroup calls={msg.toolCalls} />
