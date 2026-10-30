@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -100,6 +101,29 @@ func successResult() *agent.ExecutionResult {
 		Data:      map[string]interface{}{"model": "test-model"},
 		ToolsUsed: []string{},
 		Duration:  15 * time.Millisecond,
+	}
+}
+
+// TestSubmitAgentTaskFailedResultMapsToFailed guards the state machine: a call
+// that returns a result with Success=false must mark the task failed, not
+// completed.
+func TestSubmitAgentTaskFailedResultMapsToFailed(t *testing.T) {
+	server := newTaskServer(t, "coordinator", fakeExec(func(ctx context.Context, task *agent.Task) (*agent.ExecutionResult, error) {
+		return &agent.ExecutionResult{
+			Success:  false,
+			Error:    errors.New("unable to route task to a specialist agent"),
+			Response: "无法将任务路由到可用专家",
+		}, nil
+	}))
+
+	code, resp := submitTask(t, server, 1, 1, "coordinator", "ambiguous request", "cid-fail-1")
+	if code != http.StatusCreated {
+		t.Fatalf("submit status = %d, want %d", code, http.StatusCreated)
+	}
+
+	task := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusFailed)
+	if task.Error != "unable to route task to a specialist agent" {
+		t.Fatalf("task error = %q, want %q", task.Error, "unable to route task to a specialist agent")
 	}
 }
 
