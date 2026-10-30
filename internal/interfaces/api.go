@@ -412,13 +412,27 @@ func (s *APIServer) setupRoutes() {
 func (s *APIServer) Start() error {
 	addr := fmt.Sprintf("%s:%d", s.settings.Server.Host, s.settings.Server.Port)
 
+	readTimeout := 30 * time.Second
+	if s.settings.Server.ReadTimeout > 0 {
+		readTimeout = time.Duration(s.settings.Server.ReadTimeout) * time.Second
+	}
+	// WriteTimeout has a 6-minute floor: LLM-backed endpoints (agent
+	// orchestration, chat, RCA) legitimately run for minutes. Config may
+	// only raise this, never cut it below the safe minimum.
+	writeTimeout := 6 * time.Minute
+	if s.settings.Server.WriteTimeout > 0 {
+		if wt := time.Duration(s.settings.Server.WriteTimeout) * time.Second; wt > writeTimeout {
+			writeTimeout = wt
+		}
+	}
+
 	s.server = &http.Server{
 		Addr:    addr,
 		Handler: s.router,
 		// ReadHeaderTimeout caps slow-header (slowloris) attacks cheaply.
 		ReadHeaderTimeout: 15 * time.Second,
 		// ReadTimeout covers reading the (small JSON) request body.
-		ReadTimeout: 30 * time.Second,
+		ReadTimeout: readTimeout,
 		// WriteTimeout MUST exceed the longest handler budget. LLM-backed
 		// endpoints (agent orchestration, chat, RCA) legitimately run for
 		// minutes — agentHandler alone budgets a 5-minute context — and the
@@ -426,7 +440,7 @@ func (s *APIServer) Start() error {
 		// own LLM call. A 30s WriteTimeout cut those responses mid-flight;
 		// 6 minutes leaves headroom above the 5-minute handler deadline while
 		// still bounding a stuck connection.
-		WriteTimeout: 6 * time.Minute,
+		WriteTimeout: writeTimeout,
 		IdleTimeout:  60 * time.Second,
 	}
 
