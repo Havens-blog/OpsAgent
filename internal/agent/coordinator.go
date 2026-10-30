@@ -555,14 +555,16 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 	}
 }
 
-// executeTask implements the default task execution for coordinator.
+// executeTask is the coordinator's fallback for a task it could not route to a
+// specialist (no explicit type and LLM routing unavailable/empty). It reports
+// failure rather than claiming success without doing the requested work.
 func (c *CoordinatorAgent) executeTask(ctx context.Context, task *Task) *ExecutionResult {
-	// Default coordinator behavior
 	availableAgents := c.GetRegisteredAgents()
 
 	return &ExecutionResult{
-		Success: true,
-		Response: fmt.Sprintf("CoordinatorAgent ready. Available agents: %v\n\nSpecify a task type to delegate:\n- type='rca' for Root Cause Analysis\n- type='log_analysis' for log analysis\n- type='inspection' for operations inspection", availableAgents),
+		Success: false,
+		Error:   fmt.Errorf("unable to route task to a specialist agent"),
+		Response: fmt.Sprintf("无法将任务路由到可用专家（可用：%v）。请提供明确的 type 参数（rca / log_analysis / inspection）或稍后重试。", availableAgents),
 		Data: map[string]interface{}{
 			"available_agents": availableAgents,
 			"registered_count": len(availableAgents),
