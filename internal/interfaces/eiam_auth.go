@@ -40,7 +40,6 @@ const (
 type eiamContextKey string
 
 const (
-	eiamUIDKey      eiamContextKey = "eiam_uid"
 	eiamUsernameKey eiamContextKey = "eiam_username"
 	eiamIsAdminKey  eiamContextKey = "eiam_is_admin"
 )
@@ -144,7 +143,6 @@ func (s *APIServer) eiamAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		ctx := r.Context()
-		ctx = context.WithValue(ctx, eiamUIDKey, claims.Data.Uid)
 		// Tenant and user go into the SHARED tenant context keys so storage
 		// layers (internal/rca, internal/chat, ...) can read them to enforce
 		// per-tenant and per-user isolation.
@@ -168,8 +166,7 @@ func EIAMTenantID(ctx context.Context) int64 {
 
 // EIAMUID returns the authenticated user id from the request context.
 func EIAMUID(ctx context.Context) int64 {
-	v, _ := ctx.Value(eiamUIDKey).(int64)
-	return v
+	return tenant.UserIDFrom(ctx)
 }
 
 // EIAMUsername returns the authenticated username from the request context.

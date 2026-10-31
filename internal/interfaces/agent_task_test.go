@@ -81,7 +81,6 @@ func waitForTaskStatus(t *testing.T, server *APIServer, tenantID, userID int64, 
 	t.Helper()
 	ctx := tenant.WithID(context.Background(), tenantID)
 	ctx = tenant.WithUserID(ctx, userID)
-	ctx = context.WithValue(ctx, eiamUIDKey, userID)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		task, err := server.taskStore.Get(ctx, id)

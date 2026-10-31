@@ -362,7 +362,7 @@ func (s *APIServer) getAgentTask(w http.ResponseWriter, r *http.Request, id stri
 // state. It runs on a fresh background context so the HTTP request can return.
 func (s *APIServer) runAgentTask(agentID, taskID string, tenantID, userID int64) {
 	ctx := tenant.WithID(context.Background(), tenantID)
-	ctx = context.WithValue(ctx, eiamUIDKey, userID)
+	ctx = tenant.WithUserID(ctx, userID)
 	task, err := s.taskStore.Get(ctx, taskID)
 	if err != nil {
 		return
