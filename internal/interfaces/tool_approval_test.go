@@ -95,6 +95,7 @@ func newToolServer(t *testing.T, client chat.ChatClient) *APIServer {
 
 func withIdentity(r *http.Request, tenantID, userID int64) *http.Request {
 	ctx := tenant.WithID(r.Context(), tenantID)
+	ctx = tenant.WithUserID(ctx, userID)
 	ctx = context.WithValue(ctx, eiamUIDKey, userID)
 	return r.WithContext(ctx)
 }

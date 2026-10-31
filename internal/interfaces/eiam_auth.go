@@ -145,9 +145,11 @@ func (s *APIServer) eiamAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, eiamUIDKey, claims.Data.Uid)
-		// Tenant goes into the SHARED tenant context key so storage layers
-		// (internal/rca, ...) can read it to enforce per-tenant isolation.
+		// Tenant and user go into the SHARED tenant context keys so storage
+		// layers (internal/rca, internal/chat, ...) can read them to enforce
+		// per-tenant and per-user isolation.
 		ctx = tenant.WithID(ctx, tid)
+		ctx = tenant.WithUserID(ctx, claims.Data.Uid)
 		if u, ok := claims.Data.Data["username"]; ok {
 			ctx = context.WithValue(ctx, eiamUsernameKey, u)
 		}
