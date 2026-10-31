@@ -77,9 +77,10 @@ func getTask(t *testing.T, server *APIServer, tenantID, userID int64, id string)
 	return w.Code, resp
 }
 
-func waitForTaskStatus(t *testing.T, server *APIServer, tenantID int64, id, want string) *AgentTask {
+func waitForTaskStatus(t *testing.T, server *APIServer, tenantID, userID int64, id, want string) *AgentTask {
 	t.Helper()
 	ctx := tenant.WithID(context.Background(), tenantID)
+	ctx = context.WithValue(ctx, eiamUIDKey, userID)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		task, err := server.taskStore.Get(ctx, id)
@@ -120,7 +121,7 @@ func TestSubmitAgentTaskFailedResultMapsToFailed(t *testing.T) {
 		t.Fatalf("submit status = %d, want %d", code, http.StatusCreated)
 	}
 
-	task := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusFailed)
+	task := waitForTaskStatus(t, server, 1, 1, resp.Task.ID, TaskStatusFailed)
 	if task.Error != "unable to route task to a specialist agent" {
 		t.Fatalf("task error = %q, want %q", task.Error, "unable to route task to a specialist agent")
 	}
@@ -143,7 +144,7 @@ func TestSubmitAgentTaskLifecycle(t *testing.T) {
 		t.Fatalf("task = %+v", resp.Task)
 	}
 
-	task := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusCompleted)
+	task := waitForTaskStatus(t, server, 1, 2, resp.Task.ID, TaskStatusCompleted)
 	if task.Result == nil || !task.Result.Success || task.Result.Response != "done" {
 		t.Fatalf("result = %+v", task.Result)
 	}
@@ -175,7 +176,7 @@ func TestSubmitAgentTaskIdempotent(t *testing.T) {
 		t.Fatalf("duplicate returned different task: %s vs %s", second.Task.ID, first.Task.ID)
 	}
 
-	waitForTaskStatus(t, server, 1, first.Task.ID, TaskStatusCompleted)
+	waitForTaskStatus(t, server, 1, 2, first.Task.ID, TaskStatusCompleted)
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Fatalf("agent executed %d times, want 1", got)
 	}
@@ -205,7 +206,7 @@ func TestAgentTaskApprovalApprove(t *testing.T) {
 		t.Fatalf("submit status = %d", code)
 	}
 
-	task := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusAwaitingApproval)
+	task := waitForTaskStatus(t, server, 1, 2, resp.Task.ID, TaskStatusAwaitingApproval)
 	if task.ApprovalID == "" {
 		t.Fatalf("expected approval id, got %+v", task)
 	}
@@ -222,7 +223,7 @@ func TestAgentTaskApprovalApprove(t *testing.T) {
 		t.Fatalf("approve status = %d body %s", w.Code, w.Body.String())
 	}
 
-	done := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusCompleted)
+	done := waitForTaskStatus(t, server, 1, 2, resp.Task.ID, TaskStatusCompleted)
 	if done.Result == nil || !done.Result.Success {
 		t.Fatalf("completed result = %+v", done.Result)
 	}
@@ -250,7 +251,7 @@ func TestAgentTaskApprovalReject(t *testing.T) {
 		t.Fatalf("submit status = %d", code)
 	}
 
-	task := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusAwaitingApproval)
+	task := waitForTaskStatus(t, server, 1, 2, resp.Task.ID, TaskStatusAwaitingApproval)
 
 	req := withIdentity(httptest.NewRequest(http.MethodPost, "/api/v1/approvals/"+task.ApprovalID+"/reject", nil), 1, 2)
 	w := httptest.NewRecorder()
@@ -259,7 +260,7 @@ func TestAgentTaskApprovalReject(t *testing.T) {
 		t.Fatalf("reject status = %d body %s", w.Code, w.Body.String())
 	}
 
-	rejected := waitForTaskStatus(t, server, 1, resp.Task.ID, TaskStatusRejected)
+	rejected := waitForTaskStatus(t, server, 1, 2, resp.Task.ID, TaskStatusRejected)
 	if rejected.Error == "" {
 		t.Fatalf("expected rejection error text, got %+v", rejected)
 	}
@@ -281,6 +282,12 @@ func TestAgentTaskCrossTenant(t *testing.T) {
 		t.Fatalf("cross-tenant get status = %d, want 404", code)
 	}
 
+	// Cross-user within the same tenant: user 99 cannot read user 2's task.
+	code, _ = getTask(t, server, 1, 99, first.Task.ID)
+	if code != http.StatusNotFound {
+		t.Fatalf("cross-user get status = %d, want 404", code)
+	}
+
 	code2, second := submitTask(t, server, 2, 3, "test-agent", "describe logs", "ct-tenant")
 	if code2 != http.StatusCreated || second.Duplicated {
 		t.Fatalf("tenant 2 submit should create its own task, got %d %+v", code2, second)
@@ -289,6 +296,6 @@ func TestAgentTaskCrossTenant(t *testing.T) {
 		t.Fatalf("tenant 2 reused tenant 1 task %s", second.Task.ID)
 	}
 
-	waitForTaskStatus(t, server, 1, first.Task.ID, TaskStatusCompleted)
-	waitForTaskStatus(t, server, 2, second.Task.ID, TaskStatusCompleted)
+	waitForTaskStatus(t, server, 1, 2, first.Task.ID, TaskStatusCompleted)
+	waitForTaskStatus(t, server, 2, 3, second.Task.ID, TaskStatusCompleted)
 }

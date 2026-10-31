@@ -182,21 +182,22 @@ func (s *MemoryAgentTaskStore) Get(ctx context.Context, id string) (*AgentTask, 
 	defer s.mu.RUnlock()
 
 	t, ok := s.items[id]
-	if !ok || t.TenantID != tenant.IDFrom(ctx) {
+	if !ok || t.TenantID != tenant.IDFrom(ctx) || t.UserID != EIAMUID(ctx) {
 		return nil, fmt.Errorf("task not found: %s", id)
 	}
 	return s.clone(t), nil
 }
 
-// List returns the calling tenant's tasks, newest first.
+// List returns the calling user's tasks, newest first.
 func (s *MemoryAgentTaskStore) List(ctx context.Context) ([]*AgentTask, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	tid := tenant.IDFrom(ctx)
+	uid := EIAMUID(ctx)
 	out := make([]*AgentTask, 0, len(s.items))
 	for _, t := range s.items {
-		if t.TenantID != tid {
+		if t.TenantID != tid || t.UserID != uid {
 			continue
 		}
 		out = append(out, s.clone(t))
@@ -218,7 +219,7 @@ func (s *MemoryAgentTaskStore) Update(ctx context.Context, t *AgentTask) error {
 	defer s.mu.Unlock()
 
 	cur, ok := s.items[t.ID]
-	if !ok || cur.TenantID != tenant.IDFrom(ctx) {
+	if !ok || cur.TenantID != tenant.IDFrom(ctx) || cur.UserID != EIAMUID(ctx) {
 		return fmt.Errorf("task not found: %s", t.ID)
 	}
 
@@ -240,8 +241,9 @@ func (s *MemoryAgentTaskStore) FindByClientTaskID(ctx context.Context, agentID, 
 	defer s.mu.RUnlock()
 
 	tid := tenant.IDFrom(ctx)
+	uid := EIAMUID(ctx)
 	for _, t := range s.items {
-		if t.AgentID == agentID && t.ClientTaskID == clientTaskID && t.TenantID == tid {
+		if t.AgentID == agentID && t.ClientTaskID == clientTaskID && t.TenantID == tid && t.UserID == uid {
 			return s.clone(t), true
 		}
 	}

@@ -355,7 +355,7 @@ func (s *APIServer) maybeReexecuteTask(ctx context.Context, p *PendingApproval) 
 		return
 	}
 
-	go s.runAgentTask(task.AgentID, task.ID, task.TenantID)
+	go s.runAgentTask(task.AgentID, task.ID, task.TenantID, task.UserID)
 }
 
 // maybeRejectTask marks a task rejected when its pending approval is denied.

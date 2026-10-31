@@ -343,7 +343,7 @@ func (s *APIServer) submitAgentTask(w http.ResponseWriter, r *http.Request, agen
 		"duplicated": false,
 	})
 
-	go s.runAgentTask(agentID, task.ID, task.TenantID)
+	go s.runAgentTask(agentID, task.ID, task.TenantID, task.UserID)
 }
 
 // getAgentTask returns the current task state (cross-tenant reads are 404).
@@ -360,8 +360,9 @@ func (s *APIServer) getAgentTask(w http.ResponseWriter, r *http.Request, id stri
 
 // runAgentTask drives one execution attempt to a terminal or approval-awaiting
 // state. It runs on a fresh background context so the HTTP request can return.
-func (s *APIServer) runAgentTask(agentID, taskID string, tenantID int64) {
+func (s *APIServer) runAgentTask(agentID, taskID string, tenantID, userID int64) {
 	ctx := tenant.WithID(context.Background(), tenantID)
+	ctx = context.WithValue(ctx, eiamUIDKey, userID)
 	task, err := s.taskStore.Get(ctx, taskID)
 	if err != nil {
 		return
