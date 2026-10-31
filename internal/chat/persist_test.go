@@ -110,3 +110,43 @@ func TestPersistentConversationStoreCorruptFile(t *testing.T) {
 		t.Fatal("expected error for corrupt conversation store file")
 	}
 }
+
+// TestPersistentConversationStoreUserScoped verifies per-user isolation
+// survives a snapshot round-trip.
+func TestPersistentConversationStoreUserScoped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conversations.json")
+	st, err := NewPersistentConversationStore(path)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	ctx1 := tenant.WithUserID(tenant.WithID(context.Background(), 1), 2)
+	ctx2 := tenant.WithUserID(tenant.WithID(context.Background(), 1), 3)
+
+	if err := st.Create(ctx1, conversation("conv-a", "A")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	reopened, err := NewPersistentConversationStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+
+	if _, err := reopened.Get(ctx2, "conv-a"); err == nil {
+		t.Error("user 3 must NOT see user 2's conv-a after reopen")
+	}
+	list, err := reopened.List(ctx2)
+	if err != nil {
+		t.Fatalf("list user 3: %v", err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("user 3 list = %+v, want empty", list)
+	}
+	conv, err := reopened.Get(ctx1, "conv-a")
+	if err != nil {
+		t.Fatalf("owner get: %v", err)
+	}
+	if conv.UserID != 2 {
+		t.Fatalf("user id = %d, want 2", conv.UserID)
+	}
+}

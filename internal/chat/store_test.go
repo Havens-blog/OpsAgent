@@ -148,3 +148,70 @@ func TestConversationStoreAddMessageTouchesUpdatedAt(t *testing.T) {
 		t.Fatalf("expected conv-a on top after AddMessage, got %s", list[0].ID)
 	}
 }
+
+// TestConversationStoreUserScoped verifies conversations are isolated per
+// user within the same tenant, mirroring the tenant-isolation guarantees.
+func TestConversationStoreUserScoped(t *testing.T) {
+	st := NewMemoryConversationStore()
+
+	ctx1 := tenant.WithUserID(tenant.WithID(context.Background(), 1), 2)
+	ctx2 := tenant.WithUserID(tenant.WithID(context.Background(), 1), 3)
+
+	if err := st.Create(ctx1, conversation("conv-a", "A")); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	t.Run("create stamps user", func(t *testing.T) {
+		conv, err := st.Get(ctx1, "conv-a")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if conv.UserID != 2 {
+			t.Fatalf("user id = %d, want 2", conv.UserID)
+		}
+	})
+
+	t.Run("cross-user get is not-found", func(t *testing.T) {
+		if _, err := st.Get(ctx2, "conv-a"); err == nil {
+			t.Error("user 3 must NOT see user 2's conv-a")
+		}
+	})
+
+	t.Run("cross-user list is empty", func(t *testing.T) {
+		list, err := st.List(ctx2)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		if len(list) != 0 {
+			t.Fatalf("user 3 list = %+v, want empty", list)
+		}
+	})
+
+	t.Run("cross-user mutations are not-found", func(t *testing.T) {
+		if err := st.UpdateTitle(ctx2, "conv-a", "nope"); err == nil {
+			t.Error("user 3 must NOT rename user 2's conv-a")
+		}
+		if err := st.AddMessage(ctx2, "conv-a", message("m-a", "user", "hi")); err == nil {
+			t.Error("user 3 must NOT add a message to user 2's conv-a")
+		}
+		if _, err := st.ListMessages(ctx2, "conv-a"); err == nil {
+			t.Error("user 3 must NOT list user 2's messages")
+		}
+		if err := st.Delete(ctx2, "conv-a"); err == nil {
+			t.Error("user 3 must NOT delete user 2's conv-a")
+		}
+	})
+
+	t.Run("owner still sees it", func(t *testing.T) {
+		if _, err := st.Get(ctx1, "conv-a"); err != nil {
+			t.Fatalf("owner get: %v", err)
+		}
+		list, err := st.List(ctx1)
+		if err != nil {
+			t.Fatalf("owner list: %v", err)
+		}
+		if len(list) != 1 || list[0].ID != "conv-a" {
+			t.Fatalf("owner list = %+v, want only conv-a", list)
+		}
+	})
+}

@@ -443,3 +443,42 @@ func TestSendMessageCancel(t *testing.T) {
 		t.Fatalf("expected only the persisted user message, got %+v", msgs)
 	}
 }
+
+// TestConversationHTTPUserScoped verifies a same-tenant cross-user GET returns
+// 404, proving the HTTP layer delegates user isolation to the store.
+func TestConversationHTTPUserScoped(t *testing.T) {
+	server := newConversationServer(t, nil)
+
+	createReq := withIdentity(httptest.NewRequest(http.MethodPost, "/api/v1/conversations",
+		bytes.NewReader([]byte(`{"title":"scoped"}`))), 1, 2)
+	createReq.Header.Set("Content-Type", "application/json")
+	createW := httptest.NewRecorder()
+	server.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("create status %d body %s", createW.Code, createW.Body.String())
+	}
+	var resp struct {
+		Conversation chat.Conversation `json:"conversation"`
+	}
+	if err := json.Unmarshal(createW.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+	id := resp.Conversation.ID
+	if id == "" {
+		t.Fatal("created conversation id is empty")
+	}
+
+	crossReq := withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/conversations/"+id, nil), 1, 3)
+	crossW := httptest.NewRecorder()
+	server.ServeHTTP(crossW, crossReq)
+	if crossW.Code != http.StatusNotFound {
+		t.Fatalf("cross-user get status %d body %s, want 404", crossW.Code, crossW.Body.String())
+	}
+
+	ownerReq := withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/conversations/"+id, nil), 1, 2)
+	ownerW := httptest.NewRecorder()
+	server.ServeHTTP(ownerW, ownerReq)
+	if ownerW.Code != http.StatusOK {
+		t.Fatalf("owner get status %d body %s, want 200", ownerW.Code, ownerW.Body.String())
+	}
+}

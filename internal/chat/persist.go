@@ -22,9 +22,10 @@ type persistedState struct {
 	Messages      map[int64]map[string][]*Message    `json:"messages"`
 }
 
-// PersistentConversationStore is a tenant-scoped ConversationStore that keeps
-// an in-memory copy of the state and writes a full snapshot to disk after every
-// mutation. Reads never touch disk; the memory state is guarded by a RWMutex.
+// PersistentConversationStore is a tenant and user scoped ConversationStore
+// that keeps an in-memory copy of the state and writes a full snapshot to disk
+// after every mutation. Reads never touch disk; the memory state is guarded by
+// a RWMutex.
 type PersistentConversationStore struct {
 	mu            sync.RWMutex
 	path          string
@@ -111,7 +112,8 @@ func (s *PersistentConversationStore) persistLocked() error {
 	return nil
 }
 
-// Create stores a conversation under the ctx tenant and persists the snapshot.
+// Create stores a conversation under the ctx tenant and user and persists the
+// snapshot.
 func (s *PersistentConversationStore) Create(ctx context.Context, conv *Conversation) error {
 	if conv == nil || conv.ID == "" {
 		return fmt.Errorf("conversation id is required")
@@ -133,32 +135,38 @@ func (s *PersistentConversationStore) Create(ctx context.Context, conv *Conversa
 		s.conversations[tid] = make(map[string]*Conversation)
 	}
 	conv.TenantID = tid
+	conv.UserID = tenant.UserIDFrom(ctx)
 	s.conversations[tid][conv.ID] = conv
 	return s.persistLocked()
 }
 
-// Get retrieves a conversation within the ctx tenant, or not-found.
+// Get retrieves a conversation within the ctx tenant and user, or not-found.
 func (s *PersistentConversationStore) Get(ctx context.Context, id string) (*Conversation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	tid := tenant.IDFrom(ctx)
 	conv, ok := s.conversations[tid][id]
-	if !ok {
+	if !ok || conv.UserID != tenant.UserIDFrom(ctx) {
 		return nil, fmt.Errorf("conversation not found: %s", id)
 	}
 	return conv, nil
 }
 
-// List returns the ctx tenant's conversations ordered by UpdatedAt descending.
+// List returns the ctx tenant and user's conversations ordered by UpdatedAt
+// descending.
 func (s *PersistentConversationStore) List(ctx context.Context) ([]*Conversation, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	tid := tenant.IDFrom(ctx)
+	uid := tenant.UserIDFrom(ctx)
 	bucket := s.conversations[tid]
 	out := make([]*Conversation, 0, len(bucket))
 	for _, conv := range bucket {
+		if conv.UserID != uid {
+			continue
+		}
 		out = append(out, conv)
 	}
 
@@ -171,14 +179,15 @@ func (s *PersistentConversationStore) List(ctx context.Context) ([]*Conversation
 	return out, nil
 }
 
-// Delete removes a conversation and its messages within the ctx tenant and
-// persists the snapshot.
+// Delete removes a conversation and its messages within the ctx tenant/user
+// and persists the snapshot.
 func (s *PersistentConversationStore) Delete(ctx context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	tid := tenant.IDFrom(ctx)
-	if _, ok := s.conversations[tid][id]; !ok {
+	conv, ok := s.conversations[tid][id]
+	if !ok || conv.UserID != tenant.UserIDFrom(ctx) {
 		return fmt.Errorf("conversation not found: %s", id)
 	}
 	delete(s.conversations[tid], id)
@@ -186,15 +195,15 @@ func (s *PersistentConversationStore) Delete(ctx context.Context, id string) err
 	return s.persistLocked()
 }
 
-// UpdateTitle renames a conversation within the ctx tenant and persists the
-// snapshot, or reports not-found when it does not exist in this tenant.
+// UpdateTitle renames a conversation within the ctx tenant/user and persists
+// the snapshot, or reports not-found when it does not exist in this scope.
 func (s *PersistentConversationStore) UpdateTitle(ctx context.Context, id string, title string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	tid := tenant.IDFrom(ctx)
 	conv, ok := s.conversations[tid][id]
-	if !ok {
+	if !ok || conv.UserID != tenant.UserIDFrom(ctx) {
 		return fmt.Errorf("conversation not found: %s", id)
 	}
 	conv.Title = title
@@ -214,7 +223,7 @@ func (s *PersistentConversationStore) AddMessage(ctx context.Context, convID str
 
 	tid := tenant.IDFrom(ctx)
 	conv, ok := s.conversations[tid][convID]
-	if !ok {
+	if !ok || conv.UserID != tenant.UserIDFrom(ctx) {
 		return fmt.Errorf("conversation not found: %s", convID)
 	}
 
@@ -232,13 +241,14 @@ func (s *PersistentConversationStore) AddMessage(ctx context.Context, convID str
 }
 
 // ListMessages returns a conversation's messages in insertion order, or
-// not-found when the conversation does not exist in the ctx tenant.
+// not-found when the conversation does not exist in the ctx tenant/user.
 func (s *PersistentConversationStore) ListMessages(ctx context.Context, convID string) ([]*Message, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	tid := tenant.IDFrom(ctx)
-	if _, ok := s.conversations[tid][convID]; !ok {
+	conv, ok := s.conversations[tid][convID]
+	if !ok || conv.UserID != tenant.UserIDFrom(ctx) {
 		return nil, fmt.Errorf("conversation not found: %s", convID)
 	}
 
