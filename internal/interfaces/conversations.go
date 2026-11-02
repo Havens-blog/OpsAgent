@@ -3,6 +3,7 @@ package interfaces
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -223,6 +224,17 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 		return
 	}
 
+	// Snapshot the remaining per-tenant budget so the multi-round tool loop can
+	// stop before the next LLM call instead of only being gated at entry.
+	var budget int64
+	if s.tenantTokenLimit > 0 {
+		budget = s.tenantTokenLimit - s.usage.tenantTokenTotal(EIAMTenantID(r.Context()))
+		if budget <= 0 {
+			s.writeErrorResponse(w, http.StatusTooManyRequests, "token_limit_exceeded", "租户 token 用量已达上限，请稍后再试", "")
+			return
+		}
+	}
+
 	var req sendMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
@@ -297,6 +309,9 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	ctx := withSessionID(r.Context(), id)
+	if budget > 0 {
+		ctx = chat.WithTokenBudget(ctx, budget)
+	}
 	// The approval callback's parameter shadows req; keep the client id here.
 	clientMessageID := req.ClientMessageID
 
@@ -370,9 +385,11 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 	fullText, evidence, grounding, usage, err := chatSvc.StreamWithTools(ctx, messages, handler)
 
 	if err != nil {
-		// Client disconnection cancels the request; there is no peer left to
-		// receive an error event, so just stop without persisting a reply.
-		if ctx.Err() == nil {
+		if errors.Is(err, chat.ErrTokenBudgetExceeded) {
+			_ = s.writeSSE(w, sseEvent{Type: "error", Message: "租户 token 用量已达上限，请稍后再试"})
+		} else if ctx.Err() == nil {
+			// Client disconnection cancels the request; there is no peer left to
+			// receive an error event, so just stop without persisting a reply.
 			_ = s.writeSSE(w, sseEvent{Type: "error", Message: err.Error()})
 		}
 		return

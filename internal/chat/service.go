@@ -245,6 +245,9 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 	// Cap the rounds so a model that keeps calling tools can never loop forever.
 	const maxRounds = 6
 	for round := 0; round < maxRounds; round++ {
+		if budget := TokenBudgetFrom(ctx); budget > 0 && int64(usage.TotalTokens) >= budget {
+			return "", evidence, computeGrounding(required, evidence), usage, ErrTokenBudgetExceeded
+		}
 		resp, err := s.client.ChatWithTools(ctx, llmMessages, tools)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -407,6 +410,11 @@ func latestUserText(messages []Message) string {
 
 // streamAnswer streams the final reply and accumulates it for persistence.
 func (s *Service) streamAnswer(ctx context.Context, llmMessages []llm.Message, h StreamHandler, usage *llm.Usage) (string, error) {
+	if usage != nil {
+		if budget := TokenBudgetFrom(ctx); budget > 0 && int64(usage.TotalTokens) >= budget {
+			return "", ErrTokenBudgetExceeded
+		}
+	}
 	var full strings.Builder
 	err := s.streamLLM(ctx, llmMessages, func(delta string) error {
 		full.WriteString(delta)
