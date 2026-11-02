@@ -502,6 +502,9 @@ func (s *APIServer) Start() error {
 
 // Shutdown gracefully shuts down the API server.
 func (s *APIServer) Shutdown(ctx context.Context) error {
+	if s.usage != nil {
+		s.usage.Flush()
+	}
 	if s.server != nil {
 		s.logger.Info("API server shutting down")
 		return s.server.Shutdown(ctx)

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 )
@@ -28,15 +29,21 @@ type usageBucket struct {
 	ToolCalls        int64 `json:"tool_calls"`
 }
 
-// usageMetrics is a thread-safe usage counter. When path is non-empty, every
-// mutation also atomically rewrites a snapshot to disk so counts survive a
-// restart. No quotas or limits are enforced here beyond the coarse tenant
-// token check done at the HTTP request entry points.
+// usageMetrics is a thread-safe usage counter. When path is non-empty, pending
+// counters are written to disk in time-throttled batches so counts survive a
+// restart. No quotas or limits are enforced here beyond the coarse tenant token
+// check done at the HTTP request entry points.
 type usageMetrics struct {
-	mu      sync.Mutex
-	buckets map[usageKey]*usageBucket
-	path    string
+	mu        sync.Mutex
+	buckets   map[usageKey]*usageBucket
+	path      string
+	dirty     bool
+	lastFlush time.Time
 }
+
+// usageFlushInterval is the minimum time between file snapshots. Counters are
+// flushed eagerly once the interval elapses, plus once more on shutdown.
+const usageFlushInterval = 2 * time.Second
 
 // persistedUsage is the on-disk snapshot shape. Bucket keys are
 // "<tenantID>:<userID>".
@@ -147,7 +154,10 @@ func (m *usageMetrics) addLLM(tenantID, userID int64, u llm.Usage) {
 	b.CompletionTokens += int64(u.CompletionTokens)
 	b.TotalTokens += int64(u.TotalTokens)
 	b.LLMCalls++
-	_ = m.persistLocked()
+	m.dirty = true
+	if m.path != "" && time.Since(m.lastFlush) >= usageFlushInterval {
+		m.flushLocked()
+	}
 }
 
 func (m *usageMetrics) addTool(tenantID, userID int64) {
@@ -155,7 +165,32 @@ func (m *usageMetrics) addTool(tenantID, userID int64) {
 	defer m.mu.Unlock()
 
 	m.bucket(tenantID, userID).ToolCalls++
-	_ = m.persistLocked()
+	m.dirty = true
+	if m.path != "" && time.Since(m.lastFlush) >= usageFlushInterval {
+		m.flushLocked()
+	}
+}
+
+// flushLocked writes pending counters to disk and clears the dirty flag on
+// success. Callers must hold m.mu. Failures are tolerated: the dirty flag
+// stays set so the next flush retries.
+func (m *usageMetrics) flushLocked() {
+	if !m.dirty || m.path == "" {
+		return
+	}
+	if err := m.persistLocked(); err != nil {
+		return
+	}
+	m.dirty = false
+	m.lastFlush = time.Now()
+}
+
+// Flush forces any pending counters to disk. It is a no-op for the in-memory
+// counter (empty path).
+func (m *usageMetrics) Flush() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flushLocked()
 }
 
 func (m *usageMetrics) tenantAggregate(tenantID int64) usageBucket {
