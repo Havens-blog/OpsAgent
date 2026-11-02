@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -116,9 +117,13 @@ type APIServer struct {
 	// read back by the security settings page. See audit_hook.go.
 	auditLog *recentAuditLog
 
-	// usage is the thread-safe, in-memory token/call usage counter surfaced by
+	// usage is the thread-safe token/call usage counter surfaced by
 	// GET /api/v1/audit/usage. See usage_metrics.go.
 	usage *usageMetrics
+
+	// tenantTokenLimit caps total tokens per tenant across the request entry
+	// points (send message + submit agent task). 0 means unlimited.
+	tenantTokenLimit int64
 }
 
 // getChatService returns the current chat service under a read lock.
@@ -312,6 +317,37 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		conversationStore = ps
 	}
 
+	// Usage persistence: use the disk-backed counter when the path is
+	// configured, falling back to memory so the server still starts without it
+	// or when the snapshot is corrupt/unwritable.
+	usage := newUsageMetrics()
+	usagePath := strings.TrimSpace(os.Getenv("OPSAGENT_USAGE_PATH"))
+	if usagePath == "" {
+		logger.Warn("Usage metrics persistence disabled, using in-memory counter",
+			observability.String("hint", "set OPSAGENT_USAGE_PATH to persist usage counts across restarts"),
+		)
+	} else if fm, err := newFileBackedUsageMetrics(usagePath); err != nil {
+		logger.Warn("Persistent usage metrics store unavailable, using in-memory fallback",
+			observability.String("path", usagePath),
+			observability.Err(err),
+		)
+	} else {
+		usage = fm
+	}
+
+	// Tenant token limit (request-entry-level coarse quota). 0 = unlimited.
+	tenantTokenLimit := int64(0)
+	if raw := strings.TrimSpace(os.Getenv("OPSAGENT_TENANT_TOKEN_LIMIT")); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err != nil {
+			logger.Warn("Invalid OPSAGENT_TENANT_TOKEN_LIMIT, using 0 (unlimited)",
+				observability.String("value", raw),
+				observability.Err(err),
+			)
+		} else {
+			tenantTokenLimit = v
+		}
+	}
+
 	server := &APIServer{
 		settings:       settings,
 		router:         http.NewServeMux(),
@@ -334,7 +370,8 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		pendingApprovals:  pendingApprovals,
 		taskStore:         taskStore,
 		auditLog:          newRecentAuditLog(100),
-		usage:             newUsageMetrics(),
+		usage:             usage,
+		tenantTokenLimit:  tenantTokenLimit,
 	}
 
 	// Construct and register the coordinator + specialist agents (nil-safe:
@@ -1129,6 +1166,21 @@ func (s *APIServer) inspectionHandler(w http.ResponseWriter, r *http.Request) {
 // apiNotFoundHandler handles API requests that don't match any registered route.
 func (s *APIServer) apiNotFoundHandler(w http.ResponseWriter, r *http.Request) {
 	s.writeErrorResponse(w, http.StatusNotFound, "not_found", "API endpoint not found", r.URL.Path)
+}
+
+// enforceTenantTokenLimit returns true (and writes a 429) when the calling
+// tenant has already consumed the configured token budget. This is a coarse,
+// request-entry-level gate: it does not stop a single request from overshooting
+// the limit across a multi-turn tool loop.
+func (s *APIServer) enforceTenantTokenLimit(w http.ResponseWriter, r *http.Request) bool {
+	if s.tenantTokenLimit <= 0 {
+		return false
+	}
+	if s.usage.tenantTokenTotal(EIAMTenantID(r.Context())) < s.tenantTokenLimit {
+		return false
+	}
+	s.writeErrorResponse(w, http.StatusTooManyRequests, "token_limit_exceeded", "租户 token 用量已达上限，请稍后再试", "")
+	return true
 }
 
 // Response helpers

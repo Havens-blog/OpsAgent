@@ -279,6 +279,9 @@ func (s *APIServer) executeAgentTask(w http.ResponseWriter, r *http.Request, age
 
 // submitAgentTaskHandler handles POST /api/v1/agents/{id}/tasks.
 func (s *APIServer) submitAgentTaskHandler(w http.ResponseWriter, r *http.Request) {
+	if s.enforceTenantTokenLimit(w, r) {
+		return
+	}
 	s.submitAgentTask(w, r, r.PathValue("id"))
 }
 
