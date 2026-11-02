@@ -22,6 +22,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // auditEntry is one config-change record as the console renders it.
@@ -180,6 +181,8 @@ func (s *APIServer) recordToolExecution(r *http.Request, ev chat.ToolEvidence) {
 			"user":            user,
 			"ip":              ip,
 			"source":          ev.Source,
+			"tenant_id":       tenant.IDFrom(r.Context()),
+			"user_id":         EIAMUID(r.Context()),
 			"conversation_id": sessionIDFromCtx(r.Context()),
 			"evidence_id":     ev.EvidenceID,
 		},
@@ -225,6 +228,8 @@ func (s *APIServer) recordLLMCall(r *http.Request, usage llm.Usage) {
 		Metadata: map[string]interface{}{
 			"user":              user,
 			"ip":                ip,
+			"tenant_id":         tenant.IDFrom(r.Context()),
+			"user_id":           EIAMUID(r.Context()),
 			"prompt_tokens":     usage.PromptTokens,
 			"completion_tokens": usage.CompletionTokens,
 			"total_tokens":      usage.TotalTokens,
