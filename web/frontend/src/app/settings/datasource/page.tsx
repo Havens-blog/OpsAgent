@@ -140,13 +140,13 @@ export default function DatasourceSettingsPage() {
               <p>
                 2. 重启后端服务，带相应维度配置的数据源会自动替换 Mock。
               </p>
-              <p>
+              <div>
                 3. 回到本页点击「刷新」，确认对应维度徽标变为
                 <Badge variant="success" className="mx-1">
                   真实
                 </Badge>
                 。
-              </p>
+              </div>
             </CardContent>
           </Card>
         </>
