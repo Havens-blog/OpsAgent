@@ -135,6 +135,10 @@ func (s *APIServer) recordConfigChange(r *http.Request, operation string, opErr 
 // security.enable_audit_log and never includes tool params (they may carry
 // sensitive data).
 func (s *APIServer) recordToolExecution(r *http.Request, ev chat.ToolEvidence) {
+	// Usage metrics are observability and must accumulate even when audit
+	// logging is disabled.
+	s.usage.addTool(tenant.IDFrom(r.Context()), EIAMUID(r.Context()))
+
 	sec := s.settings.ToSecurityConfig()
 	if !sec.EnableAuditLog {
 		return
@@ -193,6 +197,10 @@ func (s *APIServer) recordToolExecution(r *http.Request, ev chat.ToolEvidence) {
 // ring plus JSONL file append when audit_log_path is configured. It is gated on
 // security.enable_audit_log.
 func (s *APIServer) recordLLMCall(r *http.Request, usage llm.Usage) {
+	// Usage metrics are observability and must accumulate even when audit
+	// logging is disabled.
+	s.usage.addLLM(tenant.IDFrom(r.Context()), EIAMUID(r.Context()), usage)
+
 	sec := s.settings.ToSecurityConfig()
 	if !sec.EnableAuditLog {
 		return
