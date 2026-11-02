@@ -115,6 +115,10 @@ type APIServer struct {
 	// auditLog is the bounded in-memory ring of recent config-change records,
 	// read back by the security settings page. See audit_hook.go.
 	auditLog *recentAuditLog
+
+	// usage is the thread-safe, in-memory token/call usage counter surfaced by
+	// GET /api/v1/audit/usage. See usage_metrics.go.
+	usage *usageMetrics
 }
 
 // getChatService returns the current chat service under a read lock.
@@ -330,6 +334,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		pendingApprovals:  pendingApprovals,
 		taskStore:         taskStore,
 		auditLog:          newRecentAuditLog(100),
+		usage:             newUsageMetrics(),
 	}
 
 	// Construct and register the coordinator + specialist agents (nil-safe:
@@ -403,6 +408,9 @@ func (s *APIServer) setupRoutes() {
 
 	// Change tracking (CI/CD deployments, config changes)
 	s.router.HandleFunc("/api/v1/changes", s.protected(s.changesHandler))
+
+	// Usage aggregation (observational only)
+	s.router.HandleFunc("/api/v1/audit/usage", s.protected(s.usageHandler))
 
 	// Catch-all for /api/ routes - return JSON 404
 	s.router.HandleFunc("/api/", s.apiNotFoundHandler)
