@@ -167,6 +167,32 @@ type usageClient struct {
 	streamUsage llm.Usage
 }
 
+type budgetToolLoopClient struct {
+	calls       int
+	streamCalls int
+	usage       llm.Usage
+}
+
+func (c *budgetToolLoopClient) Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error) {
+	return &llm.ChatResponse{}, nil
+}
+
+func (c *budgetToolLoopClient) ChatWithTools(ctx context.Context, messages []llm.Message, tools []llm.Tool) (*llm.ChatResponse, error) {
+	c.calls++
+	return &llm.ChatResponse{
+		Choices: []llm.Choice{{Message: llm.ResponseMessage{
+			Role:      "assistant",
+			ToolCalls: []llm.ToolCall{{ID: "c1", Type: "function", Function: llm.FunctionCall{Name: "noop", Arguments: "{}"}}},
+		}}},
+		Usage: c.usage,
+	}, nil
+}
+
+func (c *budgetToolLoopClient) ChatStream(ctx context.Context, messages []llm.Message, handler func(llm.ChatChunk)) (*llm.ChatResponse, error) {
+	c.streamCalls++
+	return &llm.ChatResponse{Usage: c.usage}, nil
+}
+
 func (c *usageClient) Chat(ctx context.Context, messages []llm.Message) (*llm.ChatResponse, error) {
 	return &llm.ChatResponse{}, nil
 }
@@ -407,11 +433,44 @@ func TestStreamWithToolsGroundingNA(t *testing.T) {
 	}
 }
 
+func TestStreamWithToolsTokenBudget(t *testing.T) {
+	client := &budgetToolLoopClient{usage: llm.Usage{PromptTokens: 40, CompletionTokens: 20, TotalTokens: 60}}
+	svc := NewServiceWithClient(client, "test")
+	svc.SetToolProvider(&fakeToolProvider{
+		specs:   []llm.Tool{{Type: "function", Function: llm.FunctionDefinition{Name: "noop"}}},
+		results: map[string]fakeToolResult{"noop": {result: map[string]interface{}{"ok": true}}},
+	})
+
+	h, _ := newStreamHandler()
+	_, evidence, _, usage, err := svc.StreamWithTools(
+		WithTokenBudget(context.Background(), 100),
+		[]Message{{Role: "user", Content: "hi"}},
+		h,
+	)
+	if !errors.Is(err, ErrTokenBudgetExceeded) {
+		t.Fatalf("err = %v, want ErrTokenBudgetExceeded", err)
+	}
+	// Two ChatWithTools rounds (60 + 60) cross the 100-token budget, then the
+	// next pre-call check aborts before a third tool call or the final stream.
+	if client.calls != 2 {
+		t.Fatalf("ChatWithTools calls = %d, want 2", client.calls)
+	}
+	if client.streamCalls != 0 {
+		t.Fatalf("ChatStream calls = %d, want 0", client.streamCalls)
+	}
+	if usage.TotalTokens != 120 {
+		t.Fatalf("usage.TotalTokens = %d, want 120", usage.TotalTokens)
+	}
+	if len(evidence) != 2 {
+		t.Fatalf("evidence = %+v, want 2 executed tools", evidence)
+	}
+}
+
 func TestStreamWithToolsAccumulatesUsage(t *testing.T) {
 	args := `{"domain":"a.com"}`
 	client := &usageClient{
-		toolCalls: []llm.ToolCall{{ID: "c1", Type: "function", Function: llm.FunctionCall{Name: "query_waf_logs", Arguments: args}}},
-		chunks:    []llm.ChatChunk{{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "ok"}}}}},
+		toolCalls:   []llm.ToolCall{{ID: "c1", Type: "function", Function: llm.FunctionCall{Name: "query_waf_logs", Arguments: args}}},
+		chunks:      []llm.ChatChunk{{Choices: []llm.Choice{{Delta: &llm.Delta{Content: "ok"}}}}},
 		toolUsage:   llm.Usage{PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15},
 		streamUsage: llm.Usage{PromptTokens: 20, CompletionTokens: 10, TotalTokens: 30},
 	}
