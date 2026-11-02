@@ -219,6 +219,10 @@ func (s *APIServer) renameConversationHandler(w http.ResponseWriter, r *http.Req
 
 // sendMessageHandler handles POST /api/v1/conversations/{id}/messages as SSE.
 func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if s.enforceTenantTokenLimit(w, r) {
+		return
+	}
+
 	var req sendMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeErrorResponse(w, http.StatusBadRequest, "invalid_request", "Failed to decode request", err.Error())
