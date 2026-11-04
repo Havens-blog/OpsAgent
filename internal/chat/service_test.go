@@ -54,6 +54,19 @@ func (b *blockingClient) ChatStream(ctx context.Context, messages []llm.Message,
 	return nil, ctx.Err()
 }
 
+func TestBuildLLMMessagesInjectsSkillSummary(t *testing.T) {
+	svc := NewServiceWithClient(&fakeStreamClient{}, "test")
+	svc.SetSkillSummary("- waf-investigation: WAF 拦截排查\n")
+
+	msgs := svc.buildLLMMessages([]Message{{Role: "user", Content: "hi"}})
+	if len(msgs) != 2 || msgs[0].Role != "system" {
+		t.Fatalf("messages = %+v, want system + user", msgs)
+	}
+	if !strings.Contains(msgs[0].Content, "waf-investigation") {
+		t.Errorf("system prompt missing skill summary: %q", msgs[0].Content)
+	}
+}
+
 func TestServiceChatStreamDeltas(t *testing.T) {
 	svc := NewServiceWithClient(&fakeStreamClient{
 		chunks: []llm.ChatChunk{

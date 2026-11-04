@@ -387,8 +387,10 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		if skillsDir == "" {
 			skillsDir = "skills"
 		}
-		provider := newRegistryToolProvider(buildChatToolRegistry(server.agentTools, wafQ, skill.New(skillsDir)), settings.DataSources, approvalMgr)
+		loader := skill.New(skillsDir)
+		provider := newRegistryToolProvider(buildChatToolRegistry(server.agentTools, wafQ, loader), settings.DataSources, approvalMgr)
 		chatService.SetToolProvider(provider)
+		chatService.SetSkillSummary(loader.Summary())
 	}
 
 	server.setupRoutes()
