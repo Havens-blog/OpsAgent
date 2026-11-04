@@ -217,4 +217,64 @@ func TestExecutePlanAllSucceed(t *testing.T) {
 	if result.Response != "[monitor]: A\n\n[log_analyst]: B" {
 		t.Errorf("unexpected response order/format: %q", result.Response)
 	}
+	if result.Data["synthesized"] != false {
+		t.Errorf("synthesized = %v, want false without an LLM", result.Data["synthesized"])
+	}
+	if n, _ := result.Data["evidence_count"].(int); n != 2 {
+		t.Errorf("evidence_count = %v, want 2", result.Data["evidence_count"])
+	}
+}
+
+// TestExecutePlanSynthesizesWithLLM 有 LLM 且多名专家成功时，用一次 LLM 综合结论
+func TestExecutePlanSynthesizesWithLLM(t *testing.T) {
+	a := &fakeSpecialist{name: "monitor", response: "CPU 打满"}
+	b := &fakeSpecialist{name: "log_analyst", response: "慢查询暴增"}
+	coord := newTestCoordinator(t, a, b)
+	coord.llmClient = &stubLLM{reply: "综合结论：慢查询导致 CPU 打满"}
+	task := newDelegationTask("synth")
+
+	plan := &ExecutionPlan{
+		Strategy: "parallel",
+		Delegations: []TaskDelegation{
+			coord.newDelegation("monitor", "monitor", task, nil),
+			coord.newDelegation("log_analyst", "log_analyst", task, nil),
+		},
+	}
+	result := coord.executePlan(context.Background(), task, plan)
+
+	if !result.Success {
+		t.Fatalf("expected success, got %+v", result)
+	}
+	if result.Response != "综合结论：慢查询导致 CPU 打满" {
+		t.Errorf("response = %q, want synthesized conclusion", result.Response)
+	}
+	if result.Data["synthesized"] != true {
+		t.Errorf("synthesized = %v, want true", result.Data["synthesized"])
+	}
+	if n, _ := result.Data["evidence_count"].(int); n != 2 {
+		t.Errorf("evidence_count = %v, want 2", result.Data["evidence_count"])
+	}
+}
+
+// TestExecutePlanSingleExpertSkipsSynthesis 单专家不额外发起 LLM 综合，直接回传结论
+func TestExecutePlanSingleExpertSkipsSynthesis(t *testing.T) {
+	a := &fakeSpecialist{name: "monitor", response: "唯一结论"}
+	coord := newTestCoordinator(t, a)
+	coord.llmClient = &stubLLM{reply: "不该被使用"}
+	task := newDelegationTask("single")
+
+	plan := &ExecutionPlan{
+		Strategy: "sequential",
+		Delegations: []TaskDelegation{
+			coord.newDelegation("monitor", "monitor", task, nil),
+		},
+	}
+	result := coord.executePlan(context.Background(), task, plan)
+
+	if result.Response != "[monitor]: 唯一结论" {
+		t.Errorf("response = %q, want expert conclusion without synthesis", result.Response)
+	}
+	if result.Data["synthesized"] != false {
+		t.Errorf("synthesized = %v, want false for single expert", result.Data["synthesized"])
+	}
 }

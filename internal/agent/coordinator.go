@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Havens-blog/OpsAgent/internal/agent/comm"
 	"github.com/Havens-blog/OpsAgent/internal/config"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
@@ -33,6 +34,7 @@ type CoordinatorAgent struct {
 	mu          sync.RWMutex
 	subTasks    map[string][]*TaskSubmission
 	taskCounter int64
+	evidence    *comm.EvidenceStore
 }
 
 // TaskSubmission represents a task submitted to a sub-agent.
@@ -87,6 +89,7 @@ When delegating:
 		agents:      make(map[string]SpecialistAgent),
 		subTasks:    make(map[string][]*TaskSubmission),
 		taskCounter: 0,
+		evidence:    comm.NewEvidenceStore(comm.MergeStrategyUnion),
 	}, nil
 }
 
@@ -560,6 +563,7 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 	var parts []string
 	toolsUsed := []string{}
 	failed := []string{}
+	evidenceIDs := []string{}
 
 	for _, sub := range submissions {
 		if sub.Result != nil {
@@ -567,6 +571,7 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 		}
 		if sub.succeeded() {
 			parts = append(parts, fmt.Sprintf("[%s]: %s", sub.AgentName, sub.Result.Response))
+			evidenceIDs = append(evidenceIDs, c.recordEvidence(originalTask, sub))
 			continue
 		}
 		failed = append(failed, sub.AgentName)
@@ -580,21 +585,103 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, reason))
 	}
 
+	response, synthesized := c.synthesize(originalTask, submissions, parts)
+
 	result := &ExecutionResult{
 		Success:   len(failed) == 0,
-		Response:  strings.Join(parts, "\n\n"),
+		Response:  response,
 		ToolsUsed: toolsUsed,
 		Data: map[string]interface{}{
-			"submissions":   submissions,
-			"agent_count":   len(submissions),
-			"failed_agents": failed,
-			"partial":       len(failed) > 0 && len(failed) < len(submissions),
+			"submissions":    submissions,
+			"agent_count":    len(submissions),
+			"failed_agents":  failed,
+			"partial":        len(failed) > 0 && len(failed) < len(submissions),
+			"evidence_ids":   evidenceIDs,
+			"evidence_count": c.evidence.Count(),
+			"synthesized":    synthesized,
 		},
 	}
 	if len(failed) > 0 {
 		result.Error = fmt.Sprintf("%d/%d 个专家执行失败: %s", len(failed), len(submissions), strings.Join(failed, ", "))
 	}
 	return result
+}
+
+// recordEvidence persists a successful specialist conclusion as shared evidence.
+func (c *CoordinatorAgent) recordEvidence(task *Task, sub *TaskSubmission) string {
+	e := &comm.SharedEvidence{
+		SourceAgent: sub.AgentName,
+		Type:        comm.EvidenceTypeHypothesis,
+		Title:       fmt.Sprintf("%s 结论", sub.AgentName),
+		Description: sub.Result.Response,
+		IncidentID:  task.ID,
+		Confidence:  resultConfidence(sub.Result),
+	}
+	c.evidence.Add(e)
+	return e.DedupKey
+}
+
+// resultConfidence extracts the specialist's self-reported confidence from its
+// result data, defaulting to 0 when absent or not a number.
+func resultConfidence(r *ExecutionResult) float64 {
+	if r == nil || r.Data == nil {
+		return 0
+	}
+	switch v := r.Data["confidence"].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	default:
+		return 0
+	}
+}
+
+// synthesize asks the coordinator's LLM to fuse multiple specialists' findings
+// into one conclusion. With fewer than two successful experts, or when no LLM
+// is configured, it falls back to the deterministic concatenated response.
+func (c *CoordinatorAgent) synthesize(task *Task, submissions []*TaskSubmission, parts []string) (string, bool) {
+	successful := make([]*TaskSubmission, 0, len(submissions))
+	for _, sub := range submissions {
+		if sub.succeeded() {
+			successful = append(successful, sub)
+		}
+	}
+	if len(successful) < 2 || c.llmClient == nil {
+		return strings.Join(parts, "\n\n"), false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	messages := []llm.ClaudeMessage{{
+		Role:    "user",
+		Content: buildSynthesisPrompt(task, successful),
+	}}
+	out, err := c.llmClient.Chat(ctx, messages)
+	if err != nil || strings.TrimSpace(out) == "" {
+		c.logger.Info("LLM synthesis unavailable, using deterministic aggregation",
+			observability.String("task_id", task.ID),
+			observability.Err(err),
+		)
+		return strings.Join(parts, "\n\n"), false
+	}
+	return out, true
+}
+
+// buildSynthesisPrompt renders the specialists' structured findings for the
+// coordinator's final fusion pass.
+func buildSynthesisPrompt(task *Task, submissions []*TaskSubmission) string {
+	var b strings.Builder
+	b.WriteString("你是运维协调者，请把多位专家的排查结论融合成一份简洁、专业的最终结论，")
+	b.WriteString("用中文输出，说明最可能的根因、支持它的证据，以及不同结论的冲突点。\n\n")
+	b.WriteString("原始诉求：\n")
+	b.WriteString(task.Description)
+	b.WriteString("\n\n专家结论：\n")
+	for _, sub := range submissions {
+		fmt.Fprintf(&b, "--- %s ---\n%s\n", sub.AgentName, sub.Result.Response)
+	}
+	return b.String()
 }
 
 // executeTask is the coordinator's fallback for a task it could not route to a
