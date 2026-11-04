@@ -83,6 +83,18 @@ type ExecutionResult struct {
 	Error     string                 `json:"error,omitempty"`
 	Metadata  map[string]interface{} `json:"metadata,omitempty"`
 	Duration  time.Duration          `json:"duration"`
+	// Finding is the specialist's structured conclusion carried into the
+	// coordinator's evidence store, keeping raw data out of the shared context.
+	Finding *StructuredFinding `json:"finding,omitempty"`
+}
+
+// StructuredFinding is a specialist's concise conclusion: the headline the
+// coordinator carries forward, while the full report stays in the evidence
+// store.
+type StructuredFinding struct {
+	Conclusion  string   `json:"conclusion"`
+	Confidence  float64  `json:"confidence"`
+	EvidenceIDs []string `json:"evidence_ids,omitempty"`
 }
 
 // errText converts an error to its message, using an empty string for nil.
