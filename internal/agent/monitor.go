@@ -4,6 +4,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -427,6 +428,22 @@ func getString(m map[string]interface{}, key string) string {
 		}
 	}
 	return ""
+}
+
+func getInt(m map[string]interface{}, key string) int {
+	switch v := m[key].(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 func getTime(m map[string]interface{}, key string) time.Time {
