@@ -63,6 +63,7 @@ type Service struct {
 	toolProvider ToolProvider
 	systemPrompt string
 	skillSummary string
+	goal         string
 	available    bool
 	model        string
 }
@@ -75,6 +76,12 @@ func (s *Service) SetToolProvider(p ToolProvider) {
 // SetSkillSummary injects the runbook catalog rendered into the system prompt.
 func (s *Service) SetSkillSummary(summary string) {
 	s.skillSummary = strings.TrimSpace(summary)
+}
+
+// SetGoal sets an active completion condition for the next turn. An empty goal
+// disables goal-aware continuation.
+func (s *Service) SetGoal(goal string) {
+	s.goal = strings.TrimSpace(goal)
 }
 
 // Message represents a chat message, both as LLM input and persisted history.
@@ -250,7 +257,12 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 	}
 
 	// Cap the rounds so a model that keeps calling tools can never loop forever.
-	const maxRounds = 6
+	// A set goal extends the cap and enables goal-aware continuation.
+	maxRounds := 6
+	goalCtl := newGoalController()
+	if s.goal != "" {
+		maxRounds = goalCtl.maxContinuations
+	}
 	for round := 0; round < maxRounds; round++ {
 		if budget := TokenBudgetFrom(ctx); budget > 0 && int64(usage.TotalTokens) >= budget {
 			return "", evidence, computeGrounding(required, evidence), usage, ErrTokenBudgetExceeded
@@ -273,6 +285,12 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 		assistantMsg := resp.Choices[0].Message
 		if len(assistantMsg.ToolCalls) == 0 {
+			if s.goal != "" {
+				if cont, hint := s.maybeContinueForGoal(ctx, assistantMsg.Content, goalCtl); cont {
+					llmMessages = append(llmMessages, llm.Message{Role: "user", Content: hint})
+					continue
+				}
+			}
 			text, ev, grounding, err := s.finishAnswer(ctx, llmMessages, h, required, evidence, &usage)
 			return text, ev, grounding, usage, err
 		}
