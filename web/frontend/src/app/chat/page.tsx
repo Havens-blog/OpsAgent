@@ -1,6 +1,5 @@
 "use client"
 
-import Link from "next/link"
 import { useEffect, useRef, useState } from "react"
 import {
   AlertCircle,
@@ -406,13 +405,15 @@ function ToolResultCard({
         >
           查看原始结果
         </button>
-        <Link
-          href="/topology"
+        <a
+          href="/cmdb"
+          target="_blank"
+          rel="noopener noreferrer"
           className="flex items-center gap-1 text-primary hover:underline"
         >
           在 CMDB 中查看
           <ExternalLink className="h-3 w-3" />
-        </Link>
+        </a>
       </div>
 
       {rawOpen && (
