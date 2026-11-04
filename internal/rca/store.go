@@ -198,11 +198,18 @@ func (s *MemoryRCAReportStore) UpdateStatus(ctx context.Context, incidentID stri
 		return fmt.Errorf("report not found: %s", incidentID)
 	}
 
-	// Update the incident status field if we have labels support
-	if report.Incident.Labels == nil {
-		report.Incident.Labels = make(map[string]string)
+	// 写时复制：Get 返回的是内部指针，原地改 Labels 会与锁外的读者竞争
+	labels := make(map[string]string, len(report.Incident.Labels)+1)
+	for k, v := range report.Incident.Labels {
+		labels[k] = v
 	}
-	report.Incident.Labels["status"] = status
+	labels["status"] = status
+
+	incident := *report.Incident
+	incident.Labels = labels
+	updated := *report
+	updated.Incident = &incident
+	s.byTenant[tid][incidentID] = &updated
 
 	return s.persistLocked()
 }
