@@ -22,6 +22,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
+	"github.com/Havens-blog/OpsAgent/internal/skill"
 	"github.com/Havens-blog/OpsAgent/internal/tenant"
 	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
@@ -382,7 +383,11 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 	// (collected by initAgents) plus the WAF facts tool and the mock
 	// approval-path tool. Wired here because bound tools need live agents.
 	if chatService != nil {
-		provider := newRegistryToolProvider(buildChatToolRegistry(server.agentTools, wafQ), settings.DataSources, approvalMgr)
+		skillsDir := strings.TrimSpace(os.Getenv("OPSAGENT_SKILLS_PATH"))
+		if skillsDir == "" {
+			skillsDir = "skills"
+		}
+		provider := newRegistryToolProvider(buildChatToolRegistry(server.agentTools, wafQ, skill.New(skillsDir)), settings.DataSources, approvalMgr)
 		chatService.SetToolProvider(provider)
 	}
 
