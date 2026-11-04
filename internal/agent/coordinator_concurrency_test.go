@@ -256,6 +256,50 @@ func TestExecutePlanSynthesizesWithLLM(t *testing.T) {
 	}
 }
 
+// TestRecordEvidencePrefersStructuredFinding 证据优先采用专家结构化结论
+func TestRecordEvidencePrefersStructuredFinding(t *testing.T) {
+	coord := newTestCoordinator(t)
+	task := newDelegationTask("inc-1")
+
+	sub := &TaskSubmission{
+		AgentName: "monitor",
+		Status:    "completed",
+		Result: &ExecutionResult{
+			Success:  true,
+			Response: "完整的 RCA 报告正文",
+			Finding:  &StructuredFinding{Conclusion: "订单服务 P99 飙升", Confidence: 0.8},
+		},
+	}
+	id := coord.recordEvidence(task, sub)
+	ev, ok := coord.evidence.Get(id)
+	if !ok {
+		t.Fatalf("evidence %q not found", id)
+	}
+	if ev.Description != "订单服务 P99 飙升" {
+		t.Errorf("evidence description = %q, want structured conclusion", ev.Description)
+	}
+	if ev.Confidence != 0.8 {
+		t.Errorf("evidence confidence = %v, want 0.8", ev.Confidence)
+	}
+}
+
+// TestRecordEvidenceFallsBackToResponse 无 Finding 时回退到完整响应
+func TestRecordEvidenceFallsBackToResponse(t *testing.T) {
+	coord := newTestCoordinator(t)
+	task := newDelegationTask("inc-2")
+
+	sub := &TaskSubmission{
+		AgentName: "log_analyst",
+		Status:    "completed",
+		Result:    &ExecutionResult{Success: true, Response: "完整日志分析"},
+	}
+	id := coord.recordEvidence(task, sub)
+	ev, ok := coord.evidence.Get(id)
+	if !ok || ev.Description != "完整日志分析" {
+		t.Fatalf("expected fallback to response, got %+v", ev)
+	}
+}
+
 // TestExecutePlanSingleExpertSkipsSynthesis 单专家不额外发起 LLM 综合，直接回传结论
 func TestExecutePlanSingleExpertSkipsSynthesis(t *testing.T) {
 	a := &fakeSpecialist{name: "monitor", response: "唯一结论"}

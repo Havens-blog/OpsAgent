@@ -263,6 +263,10 @@ func (m *MonitorAgent) executeRCATask(ctx context.Context, task *Task) (*Executi
 			"duration":      report.Duration.String(),
 		},
 		ToolsUsed: []string{"rca_engine"},
+		Finding: &StructuredFinding{
+			Conclusion: report.GetSummary(),
+			Confidence: report.Confidence,
+		},
 	}, nil
 }
 

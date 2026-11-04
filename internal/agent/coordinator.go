@@ -51,12 +51,12 @@ type TaskSubmission struct {
 // NewCoordinatorAgent creates a new coordinator agent.
 func NewCoordinatorAgent(settings *config.Settings) (*CoordinatorAgent, error) {
 	cfg := &AgentConfig{
-		Name:         "coordinator-agent",
-		Type:         AgentTypeCoordinator,
-		Description:  "Orchestrates multiple agents to complete complex tasks",
-		Model:        "claude-sonnet-4-20250514",
-		MaxTurns:     15,
-		Timeout:      10 * time.Minute,
+		Name:        "coordinator-agent",
+		Type:        AgentTypeCoordinator,
+		Description: "Orchestrates multiple agents to complete complex tasks",
+		Model:       "claude-sonnet-4-20250514",
+		MaxTurns:    15,
+		Timeout:     10 * time.Minute,
 		SystemPrompt: `You are a CoordinatorAgent responsible for orchestrating other agents.
 
 Your capabilities include:
@@ -260,8 +260,8 @@ func (c *CoordinatorAgent) Execute(ctx context.Context, task *Task) (*ExecutionR
 	plan, err := c.createExecutionPlan(ctx, task)
 	if err != nil {
 		return &ExecutionResult{
-			Success: false,
-			Error:   errText(err),
+			Success:  false,
+			Error:    errText(err),
 			Response: fmt.Sprintf("Failed to create execution plan: %v", err),
 		}, nil
 	}
@@ -613,12 +613,33 @@ func (c *CoordinatorAgent) recordEvidence(task *Task, sub *TaskSubmission) strin
 		SourceAgent: sub.AgentName,
 		Type:        comm.EvidenceTypeHypothesis,
 		Title:       fmt.Sprintf("%s 结论", sub.AgentName),
-		Description: sub.Result.Response,
+		Description: findingConclusion(sub.Result),
 		IncidentID:  task.ID,
-		Confidence:  resultConfidence(sub.Result),
+		Confidence:  findingConfidence(sub.Result),
 	}
 	c.evidence.Add(e)
 	return e.DedupKey
+}
+
+// findingConclusion prefers the specialist's structured conclusion and falls
+// back to its full response when no finding was produced.
+func findingConclusion(r *ExecutionResult) string {
+	if r != nil && r.Finding != nil && strings.TrimSpace(r.Finding.Conclusion) != "" {
+		return r.Finding.Conclusion
+	}
+	if r != nil {
+		return r.Response
+	}
+	return ""
+}
+
+// findingConfidence prefers the structured finding's confidence and falls back
+// to the result data when no finding was produced.
+func findingConfidence(r *ExecutionResult) float64 {
+	if r != nil && r.Finding != nil {
+		return r.Finding.Confidence
+	}
+	return resultConfidence(r)
 }
 
 // resultConfidence extracts the specialist's self-reported confidence from its
@@ -679,7 +700,7 @@ func buildSynthesisPrompt(task *Task, submissions []*TaskSubmission) string {
 	b.WriteString(task.Description)
 	b.WriteString("\n\n专家结论：\n")
 	for _, sub := range submissions {
-		fmt.Fprintf(&b, "--- %s ---\n%s\n", sub.AgentName, sub.Result.Response)
+		fmt.Fprintf(&b, "--- %s ---\n%s\n", sub.AgentName, findingConclusion(sub.Result))
 	}
 	return b.String()
 }
@@ -691,8 +712,8 @@ func (c *CoordinatorAgent) executeTask(ctx context.Context, task *Task) *Executi
 	availableAgents := c.GetRegisteredAgents()
 
 	return &ExecutionResult{
-		Success: false,
-		Error:   "unable to route task to a specialist agent",
+		Success:  false,
+		Error:    "unable to route task to a specialist agent",
 		Response: fmt.Sprintf("无法将任务路由到可用专家（可用：%v）。请提供明确的 type 参数（rca / log_analysis / inspection）或稍后重试。", availableAgents),
 		Data: map[string]interface{}{
 			"available_agents": availableAgents,

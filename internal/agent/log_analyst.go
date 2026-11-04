@@ -439,6 +439,14 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 
 	// Format response
 	response := l.formatAnalysisResult(analysis)
+	conclusion := fmt.Sprintf("窗口内错误总数 %d", analysis.TotalErrors)
+	confidence := 0.0
+	if len(analysis.ErrorPatterns) > 0 {
+		top := analysis.ErrorPatterns[0]
+		conclusion = fmt.Sprintf("发现 %d 个错误模式，最突出: %s (%d 次)",
+			len(analysis.ErrorPatterns), top.Pattern, top.Count)
+		confidence = 0.5
+	}
 
 	return &ExecutionResult{
 		Success:  true,
@@ -450,6 +458,10 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 			"timeline":      analysis.Timeline,
 		},
 		ToolsUsed: []string{"log_analysis"},
+		Finding: &StructuredFinding{
+			Conclusion: conclusion,
+			Confidence: confidence,
+		},
 	}, nil
 }
 
