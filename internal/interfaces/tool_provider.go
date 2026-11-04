@@ -6,6 +6,7 @@ import (
 
 	"github.com/Havens-blog/OpsAgent/internal/guardrails"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
+	"github.com/Havens-blog/OpsAgent/internal/skill"
 	"github.com/Havens-blog/OpsAgent/internal/tool"
 )
 
@@ -102,15 +103,55 @@ func approvalScope(s string) guardrails.ApprovalScope {
 // buildChatToolRegistry registers the specialists' BOUND tools (real
 // implementations collected from the live agents by initAgents), the factual
 // WAF query tool, plus a mock confirmation-required tool so the approval path
-// is reachable end-to-end.
-func buildChatToolRegistry(specialistTools []*tool.Tool, wq *wafQuerier) *tool.Registry {
+// is reachable end-to-end. When a skill loader is supplied, the runbook loader
+// tool is registered too.
+func buildChatToolRegistry(specialistTools []*tool.Tool, wq *wafQuerier, skillLoaders ...*skill.Loader) *tool.Registry {
 	reg := tool.NewRegistry()
 	for _, t := range specialistTools {
 		_ = reg.Register(t)
 	}
 	_ = reg.Register(createWAFLogQueryTool(wq))
 	_ = reg.Register(mockRestartServiceTool())
+	if len(skillLoaders) > 0 && skillLoaders[0] != nil {
+		_ = reg.Register(createSkillLoadTool(skillLoaders[0]))
+	}
 	return reg
+}
+
+// createSkillLoadTool exposes a runbook loader so the model pulls full skill
+// content only when the task needs it.
+func createSkillLoadTool(l *skill.Loader) *tool.Tool {
+	schema := `{
+		"type": "object",
+		"properties": {
+			"name": {"type": "string", "description": "要加载的技能名，例如 waf-investigation"}
+		},
+		"required": ["name"]
+	}`
+	return &tool.Tool{
+		Metadata: &tool.ToolMetadata{
+			Name:        "load_skill",
+			Description: "按名称加载运维技能的完整说明与步骤",
+			Source:      tool.DataSourceTypeGeneric,
+			InputSchema: []byte(schema),
+			Tier:        guardrails.TierSafe,
+			SideEffect:  guardrails.SideEffectReadOnly,
+			Category:    "skills",
+		},
+		IsAvailable: func(map[string]interface{}) bool { return l != nil && len(l.List()) > 0 },
+		Run: func(ctx context.Context, params map[string]interface{}) (interface{}, error) {
+			name, _ := params["name"].(string)
+			s, err := l.Load(name)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]interface{}{
+				"name":        s.Name,
+				"description": s.Description,
+				"content":     s.Body,
+			}, nil
+		},
+	}
 }
 
 func mockRestartServiceTool() *tool.Tool {
