@@ -311,11 +311,19 @@ func (i *InspectorAgent) executeInspectionTask(ctx context.Context, task *Task) 
 			Success:  false,
 			Error:    errText(err),
 			Response: fmt.Sprintf("Inspection failed: %v", err),
+			Data: map[string]interface{}{
+				"run_status": InspectionRunFailed,
+			},
 		}, nil
 	}
 
 	// Format response
 	response := i.formatInspectionReport(report)
+	runStatus := InspectionRunSuccess
+	stopCondition := getString(task.Params, "stop_condition")
+	if stopCondition != "" && !StopConditionMet(stopCondition, report.Summary) {
+		runStatus = InspectionRunUnmet
+	}
 
 	return &ExecutionResult{
 		Success:  true,
@@ -330,6 +338,9 @@ func (i *InspectorAgent) executeInspectionTask(ctx context.Context, task *Task) 
 			"critical_count": report.Summary.CriticalCount,
 			"warning_count":  report.Summary.WarningCount,
 			"duration":       report.Duration.String(),
+			"run_status":     runStatus,
+			"stop_condition": stopCondition,
+			"max_runs":       getInt(task.Params, "max_runs"),
 		},
 		ToolsUsed: []string{"inspection"},
 	}, nil
