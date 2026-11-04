@@ -182,6 +182,7 @@ func (s *Service) Chat(ctx context.Context, messages []Message) (string, error) 
 	}
 
 	// Convert to llm.Message format, prepending system prompt
+	messages = s.compactIfNeeded(ctx, messages)
 	llmMessages := make([]llm.Message, 0, len(messages)+1)
 	llmMessages = append(llmMessages, llm.Message{
 		Role:    "system",
@@ -213,7 +214,7 @@ func (s *Service) ChatStream(ctx context.Context, messages []Message, onDelta fu
 	if !s.IsAvailable() {
 		return fmt.Errorf("chat service not available")
 	}
-	return s.streamLLM(ctx, s.buildLLMMessages(messages), onDelta, nil)
+	return s.streamLLM(ctx, s.buildLLMMessages(s.compactIfNeeded(ctx, messages)), onDelta, nil)
 }
 
 // StreamWithTools runs a multi-round tool-calling loop and then streams the
@@ -232,7 +233,7 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 	required := mustQueryTools(latestUserText(messages))
 	var evidence []ToolEvidence
 	var usage llm.Usage
-	llmMessages := s.buildLLMMessages(messages)
+	llmMessages := s.buildLLMMessages(s.compactIfNeeded(ctx, messages))
 
 	var tools []llm.Tool
 	if s.toolProvider != nil {
