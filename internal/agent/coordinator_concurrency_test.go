@@ -1,0 +1,220 @@
+package agent
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Havens-blog/OpsAgent/internal/config"
+)
+
+// fakeSpecialist 是可控结果的专家桩，用于验证 Coordinator 的委派与汇总逻辑
+type fakeSpecialist struct {
+	name     string
+	response string
+	fail     bool
+	err      error
+	calls    int
+	mu       sync.Mutex
+}
+
+func (f *fakeSpecialist) Execute(_ context.Context, _ *Task) (*ExecutionResult, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &ExecutionResult{
+		Success:   !f.fail,
+		Response:  f.response,
+		ToolsUsed: []string{f.name + "_tool"},
+	}, nil
+}
+
+func (f *fakeSpecialist) GetConfig() *AgentConfig {
+	return &AgentConfig{Name: f.name, Type: AgentTypeMonitor, Description: f.name}
+}
+
+func (f *fakeSpecialist) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func newTestCoordinator(t *testing.T, specialists ...*fakeSpecialist) *CoordinatorAgent {
+	t.Helper()
+	settings := &config.Settings{
+		Environment:   config.EnvDevelopment,
+		LLM:           config.LLMConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1", APIKey: "test-key"},
+		Observability: config.ObservabilityConfig{LogLevel: "info", LogFormat: "json"},
+		Security:      config.SecurityConfig{EnableAuditLog: false},
+		DataSources:   make(map[string]interface{}),
+	}
+	coord, err := NewCoordinatorAgent(settings)
+	if err != nil {
+		t.Fatalf("NewCoordinatorAgent failed: %v", err)
+	}
+	t.Cleanup(func() { coord.Shutdown(context.Background()) })
+	for _, s := range specialists {
+		if err := coord.RegisterAgent(s.name, s); err != nil {
+			t.Fatalf("RegisterAgent(%s) failed: %v", s.name, err)
+		}
+	}
+	return coord
+}
+
+func newDelegationTask(id string) *Task {
+	return &Task{ID: id, Description: "test", Params: map[string]interface{}{}, CreatedAt: time.Now(), Status: "pending"}
+}
+
+// TestDelegateTaskConcurrentUniqueIDs 并发委派时提交 ID 必须唯一，且状态全部写完
+func TestDelegateTaskConcurrentUniqueIDs(t *testing.T) {
+	spec := &fakeSpecialist{name: "monitor", response: "ok"}
+	coord := newTestCoordinator(t, spec)
+	task := newDelegationTask("concurrent")
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := coord.DelegateTask(context.Background(), "monitor", task); err != nil {
+				t.Errorf("DelegateTask failed: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	statuses := coord.GetTaskStatus(task.ID)
+	if len(statuses) != n {
+		t.Fatalf("expected %d submissions, got %d", n, len(statuses))
+	}
+	seen := make(map[string]bool, n)
+	for _, s := range statuses {
+		if seen[s.TaskID] {
+			t.Fatalf("duplicate submission id %s", s.TaskID)
+		}
+		seen[s.TaskID] = true
+		if s.Status != "completed" {
+			t.Errorf("submission %s status = %q, want completed", s.TaskID, s.Status)
+		}
+	}
+}
+
+// TestDelegateTasksAsyncKeepsFailures 并行委派对每个委派都返回一个提交，含未注册专家
+func TestDelegateTasksAsyncKeepsFailures(t *testing.T) {
+	ok := &fakeSpecialist{name: "monitor", response: "cpu 打满"}
+	coord := newTestCoordinator(t, ok)
+
+	subs := coord.DelegateTasksAsync(context.Background(), []TaskDelegation{
+		{AgentName: "monitor", Task: newDelegationTask("p-monitor")},
+		{AgentName: "ghost", Task: newDelegationTask("p-ghost")},
+	})
+	if len(subs) != 2 {
+		t.Fatalf("expected 2 submissions, got %d", len(subs))
+	}
+	if subs[0].AgentName != "monitor" || !subs[0].succeeded() {
+		t.Errorf("expected monitor to succeed first, got %+v", subs[0])
+	}
+	if subs[1].AgentName != "ghost" || subs[1].Status != "failed" || subs[1].Error == "" {
+		t.Errorf("expected ghost failed submission with error, got %+v", subs[1])
+	}
+}
+
+// TestExecutePlanParallelPartialResult 并行时一个专家失败，其他专家的结论必须保留
+func TestExecutePlanParallelPartialResult(t *testing.T) {
+	ok := &fakeSpecialist{name: "monitor", response: "订单服务 P99 飙升"}
+	bad := &fakeSpecialist{name: "log_analyst", err: errors.New("SLS 超时")}
+	coord := newTestCoordinator(t, ok, bad)
+	task := newDelegationTask("parallel")
+
+	plan := &ExecutionPlan{
+		Strategy: "parallel",
+		Delegations: []TaskDelegation{
+			coord.newDelegation("monitor", "monitor", task, nil),
+			coord.newDelegation("log_analyst", "log_analyst", task, nil),
+		},
+	}
+	result := coord.executePlan(context.Background(), task, plan)
+
+	if result.Success {
+		t.Error("expected overall failure when one specialist fails")
+	}
+	if !strings.Contains(result.Response, "订单服务 P99 飙升") {
+		t.Errorf("successful specialist output dropped: %q", result.Response)
+	}
+	if !strings.Contains(result.Response, "SLS 超时") {
+		t.Errorf("failure reason missing: %q", result.Response)
+	}
+	if partial, _ := result.Data["partial"].(bool); !partial {
+		t.Error("expected Data[partial]=true")
+	}
+	failed, _ := result.Data["failed_agents"].([]string)
+	if len(failed) != 1 || failed[0] != "log_analyst" {
+		t.Errorf("failed_agents = %v, want [log_analyst]", failed)
+	}
+	if len(result.ToolsUsed) != 1 || result.ToolsUsed[0] != "monitor_tool" {
+		t.Errorf("ToolsUsed = %v, want [monitor_tool]", result.ToolsUsed)
+	}
+}
+
+// TestExecutePlanSequentialStopsButKeepsEarlier 顺序执行遇失败即停，但保留前面的结果
+func TestExecutePlanSequentialStopsButKeepsEarlier(t *testing.T) {
+	first := &fakeSpecialist{name: "monitor", response: "发现异常"}
+	failing := &fakeSpecialist{name: "log_analyst", response: "日志源未配置", fail: true}
+	never := &fakeSpecialist{name: "inspector", response: "不该执行"}
+	coord := newTestCoordinator(t, first, failing, never)
+	task := newDelegationTask("sequential")
+
+	plan := &ExecutionPlan{
+		Strategy: "sequential",
+		Delegations: []TaskDelegation{
+			coord.newDelegation("monitor", "monitor", task, nil),
+			coord.newDelegation("log_analyst", "log_analyst", task, nil),
+			coord.newDelegation("inspector", "inspector", task, nil),
+		},
+	}
+	result := coord.executePlan(context.Background(), task, plan)
+
+	if result.Success {
+		t.Error("expected failure")
+	}
+	if never.callCount() != 0 {
+		t.Error("inspector must not run after an earlier failure")
+	}
+	if !strings.Contains(result.Response, "发现异常") || !strings.Contains(result.Response, "日志源未配置") {
+		t.Errorf("expected earlier result and failure reason, got %q", result.Response)
+	}
+}
+
+// TestExecutePlanAllSucceed 全部成功时整体成功且非 partial
+func TestExecutePlanAllSucceed(t *testing.T) {
+	a := &fakeSpecialist{name: "monitor", response: "A"}
+	b := &fakeSpecialist{name: "log_analyst", response: "B"}
+	coord := newTestCoordinator(t, a, b)
+	task := newDelegationTask("all-ok")
+
+	plan := &ExecutionPlan{
+		Strategy: "parallel",
+		Delegations: []TaskDelegation{
+			coord.newDelegation("monitor", "monitor", task, nil),
+			coord.newDelegation("log_analyst", "log_analyst", task, nil),
+		},
+	}
+	result := coord.executePlan(context.Background(), task, plan)
+
+	if !result.Success || result.Error != "" {
+		t.Fatalf("expected success, got success=%v error=%q", result.Success, result.Error)
+	}
+	if partial, _ := result.Data["partial"].(bool); partial {
+		t.Error("expected Data[partial]=false")
+	}
+	if result.Response != "[monitor]: A\n\n[log_analyst]: B" {
+		t.Errorf("unexpected response order/format: %q", result.Response)
+	}
+}

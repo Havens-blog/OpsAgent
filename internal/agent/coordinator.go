@@ -131,27 +131,30 @@ func (c *CoordinatorAgent) GetRegisteredAgents() []string {
 	return names
 }
 
-// DelegateTask sends a task to a specific agent.
-func (c *CoordinatorAgent) DelegateTask(ctx context.Context, agentName string, task *Task) (*TaskSubmission, error) {
-	c.mu.RLock()
-	agent, exists := c.agents[agentName]
-	c.mu.RUnlock()
+// succeeded reports whether the sub-task finished without error and the
+// specialist itself reported success.
+func (s *TaskSubmission) succeeded() bool {
+	return s.Error == "" && s.Result != nil && s.Result.Success
+}
 
+// DelegateTask sends a task to a specific agent. All submission bookkeeping is
+// done under c.mu so concurrent delegations get unique IDs and GetTaskStatus
+// never observes a half-written submission.
+func (c *CoordinatorAgent) DelegateTask(ctx context.Context, agentName string, task *Task) (*TaskSubmission, error) {
+	c.mu.Lock()
+	agent, exists := c.agents[agentName]
 	if !exists {
+		c.mu.Unlock()
 		return nil, fmt.Errorf("agent not registered: %s", agentName)
 	}
-
 	submission := &TaskSubmission{
 		TaskID:      fmt.Sprintf("%s-%d", task.ID, c.taskCounter),
 		AgentName:   agentName,
 		Status:      "pending",
 		SubmittedAt: time.Now(),
 	}
-
-	// Store submission
-	c.mu.Lock()
-	c.subTasks[task.ID] = append(c.subTasks[task.ID], submission)
 	c.taskCounter++
+	c.subTasks[task.ID] = append(c.subTasks[task.ID], submission)
 	c.mu.Unlock()
 
 	c.logger.Info("Task delegated",
@@ -160,16 +163,19 @@ func (c *CoordinatorAgent) DelegateTask(ctx context.Context, agentName string, t
 		observability.String("submission_id", submission.TaskID),
 	)
 
-	// Execute asynchronously (in real implementation, use goroutine pool)
 	result, err := agent.Execute(ctx, task)
 
+	c.mu.Lock()
 	submission.Status = "completed"
+	if err != nil {
+		submission.Status = "failed"
+	}
 	submission.CompletedAt = time.Now()
 	submission.Result = result
 	submission.Error = errText(err)
+	c.mu.Unlock()
 
 	if err != nil {
-		submission.Status = "failed"
 		c.logger.Error("Task delegation failed",
 			observability.String("submission_id", submission.TaskID),
 			observability.Err(err),
@@ -177,38 +183,45 @@ func (c *CoordinatorAgent) DelegateTask(ctx context.Context, agentName string, t
 	} else {
 		c.logger.Info("Task delegation completed",
 			observability.String("submission_id", submission.TaskID),
-			observability.Bool("success", result.Success),
+			observability.Bool("success", result != nil && result.Success),
 		)
 	}
 
 	return submission, nil
 }
 
-// DelegateTasksAsync delegates multiple tasks in parallel.
+// delegateOrFail delegates a task and converts a delegation error (e.g. an
+// unregistered agent) into a failed submission, so callers always get one
+// submission per delegation to report on.
+func (c *CoordinatorAgent) delegateOrFail(ctx context.Context, d TaskDelegation) *TaskSubmission {
+	sub, err := c.DelegateTask(ctx, d.AgentName, d.Task)
+	if err == nil {
+		return sub
+	}
+	now := time.Now()
+	return &TaskSubmission{
+		TaskID:      d.Task.ID,
+		AgentName:   d.AgentName,
+		Status:      "failed",
+		Error:       err.Error(),
+		SubmittedAt: now,
+		CompletedAt: now,
+	}
+}
+
+// DelegateTasksAsync delegates multiple tasks in parallel. It returns exactly
+// one submission per delegation, in delegation order, including failures.
 func (c *CoordinatorAgent) DelegateTasksAsync(ctx context.Context, delegations []TaskDelegation) []*TaskSubmission {
-	type result struct {
-		submission *TaskSubmission
-		err        error
+	submissions := make([]*TaskSubmission, len(delegations))
+	var wg sync.WaitGroup
+	for i, del := range delegations {
+		wg.Add(1)
+		go func(i int, d TaskDelegation) {
+			defer wg.Done()
+			submissions[i] = c.delegateOrFail(ctx, d)
+		}(i, del)
 	}
-
-	results := make(chan result, len(delegations))
-
-	for _, del := range delegations {
-		go func(d TaskDelegation) {
-			sub, err := c.DelegateTask(ctx, d.AgentName, d.Task)
-			results <- result{submission: sub, err: err}
-		}(del)
-	}
-
-	// Collect results
-	submissions := make([]*TaskSubmission, 0, len(delegations))
-	for i := 0; i < len(delegations); i++ {
-		r := <-results
-		if r.err == nil {
-			submissions = append(submissions, r.submission)
-		}
-	}
-
+	wg.Wait()
 	return submissions
 }
 
@@ -216,7 +229,6 @@ func (c *CoordinatorAgent) DelegateTasksAsync(ctx context.Context, delegations [
 type TaskDelegation struct {
 	AgentName string
 	Task      *Task
-	DependsOn []string // IDs of tasks this depends on
 }
 
 // Execute orchestrates the task execution process.
@@ -281,9 +293,8 @@ func (c *CoordinatorAgent) Execute(ctx context.Context, task *Task) (*ExecutionR
 
 // ExecutionPlan represents the execution strategy for a task.
 type ExecutionPlan struct {
-	Strategy     string // "sequential", "parallel", "hybrid"
-	Delegations  []TaskDelegation
-	Dependencies map[string][]string // task ID -> dependent task IDs
+	Strategy    string // "sequential", "parallel", "direct"
+	Delegations []TaskDelegation
 }
 
 // knownTypeAgent maps an explicit task type to its specialist agent. These are
@@ -311,9 +322,8 @@ var knownTypeAgent = map[string]string{
 //     intelligence when available, a safe deterministic path otherwise.
 func (c *CoordinatorAgent) createExecutionPlan(ctx context.Context, task *Task) (*ExecutionPlan, error) {
 	plan := &ExecutionPlan{
-		Strategy:     "sequential",
-		Delegations:  []TaskDelegation{},
-		Dependencies: make(map[string][]string),
+		Strategy:    "sequential",
+		Delegations: []TaskDelegation{},
 	}
 
 	// (1) Explicit type fast-path.
@@ -486,9 +496,8 @@ func (c *CoordinatorAgent) parsePlanJSON(raw string, valid map[string]bool, task
 	}
 
 	plan := &ExecutionPlan{
-		Strategy:     strategy,
-		Delegations:  []TaskDelegation{},
-		Dependencies: make(map[string][]string),
+		Strategy:    strategy,
+		Delegations: []TaskDelegation{},
 	}
 	seen := make(map[string]bool)
 	add := func(name string, params map[string]interface{}) {
@@ -519,51 +528,27 @@ func (c *CoordinatorAgent) executePlan(ctx context.Context, originalTask *Task, 
 		return c.executeTask(ctx, originalTask)
 	}
 
-	// Execute delegations based on strategy
 	var submissions []*TaskSubmission
-
-	switch plan.Strategy {
-	case "sequential":
-		for _, del := range plan.Delegations {
-			sub, err := c.DelegateTask(ctx, del.AgentName, del.Task)
-			if err != nil {
-				return &ExecutionResult{
-					Success: false,
-					Error:   errText(err),
-					Response: fmt.Sprintf("Delegation to %s failed: %v", del.AgentName, err),
-				}
-			}
-			submissions = append(submissions, sub)
-
-			// Stop if task failed
-			if sub.Error != "" || (sub.Result != nil && !sub.Result.Success) {
-				return &ExecutionResult{
-					Success: false,
-					Error:   sub.Error,
-					Response: fmt.Sprintf("Task failed at %s: %v", del.AgentName, sub.Error),
-				}
-			}
-		}
-
-	case "parallel":
+	if plan.Strategy == "parallel" {
 		submissions = c.DelegateTasksAsync(ctx, plan.Delegations)
-
-		// Check if all succeeded
-		for _, sub := range submissions {
-			if sub.Error != "" || (sub.Result != nil && !sub.Result.Success) {
-				return &ExecutionResult{
-					Success: false,
-					Response: fmt.Sprintf("One or more parallel tasks failed"),
-				}
+	} else {
+		// 顺序执行遇到失败即停止，但保留已完成专家的结果
+		for _, del := range plan.Delegations {
+			sub := c.delegateOrFail(ctx, del)
+			submissions = append(submissions, sub)
+			if !sub.succeeded() {
+				break
 			}
 		}
 	}
 
-	// Aggregate results
 	return c.aggregateResults(originalTask, submissions)
 }
 
-// aggregateResults combines results from multiple sub-tasks.
+// aggregateResults combines results from multiple sub-tasks. Failed sub-tasks
+// never discard the evidence other specialists already produced: successful
+// responses are kept, failures are listed, and Data["partial"] marks a mixed
+// outcome.
 func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*TaskSubmission) *ExecutionResult {
 	if len(submissions) == 0 {
 		return &ExecutionResult{
@@ -572,33 +557,44 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 		}
 	}
 
-	// Combine all responses
-	var combinedResponse string
+	var parts []string
 	toolsUsed := []string{}
-	allSuccess := true
+	failed := []string{}
 
-	for i, sub := range submissions {
-		if i > 0 {
-			combinedResponse += "\n\n"
+	for _, sub := range submissions {
+		if sub.Result != nil {
+			toolsUsed = append(toolsUsed, sub.Result.ToolsUsed...)
 		}
-		combinedResponse += fmt.Sprintf("[%s]: %s", sub.AgentName, sub.Result.Response)
-
-		if !sub.Result.Success {
-			allSuccess = false
+		if sub.succeeded() {
+			parts = append(parts, fmt.Sprintf("[%s]: %s", sub.AgentName, sub.Result.Response))
+			continue
 		}
-
-		toolsUsed = append(toolsUsed, sub.Result.ToolsUsed...)
+		failed = append(failed, sub.AgentName)
+		reason := sub.Error
+		if reason == "" && sub.Result != nil {
+			reason = sub.Result.Error
+			if reason == "" {
+				reason = sub.Result.Response
+			}
+		}
+		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, reason))
 	}
 
-	return &ExecutionResult{
-		Success:   allSuccess,
-		Response:  combinedResponse,
+	result := &ExecutionResult{
+		Success:   len(failed) == 0,
+		Response:  strings.Join(parts, "\n\n"),
 		ToolsUsed: toolsUsed,
 		Data: map[string]interface{}{
-			"submissions": submissions,
-			"agent_count": len(submissions),
+			"submissions":   submissions,
+			"agent_count":   len(submissions),
+			"failed_agents": failed,
+			"partial":       len(failed) > 0 && len(failed) < len(submissions),
 		},
 	}
+	if len(failed) > 0 {
+		result.Error = fmt.Sprintf("%d/%d 个专家执行失败: %s", len(failed), len(submissions), strings.Join(failed, ", "))
+	}
+	return result
 }
 
 // executeTask is the coordinator's fallback for a task it could not route to a

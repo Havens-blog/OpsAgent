@@ -738,8 +738,7 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 				observability.String("incident_id", req.IncidentID),
 				observability.Err(err),
 			)
-			// Update incident status to failed
-			incident.Labels["status"] = "failed"
+			// 只通过 store 改状态：incident 与已存储的 running 报告共享，原地写 Labels 会与读者竞争
 			_ = s.rcaStore.UpdateStatus(ctx, req.IncidentID, "failed")
 			return
 		}

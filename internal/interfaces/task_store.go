@@ -171,7 +171,8 @@ func (s *MemoryAgentTaskStore) Create(ctx context.Context, t *AgentTask) error {
 	if t.UpdatedAt.IsZero() {
 		t.UpdatedAt = now
 	}
-	s.items[t.ID] = t
+	// 存副本：调用方后续修改自己的 t 不会与并发读者竞争
+	s.items[t.ID] = s.clone(t)
 	return s.persistLocked()
 }
 
@@ -226,7 +227,8 @@ func (s *MemoryAgentTaskStore) Update(ctx context.Context, t *AgentTask) error {
 	t.TenantID = cur.TenantID
 	t.UserID = cur.UserID
 	t.UpdatedAt = time.Now()
-	s.items[t.ID] = t
+	// 存副本：执行任务的 goroutine 会继续修改 t，不能与 Get/List 的读共享同一对象
+	s.items[t.ID] = s.clone(t)
 	return s.persistLocked()
 }
 

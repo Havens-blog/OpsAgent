@@ -20,7 +20,7 @@ jobs:
       - name: Vet
         run: go vet ./internal/... ./tests/...
       - name: Test
-        run: go test ./internal/... ./tests/... -count=1
+        run: go test ./internal/... ./tests/... -count=1 -race
 
   frontend:
     name: frontend (type check)
