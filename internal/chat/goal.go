@@ -111,40 +111,80 @@ func (c *goalController) decide(r GoalResult) (bool, string) {
 	return true, ""
 }
 
-// buildGoalEvalPrompt 渲染目标评估提示词
-func buildGoalEvalPrompt(goal, draft string) string {
-	return fmt.Sprintf(
-		"你是目标达成度评估器。目标：%s\n\n助手当前草稿：\n%s\n\n"+
-			"请判断目标是否已达成，只返回 JSON：\n"+
-			"{\"met\": true|false, \"blocker\": \"goal_not_met_yet|missing_evidence|needs_user_input|run_failed|external_wait\", \"reasoning\": \"一句话说明\"}",
-		goal, draft,
-	)
+type goalKey struct{}
+
+// WithGoal 把本次请求的完成条件挂到 ctx；空目标表示不启用目标续跑
+func WithGoal(ctx context.Context, goal string) context.Context {
+	return context.WithValue(ctx, goalKey{}, strings.TrimSpace(goal))
 }
 
-// evaluateGoal 调用一次 LLM 评估助手草稿是否达成当前目标
-func (s *Service) evaluateGoal(ctx context.Context, draft string) (GoalResult, error) {
+// GoalFrom 读取 ctx 上的完成条件，未设置时返回空串
+func GoalFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	g, _ := ctx.Value(goalKey{}).(string)
+	return g
+}
+
+// buildGoalEvalPrompt 渲染目标评估提示词，评估依据是本轮工具证据而非草稿措辞
+func buildGoalEvalPrompt(goal, draft string, evidence []ToolEvidence) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "你是目标达成度评估器。目标：%s\n\n助手当前草稿：\n%s\n\n本轮已取得的工具证据：\n", goal, draft)
+	if len(evidence) == 0 {
+		b.WriteString("（无）\n")
+	}
+	for _, ev := range evidence {
+		if ev.Error != "" {
+			fmt.Fprintf(&b, "- %s [%s] 错误: %s\n", ev.ToolName, ev.Status, truncateBytes(ev.Error, 300))
+			continue
+		}
+		digest, _ := json.Marshal(ev.ResultDigest)
+		fmt.Fprintf(&b, "- %s [%s] %s\n", ev.ToolName, ev.Status, truncateBytes(string(digest), 300))
+	}
+	b.WriteString("\n只依据上述证据判断目标是否已达成，草稿里没有证据支撑的说法不算达成。只返回 JSON：\n")
+	b.WriteString(`{"met": true|false, "blocker": "goal_not_met_yet|missing_evidence|needs_user_input|run_failed|external_wait", "reasoning": "一句话说明"}`)
+	return b.String()
+}
+
+// evaluateGoal 调用一次 LLM 评估目标是否达成，并返回本次评估消耗的 usage
+func (s *Service) evaluateGoal(ctx context.Context, goal, draft string, evidence []ToolEvidence) (GoalResult, llm.Usage, error) {
 	resp, err := s.client.Chat(ctx, []llm.Message{{
 		Role:    "user",
-		Content: buildGoalEvalPrompt(s.goal, draft),
+		Content: buildGoalEvalPrompt(goal, draft, evidence),
 	}})
 	if err != nil {
-		return GoalResult{}, err
+		return GoalResult{}, llm.Usage{}, err
 	}
-	if len(resp.Choices) == 0 {
-		return GoalResult{}, fmt.Errorf("empty goal evaluation response")
+	if resp == nil || len(resp.Choices) == 0 {
+		return GoalResult{}, llm.Usage{}, fmt.Errorf("empty goal evaluation response")
 	}
-	return parseGoalResult(resp.Choices[0].Message.Content)
+	gr, err := parseGoalResult(resp.Choices[0].Message.Content)
+	return gr, resp.Usage, err
 }
 
-// maybeContinueForGoal 返回是否续跑，以及续跑时注入的提示
-func (s *Service) maybeContinueForGoal(ctx context.Context, draft string, ctl *goalController) (bool, string) {
-	gr, err := s.evaluateGoal(ctx, draft)
+// maybeContinueForGoal 返回是否续跑、续跑提示、停止原因与评估 usage
+func (s *Service) maybeContinueForGoal(ctx context.Context, goal, draft string, evidence []ToolEvidence, ctl *goalController) (bool, string, string, llm.Usage) {
+	gr, usage, err := s.evaluateGoal(ctx, goal, draft, evidence)
 	if err != nil {
-		return false, ""
+		return false, "", "目标评估失败：" + err.Error(), usage
 	}
-	cont, _ := ctl.decide(gr)
+	if gr.Met {
+		return false, "", "目标已达成", usage
+	}
+	cont, reason := ctl.decide(gr)
 	if !cont {
-		return false, ""
+		if gr.Reasoning != "" {
+			reason += "：" + gr.Reasoning
+		}
+		return false, "", reason, usage
 	}
-	return true, fmt.Sprintf("目标尚未达成：%s\n请继续完成：%s", gr.Reasoning, s.goal)
+	return true, fmt.Sprintf("目标尚未达成：%s\n请继续完成：%s", gr.Reasoning, goal), "", usage
+}
+
+// addUsage 把一次调用的 usage 累加到总量
+func addUsage(dst *llm.Usage, u llm.Usage) {
+	dst.PromptTokens += u.PromptTokens
+	dst.CompletionTokens += u.CompletionTokens
+	dst.TotalTokens += u.TotalTokens
 }

@@ -55,6 +55,8 @@ type StreamHandler struct {
 	OnToolCall         func(callID string, name string, params map[string]interface{}) error
 	OnToolResult       func(callID string, name string, status string, result string, errMsg string, evidence ToolEvidence) error
 	OnApprovalRequired func(req guardrails.ApprovalRequest) error
+	// OnGoalStop 回传目标续跑的停止原因（已达成、阻塞类型、熔断或轮次上限）
+	OnGoalStop func(reason string) error
 }
 
 // Service provides conversational AI capabilities.
@@ -63,7 +65,6 @@ type Service struct {
 	toolProvider ToolProvider
 	systemPrompt string
 	skillSummary string
-	goal         string
 	available    bool
 	model        string
 }
@@ -76,12 +77,6 @@ func (s *Service) SetToolProvider(p ToolProvider) {
 // SetSkillSummary injects the runbook catalog rendered into the system prompt.
 func (s *Service) SetSkillSummary(summary string) {
 	s.skillSummary = strings.TrimSpace(summary)
-}
-
-// SetGoal sets an active completion condition for the next turn. An empty goal
-// disables goal-aware continuation.
-func (s *Service) SetGoal(goal string) {
-	s.goal = strings.TrimSpace(goal)
 }
 
 // Message represents a chat message, both as LLM input and persisted history.
@@ -257,10 +252,11 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 	}
 
 	// Cap the rounds so a model that keeps calling tools can never loop forever.
-	// A set goal extends the cap and enables goal-aware continuation.
+	// A request-scoped goal extends the cap and enables goal-aware continuation.
+	goal := GoalFrom(ctx)
 	maxRounds := 6
 	goalCtl := newGoalController()
-	if s.goal != "" {
+	if goal != "" {
 		maxRounds = goalCtl.maxContinuations
 	}
 	for round := 0; round < maxRounds; round++ {
@@ -285,11 +281,14 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 		assistantMsg := resp.Choices[0].Message
 		if len(assistantMsg.ToolCalls) == 0 {
-			if s.goal != "" {
-				if cont, hint := s.maybeContinueForGoal(ctx, assistantMsg.Content, goalCtl); cont {
+			if goal != "" {
+				cont, hint, stop, evalUsage := s.maybeContinueForGoal(ctx, goal, assistantMsg.Content, evidence, goalCtl)
+				addUsage(&usage, evalUsage)
+				if cont {
 					llmMessages = append(llmMessages, llm.Message{Role: "user", Content: hint})
 					continue
 				}
+				reportGoalStop(h, stop)
 			}
 			text, ev, grounding, err := s.finishAnswer(ctx, llmMessages, h, required, evidence, &usage)
 			return text, ev, grounding, usage, err
@@ -380,8 +379,18 @@ func (s *Service) StreamWithTools(ctx context.Context, messages []Message, h Str
 
 	// Exhausted the round budget: stream whatever the accumulated tool results
 	// support rather than leaving the user with no answer.
+	if goal != "" {
+		reportGoalStop(h, "达到工具轮次上限，目标未确认达成")
+	}
 	text, ev, grounding, err := s.finishAnswer(ctx, llmMessages, h, required, evidence, &usage)
 	return text, ev, grounding, usage, err
+}
+
+// reportGoalStop 把目标续跑的停止原因回传给调用方
+func reportGoalStop(h StreamHandler, reason string) {
+	if h.OnGoalStop != nil && reason != "" {
+		_ = h.OnGoalStop(reason)
+	}
 }
 
 // finishAnswer streams the final reply, then applies the unsupported suffix and
