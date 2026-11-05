@@ -72,6 +72,10 @@ type RCAReport struct {
 	// report can show whether the SLB forwarded 5xx in the window without
 	// crowning the edge as the root cause.
 	EdgeFacts *EdgeFacts
+	// Investigation is the multi-expert investigation outcome (coordinator
+	// findings plus programmatically disclosed coverage gaps). Storage and
+	// notification read this same field.
+	Investigation string
 }
 
 // GetSummary returns a human-readable summary of the RCA report. The headline

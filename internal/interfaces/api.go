@@ -85,6 +85,10 @@ type APIServer struct {
 	rcaEngine *engine.Engine
 	rcaStore  rca.RCAReportStore
 
+	// investigator 把告警调查委派给多个只读专家；nil 或专家不足两个时回退确定性引擎
+	investigator        alertInvestigator
+	investigationAgents []string
+
 	// Conversation store for the chat assistant (tenant-scoped, in-memory).
 	conversationStore chat.ConversationStore
 
@@ -745,7 +749,7 @@ func (s *APIServer) rcaAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
 	// Run RCA analysis in background
 	go func() {
 		ctx := tenant.WithID(context.Background(), tid)
-		report, err := s.rcaEngine.Analyze(ctx, incident)
+		report, err := s.investigateIncident(ctx, incident)
 		if err != nil {
 			s.logger.Error("RCA analysis failed",
 				observability.String("incident_id", req.IncidentID),
@@ -973,6 +977,7 @@ func (s *APIServer) getRCAHandler(w http.ResponseWriter, r *http.Request) {
 		"duration_ms":       int64(report.Duration.Seconds() * 1000),
 		"generated_at":      formatTimePtr(report.GeneratedAt),
 		"warnings":          normalizeWarnings(report.Warnings),
+		"investigation":     report.Investigation,
 	}
 
 	s.writeJSONResponse(w, http.StatusOK, result)
