@@ -27,6 +27,8 @@ type renameConversationRequest struct {
 type sendMessageRequest struct {
 	Content         string `json:"content"`
 	ClientMessageID string `json:"client_message_id,omitempty"`
+	// Goal 是本次请求的完成条件，非空时启用目标续跑
+	Goal string `json:"goal,omitempty"`
 }
 
 // sseEvent is the JSON payload carried on each SSE "data:" line.
@@ -312,6 +314,9 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 	if budget > 0 {
 		ctx = chat.WithTokenBudget(ctx, budget)
 	}
+	if goal := strings.TrimSpace(req.Goal); goal != "" {
+		ctx = chat.WithGoal(ctx, goal)
+	}
 	// The approval callback's parameter shadows req; keep the client id here.
 	clientMessageID := req.ClientMessageID
 
@@ -340,6 +345,9 @@ func (s *APIServer) sendMessageHandler(w http.ResponseWriter, r *http.Request, i
 				Source:       evidence.Source,
 				ResultDigest: evidence.ResultDigest,
 			})
+		},
+		OnGoalStop: func(reason string) error {
+			return s.writeSSE(w, sseEvent{Type: "goal_stop", Reason: reason})
 		},
 		OnApprovalRequired: func(req guardrails.ApprovalRequest) error {
 			approvalID := uuid.New().String()
