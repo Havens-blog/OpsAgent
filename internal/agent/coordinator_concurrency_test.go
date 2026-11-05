@@ -9,7 +9,32 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/config"
+	"github.com/Havens-blog/OpsAgent/internal/llm"
 )
+
+// cancelLLM 在 Chat 里阻塞到 ctx 取消，用于验证综合继承取消
+type cancelLLM struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *cancelLLM) Chat(ctx context.Context, _ []llm.ClaudeMessage) (string, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (c *cancelLLM) ChatWithTools(_ context.Context, _ []llm.ClaudeMessage, _ []llm.ClaudeTool) (string, []string, error) {
+	return "", nil, nil
+}
+
+func (c *cancelLLM) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
 
 // fakeSpecialist 是可控结果的专家桩，用于验证 Coordinator 的委派与汇总逻辑
 type fakeSpecialist struct {
@@ -355,5 +380,64 @@ func TestExecutePlanSingleExpertSkipsSynthesis(t *testing.T) {
 	}
 	if result.Data["synthesized"] != false {
 		t.Errorf("synthesized = %v, want false for single expert", result.Data["synthesized"])
+	}
+}
+
+func twoOKSubs() []*TaskSubmission {
+	return []*TaskSubmission{
+		{AgentName: "monitor", Status: "completed", Result: &ExecutionResult{Success: true, Response: "A"}},
+		{AgentName: "log_analyst", Status: "completed", Result: &ExecutionResult{Success: true, Response: "B"}},
+	}
+}
+
+// TestSynthesizeSkipsCancelledParent 父 context 已取消时不再发起综合 LLM 调用
+func TestSynthesizeSkipsCancelledParent(t *testing.T) {
+	llmClient := &cancelLLM{}
+	coord := newTestCoordinator(t)
+	coord.llmClient = llmClient
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	text, synthesized := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"})
+	if synthesized {
+		t.Error("cancelled parent must not synthesize")
+	}
+	if text != "[monitor]: A\n\n[log_analyst]: B" {
+		t.Errorf("text = %q, want deterministic fallback", text)
+	}
+	if llmClient.callCount() != 0 {
+		t.Errorf("LLM called %d times, want 0", llmClient.callCount())
+	}
+}
+
+// TestSynthesizeHonorsParentCancellation 综合进行中取消父 context，应立即回退而不是跑满 30 秒
+func TestSynthesizeHonorsParentCancellation(t *testing.T) {
+	llmClient := &cancelLLM{}
+	coord := newTestCoordinator(t)
+	coord.llmClient = llmClient
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var text string
+	var synthesized bool
+	go func() {
+		text, synthesized = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"})
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("synthesize did not return after parent cancellation")
+	}
+	if synthesized {
+		t.Error("should fall back to deterministic on cancellation")
+	}
+	if text != "parts" {
+		t.Errorf("text = %q, want fallback parts", text)
 	}
 }
