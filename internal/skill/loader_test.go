@@ -67,3 +67,36 @@ func TestLoaderSummarySorted(t *testing.T) {
 		t.Errorf("Summary not sorted: %q", sum)
 	}
 }
+
+func TestLoaderMissing(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "waf", "waf-investigation", "WAF", "body")
+
+	l := New(root)
+	if missing := l.Missing([]string{"waf-investigation"}); len(missing) != 0 {
+		t.Errorf("Missing = %v, want empty", missing)
+	}
+	missing := l.Missing([]string{"waf-investigation", "cmdb-inventory"})
+	if len(missing) != 1 || missing[0] != "cmdb-inventory" {
+		t.Errorf("Missing = %v, want [cmdb-inventory]", missing)
+	}
+}
+
+// TestRepoBuiltinSkillsLoadable 校验仓库 skills 目录里的内置技能可被发现并读取正文，
+// 对应镜像打包后 load_skill 的能力验证（CI 无 docker，这里覆盖仓库侧事实）。
+func TestRepoBuiltinSkillsLoadable(t *testing.T) {
+	dir := filepath.Join("..", "..", "skills")
+	if _, err := os.Stat(dir); err != nil {
+		t.Skipf("仓库 skills 目录不存在: %v", err)
+	}
+	l := New(dir)
+	for _, name := range []string{"waf-investigation", "cmdb-inventory"} {
+		s, err := l.Load(name)
+		if err != nil {
+			t.Fatalf("内置技能 %s 缺失: %v", name, err)
+		}
+		if strings.TrimSpace(s.Body) == "" {
+			t.Errorf("内置技能 %s 正文为空", name)
+		}
+	}
+}

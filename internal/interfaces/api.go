@@ -388,6 +388,12 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 			skillsDir = "skills"
 		}
 		loader := skill.New(skillsDir)
+		for _, name := range loader.Missing([]string{"waf-investigation", "cmdb-inventory"}) {
+			logger.Warn("内置技能缺失，load_skill 将无法加载该 runbook",
+				observability.String("skill", name),
+				observability.String("skills_dir", skillsDir),
+			)
+		}
 		provider := newRegistryToolProvider(buildChatToolRegistry(server.agentTools, wafQ, loader), settings.DataSources, approvalMgr)
 		chatService.SetToolProvider(provider)
 		chatService.SetSkillSummary(loader.Summary())

@@ -38,6 +38,9 @@ COPY --from=builder /build/opsagent .
 # Copy configuration files
 COPY --from=builder /build/config ./config
 
+# Copy runbooks so load_skill finds the built-in WAF/CMDB skills at runtime
+COPY --from=builder /build/skills ./skills
+
 # Create directories for runtime data
 RUN mkdir -p /app/data /app/logs && \
     chown -R opsagent:opsagent /app
