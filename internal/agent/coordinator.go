@@ -597,7 +597,7 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 			"failed_agents":  failed,
 			"partial":        len(failed) > 0 && len(failed) < len(submissions),
 			"evidence_ids":   evidenceIDs,
-			"evidence_count": c.evidence.Count(),
+			"evidence_count": len(c.evidence.GetByIncident(originalTask.ID)),
 			"synthesized":    synthesized,
 		},
 	}
