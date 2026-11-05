@@ -182,22 +182,22 @@ func TestMergeStrategies(t *testing.T) {
 		store := NewEvidenceStore(MergeStrategyHighestConfidence)
 
 		e1 := &SharedEvidence{
-			Type:        EvidenceTypeMetric,
-			Title:       "Latency spike",
-			Service:     "svc",
-			Data:        "low-conf data",
-			StartTime:   baseTime,
-			EndTime:     laterTime,
-			Confidence:  0.3,
+			Type:       EvidenceTypeMetric,
+			Title:      "Latency spike",
+			Service:    "svc",
+			Data:       "low-conf data",
+			StartTime:  baseTime,
+			EndTime:    laterTime,
+			Confidence: 0.3,
 		}
 		e2 := &SharedEvidence{
-			Type:        EvidenceTypeMetric,
-			Title:       "Latency spike",
-			Service:     "svc",
-			Data:        "high-conf data",
-			StartTime:   baseTime,
-			EndTime:     laterTime,
-			Confidence:  0.9,
+			Type:       EvidenceTypeMetric,
+			Title:      "Latency spike",
+			Service:    "svc",
+			Data:       "high-conf data",
+			StartTime:  baseTime,
+			EndTime:    laterTime,
+			Confidence: 0.9,
 		}
 
 		store.Add(e1)
@@ -242,6 +242,32 @@ func TestMergeStrategies(t *testing.T) {
 			t.Errorf("Expected newest data to win, got %v", merged.Data)
 		}
 	})
+}
+
+func TestDedupKeySeparatesIncidentAndDescription(t *testing.T) {
+	base := SharedEvidence{Type: EvidenceTypeHypothesis, Title: "monitor 结论"}
+	a := base
+	a.IncidentID = "inc-1"
+	a.Description = "CPU 饱和"
+	b := base
+	b.IncidentID = "inc-2"
+	b.Description = "CPU 饱和"
+	c := base
+	c.IncidentID = "inc-1"
+	c.Description = "连接池耗尽"
+	d := base
+	d.IncidentID = "inc-1"
+	d.Description = "CPU 饱和"
+
+	if a.ComputeDedupKey() == b.ComputeDedupKey() {
+		t.Error("不同事件不得共享去重键")
+	}
+	if a.ComputeDedupKey() == c.ComputeDedupKey() {
+		t.Error("不同结论不得共享去重键")
+	}
+	if a.ComputeDedupKey() != d.ComputeDedupKey() {
+		t.Error("相同事件与相同结论应共享去重键")
+	}
 }
 
 func TestEvidenceStoreEndorse(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,67 +18,70 @@ import (
 type EvidenceType string
 
 const (
-	EvidenceTypeLog      EvidenceType = "log"
-	EvidenceTypeMetric   EvidenceType = "metric"
-	EvidenceTypeTrace    EvidenceType = "trace"
-	EvidenceTypeChange   EvidenceType = "change"
-	EvidenceTypeTopology EvidenceType = "topology"
-	EvidenceTypeAlert    EvidenceType = "alert"
+	EvidenceTypeLog        EvidenceType = "log"
+	EvidenceTypeMetric     EvidenceType = "metric"
+	EvidenceTypeTrace      EvidenceType = "trace"
+	EvidenceTypeChange     EvidenceType = "change"
+	EvidenceTypeTopology   EvidenceType = "topology"
+	EvidenceTypeAlert      EvidenceType = "alert"
 	EvidenceTypeHypothesis EvidenceType = "hypothesis"
 )
 
 // SharedEvidence represents evidence collected and shared by an agent.
 type SharedEvidence struct {
 	// Identification
-	ID            string       `json:"id"`
-	DedupKey      string       `json:"dedup_key"` // Content hash for deduplication
+	ID       string `json:"id"`
+	DedupKey string `json:"dedup_key"` // Content hash for deduplication
 
 	// Source
-	SourceAgent   string       `json:"source_agent"` // Agent that collected it
-	Type          EvidenceType `json:"type"`
-	Service       string       `json:"service,omitempty"`
+	SourceAgent string       `json:"source_agent"` // Agent that collected it
+	Type        EvidenceType `json:"type"`
+	Service     string       `json:"service,omitempty"`
 
 	// Content
-	Title         string      `json:"title"`
-	Description   string      `json:"description"`
-	Data          interface{} `json:"data,omitempty"`
+	Title       string      `json:"title"`
+	Description string      `json:"description"`
+	Data        interface{} `json:"data,omitempty"`
 
 	// Time window when evidence was observed
-	StartTime     time.Time   `json:"start_time"`
-	EndTime       time.Time   `json:"end_time"`
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
 
 	// Relevance
-	Confidence    float64     `json:"confidence"`    // 0-1, how relevant to incident
-	Severity      string      `json:"severity,omitempty"`
+	Confidence float64 `json:"confidence"` // 0-1, how relevant to incident
+	Severity   string  `json:"severity,omitempty"`
 
 	// Correlation
-	IncidentID    string      `json:"incident_id,omitempty"`
-	CorrelatedTo  []string    `json:"correlated_to,omitempty"` // Other evidence IDs
+	IncidentID   string   `json:"incident_id,omitempty"`
+	CorrelatedTo []string `json:"correlated_to,omitempty"` // Other evidence IDs
 
 	// Metadata
-	Tags          []string    `json:"tags,omitempty"`
-	Annotations   map[string]string `json:"annotations,omitempty"`
+	Tags        []string          `json:"tags,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 
 	// Timing
-	CollectedAt   time.Time   `json:"collected_at"`
-	SharedAt      time.Time   `json:"shared_at,omitempty"`
+	CollectedAt time.Time `json:"collected_at"`
+	SharedAt    time.Time `json:"shared_at,omitempty"`
 
 	// Endorsements: agents that have corroborated this evidence
-	EndorsedBy    []string    `json:"endorsed_by,omitempty"`
-	ContradictedBy []string   `json:"contradicted_by,omitempty"`
+	EndorsedBy     []string `json:"endorsed_by,omitempty"`
+	ContradictedBy []string `json:"contradicted_by,omitempty"`
 }
 
 // ComputeDedupKey computes a content-based dedup key for an evidence.
-// Two pieces of evidence with the same type, title, service, and data hash
-// are considered duplicates regardless of which agent collected them.
+// IncidentID and the normalized description are part of the identity, so two
+// investigations or two different conclusions never collapse into one record.
+// Dedup across agents stays content-based (an endorsement), not source-based.
 func (e *SharedEvidence) ComputeDedupKey() string {
 	if e.DedupKey != "" {
 		return e.DedupKey
 	}
 
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%s|%v|%s|%s",
-		e.Type, e.Title, e.Service, e.Data, e.StartTime.Format(time.RFC3339), e.EndTime.Format(time.RFC3339))
+	fmt.Fprintf(h, "%s|%s|%s|%s|%v|%s|%s|%s",
+		e.IncidentID, e.Type, e.Title, e.Service, e.Data,
+		strings.TrimSpace(e.Description),
+		e.StartTime.Format(time.RFC3339), e.EndTime.Format(time.RFC3339))
 	e.DedupKey = hex.EncodeToString(h.Sum(nil))[:16]
 	return e.DedupKey
 }
@@ -343,8 +347,8 @@ func (s *EvidenceStore) Count() int {
 
 // EvidenceSharer coordinates evidence sharing between agents via the broker.
 type EvidenceSharer struct {
-	broker *Broker
-	store  *EvidenceStore
+	broker  *Broker
+	store   *EvidenceStore
 	agentID string
 }
 
@@ -460,18 +464,18 @@ func (s *EvidenceSharer) GetConsensusEvidence(minEndorsers int) []*SharedEvidenc
 
 // ConflictTracker tracks disagreements between agents about evidence.
 type ConflictTracker struct {
-	mu            sync.RWMutex
-	conflicts     map[string]*EvidenceConflict // dedupKey -> conflict
+	mu        sync.RWMutex
+	conflicts map[string]*EvidenceConflict // dedupKey -> conflict
 }
 
 // EvidenceConflict represents a disagreement about a piece of evidence.
 type EvidenceConflict struct {
-	EvidenceKey    string    `json:"evidence_key"`
-	Supporters     []string  `json:"supporters"`     // Agents that endorse
-	Dissenters     []string  `json:"dissenters"`     // Agents that contradict
-	DetectedAt     time.Time `json:"detected_at"`
-	ResolvedAt     time.Time `json:"resolved_at,omitempty"`
-	Resolution     string    `json:"resolution,omitempty"`
+	EvidenceKey string    `json:"evidence_key"`
+	Supporters  []string  `json:"supporters"` // Agents that endorse
+	Dissenters  []string  `json:"dissenters"` // Agents that contradict
+	DetectedAt  time.Time `json:"detected_at"`
+	ResolvedAt  time.Time `json:"resolved_at,omitempty"`
+	Resolution  string    `json:"resolution,omitempty"`
 }
 
 // NewConflictTracker creates a new conflict tracker.
@@ -546,13 +550,13 @@ func uniqueAppend(slice []string, items []string) []string {
 
 // EvidenceSummary summarizes the evidence store for an incident.
 type EvidenceSummary struct {
-	IncidentID      string                  `json:"incident_id"`
-	TotalEvidence   int                     `json:"total_evidence"`
-	ByType          map[EvidenceType]int    `json:"by_type"`
-	ConsensusCount  int                     `json:"consensus_count"`    // Endorsed by >=2
-	ConflictedCount int                     `json:"conflicted_count"`
-	TopEvidence     []*SharedEvidence       `json:"top_evidence"`       // Highest confidence
-	Conflicts       []*EvidenceConflict     `json:"conflicts,omitempty"`
+	IncidentID      string               `json:"incident_id"`
+	TotalEvidence   int                  `json:"total_evidence"`
+	ByType          map[EvidenceType]int `json:"by_type"`
+	ConsensusCount  int                  `json:"consensus_count"` // Endorsed by >=2
+	ConflictedCount int                  `json:"conflicted_count"`
+	TopEvidence     []*SharedEvidence    `json:"top_evidence"` // Highest confidence
+	Conflicts       []*EvidenceConflict  `json:"conflicts,omitempty"`
 }
 
 // Summarize generates a summary of evidence for an incident.

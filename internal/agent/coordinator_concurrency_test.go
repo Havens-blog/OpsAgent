@@ -300,6 +300,41 @@ func TestRecordEvidenceFallsBackToResponse(t *testing.T) {
 	}
 }
 
+// TestRecordEvidenceSeparatesIncidents 不同事件不同结论不得串到同一条证据
+func TestRecordEvidenceSeparatesIncidents(t *testing.T) {
+	coord := newTestCoordinator(t)
+
+	mk := func(conclusion string, conf float64) *TaskSubmission {
+		return &TaskSubmission{
+			AgentName: "monitor",
+			Status:    "completed",
+			Result: &ExecutionResult{
+				Success: true,
+				Finding: &StructuredFinding{Conclusion: conclusion, Confidence: conf},
+			},
+		}
+	}
+
+	idA := coord.recordEvidence(newDelegationTask("inc-A"), mk("CPU 饱和", 0.7))
+	idB := coord.recordEvidence(newDelegationTask("inc-B"), mk("连接池耗尽", 0.9))
+	if idA == idB {
+		t.Fatal("两个事件不得共享证据 ID")
+	}
+	evA, _ := coord.evidence.Get(idA)
+	evB, _ := coord.evidence.Get(idB)
+	if evA.IncidentID != "inc-A" || evA.Description != "CPU 饱和" || evA.Confidence != 0.7 {
+		t.Errorf("evA = %+v", evA)
+	}
+	if evB.IncidentID != "inc-B" || evB.Description != "连接池耗尽" || evB.Confidence != 0.9 {
+		t.Errorf("evB = %+v", evB)
+	}
+
+	// 相同输入幂等，复用同一证据 ID
+	if id := coord.recordEvidence(newDelegationTask("inc-A"), mk("CPU 饱和", 0.7)); id != idA {
+		t.Errorf("幂等写入应复用 ID，got %q want %q", id, idA)
+	}
+}
+
 // TestExecutePlanSingleExpertSkipsSynthesis 单专家不额外发起 LLM 综合，直接回传结论
 func TestExecutePlanSingleExpertSkipsSynthesis(t *testing.T) {
 	a := &fakeSpecialist{name: "monitor", response: "唯一结论"}
