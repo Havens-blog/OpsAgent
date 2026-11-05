@@ -160,6 +160,17 @@ func (s *APIServer) initAgents() {
 		if topologyAgent != nil {
 			_ = coordinator.RegisterAgent("resource_topology", topologyAgent)
 		}
+
+		// 告警调查计划：只读的 RCA 与日志取证专家
+		var planned []string
+		if monitor != nil {
+			planned = append(planned, "monitor")
+		}
+		if logAnalyst != nil {
+			planned = append(planned, "log_analyst")
+		}
+		s.investigator = coordinator
+		s.investigationAgents = planned
 	}
 	register("coordinator", "Coordinator", "coordinator",
 		"任务调度、委派与结论汇总",

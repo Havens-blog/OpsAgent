@@ -262,6 +262,8 @@ func (m *MonitorAgent) executeRCATask(ctx context.Context, task *Task) (*Executi
 			"candidates":    report.Candidates,
 			"signals":       report.Signals,
 			"duration":      report.Duration.String(),
+			// 完整报告供告警调查直接复用，避免确定性引擎重复分析
+			"report": report,
 		},
 		ToolsUsed: []string{"rca_engine"},
 		Finding: &StructuredFinding{

@@ -548,6 +548,17 @@ func (c *CoordinatorAgent) executePlan(ctx context.Context, originalTask *Task, 
 	return c.aggregateResults(ctx, originalTask, submissions)
 }
 
+// Investigate runs a caller-planned set of read-only specialists in parallel
+// and aggregates their results. Unregistered names become failed submissions,
+// so missing coverage stays visible instead of silently shrinking the plan.
+func (c *CoordinatorAgent) Investigate(ctx context.Context, task *Task, agents []string) *ExecutionResult {
+	plan := &ExecutionPlan{Strategy: "parallel"}
+	for _, name := range agents {
+		plan.Delegations = append(plan.Delegations, c.newDelegation(name, name, task, nil))
+	}
+	return c.executePlan(ctx, task, plan)
+}
+
 // aggregateResults combines results from multiple sub-tasks. Failed sub-tasks
 // never discard the evidence other specialists already produced: successful
 // responses are kept, failures are listed, and Data["partial"] marks a mixed

@@ -140,7 +140,7 @@ func (s *APIServer) watchAlertWebhookHandler(w http.ResponseWriter, r *http.Requ
 	go func() {
 		ctx := tenant.WithID(context.Background(), tid)
 
-		report, err := s.rcaEngine.Analyze(ctx, incident)
+		report, err := s.investigateIncident(ctx, incident)
 		if err != nil {
 			s.logger.Error("WatchAlert-triggered RCA failed",
 				observability.String("incident_id", incident.ID),
@@ -246,13 +246,13 @@ func (e *watchAlertEvent) description() string {
 // RCA report and console retain the source trace.
 func (e *watchAlertEvent) labelMap() map[string]string {
 	m := map[string]string{
-		"status":           "running",
-		"source":           "watch-alert",
-		"rule_name":        e.RuleName,
-		"tenant_id":        e.TenantId,
-		"fault_center_id":  e.FaultCenterId,
-		"datasource_type":  e.DatasourceType,
-		"fingerprint":      e.Fingerprint,
+		"status":          "running",
+		"source":          "watch-alert",
+		"rule_name":       e.RuleName,
+		"tenant_id":       e.TenantId,
+		"fault_center_id": e.FaultCenterId,
+		"datasource_type": e.DatasourceType,
+		"fingerprint":     e.Fingerprint,
 	}
 	if e.IsRecovered {
 		m["status"] = "resolved"
@@ -362,6 +362,9 @@ func (s *APIServer) notifyRCACompleted(report *models.RCAReport, extra string) {
 		text += "\n\n" + extra
 	}
 	text += "\n\n" + report.GetSummary()
+	if report.Investigation != "" {
+		text += "\n\n多专家调查：\n" + report.Investigation
+	}
 
 	s.logger.Info("RCA completion notification",
 		observability.String("incident_id", incidentID),
