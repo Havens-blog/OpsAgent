@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +36,40 @@ func (c *cancelLLM) callCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.calls
+}
+
+var evidenceIDPattern = regexp.MustCompile(`证据ID: ([0-9a-f]+)`)
+
+// evidenceLLM 读取提示词里的证据 ID，按 mode 返回不同形态的综合输出
+type evidenceLLM struct {
+	mode string
+}
+
+func (e *evidenceLLM) Chat(_ context.Context, msgs []llm.ClaudeMessage) (string, error) {
+	var ids []string
+	for _, m := range evidenceIDPattern.FindAllStringSubmatch(msgs[0].Content, -1) {
+		ids = append(ids, m[1])
+	}
+	switch e.mode {
+	case "prose":
+		return "根因就是数据库", nil
+	case "fake":
+		return `{"verdict":"determined","root_cause":"x","claims":[{"text":"y","evidence_ids":["deadbeef00000000"]}]}`, nil
+	case "single":
+		if len(ids) < 1 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause":"CPU 打满","claims":[{"text":"CPU 打满","evidence_ids":[%q]}]}`, ids[0]), nil
+	default:
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`说明如下：{"verdict":"determined","root_cause":"慢查询导致 CPU 打满","claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+	}
+}
+
+func (e *evidenceLLM) ChatWithTools(_ context.Context, _ []llm.ClaudeMessage, _ []llm.ClaudeTool) (string, []string, error) {
+	return "", nil, nil
 }
 
 // fakeSpecialist 是可控结果的专家桩，用于验证 Coordinator 的委派与汇总逻辑
@@ -255,7 +291,7 @@ func TestExecutePlanSynthesizesWithLLM(t *testing.T) {
 	a := &fakeSpecialist{name: "monitor", response: "CPU 打满"}
 	b := &fakeSpecialist{name: "log_analyst", response: "慢查询暴增"}
 	coord := newTestCoordinator(t, a, b)
-	coord.llmClient = &stubLLM{reply: "综合结论：慢查询导致 CPU 打满"}
+	coord.llmClient = &evidenceLLM{mode: "cross"}
 	task := newDelegationTask("synth")
 
 	plan := &ExecutionPlan{
@@ -270,8 +306,8 @@ func TestExecutePlanSynthesizesWithLLM(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("expected success, got %+v", result)
 	}
-	if result.Response != "综合结论：慢查询导致 CPU 打满" {
-		t.Errorf("response = %q, want synthesized conclusion", result.Response)
+	if !strings.Contains(result.Response, "根因结论：慢查询导致 CPU 打满") || !strings.Contains(result.Response, "证据：") {
+		t.Errorf("response = %q, want evidence-bound synthesized conclusion", result.Response)
 	}
 	if result.Data["synthesized"] != true {
 		t.Errorf("synthesized = %v, want true", result.Data["synthesized"])
@@ -399,7 +435,7 @@ func TestSynthesizeSkipsCancelledParent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	text, synthesized := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"})
+	text, synthesized := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"}, nil)
 	if synthesized {
 		t.Error("cancelled parent must not synthesize")
 	}
@@ -422,7 +458,7 @@ func TestSynthesizeHonorsParentCancellation(t *testing.T) {
 	var text string
 	var synthesized bool
 	go func() {
-		text, synthesized = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"})
+		text, synthesized = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"}, nil)
 		close(done)
 	}()
 

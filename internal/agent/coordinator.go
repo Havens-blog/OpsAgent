@@ -575,6 +575,7 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 	toolsUsed := []string{}
 	failed := []string{}
 	evidenceIDs := []string{}
+	ids := make(map[*TaskSubmission]string)
 
 	for _, sub := range submissions {
 		if sub.Result != nil {
@@ -582,21 +583,21 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 		}
 		if sub.succeeded() {
 			parts = append(parts, fmt.Sprintf("[%s]: %s", sub.AgentName, sub.Result.Response))
-			evidenceIDs = append(evidenceIDs, c.recordEvidence(originalTask, sub))
+			id := c.recordEvidence(originalTask, sub)
+			c.attachEvidence(sub, id)
+			ids[sub] = id
+			evidenceIDs = append(evidenceIDs, id)
 			continue
 		}
 		failed = append(failed, sub.AgentName)
-		reason := sub.Error
-		if reason == "" && sub.Result != nil {
-			reason = sub.Result.Error
-			if reason == "" {
-				reason = sub.Result.Response
-			}
-		}
-		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, reason))
+		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, failureReason(sub)))
 	}
 
-	response, synthesized := c.synthesize(ctx, originalTask, submissions, parts)
+	response, synthesized := c.synthesize(ctx, originalTask, submissions, parts, ids)
+	// 失败覆盖由程序强制附加，不依赖综合文本自觉披露
+	if notice := CoverageGapNotice(failed); notice != "" {
+		response += "\n\n" + notice
+	}
 
 	result := &ExecutionResult{
 		Success:   len(failed) == 0,
@@ -630,6 +631,49 @@ func (c *CoordinatorAgent) recordEvidence(task *Task, sub *TaskSubmission) strin
 	}
 	c.evidence.Add(e)
 	return e.DedupKey
+}
+
+// attachEvidence 以写时复制把证据 ID 回填到专家 Finding，避免与快照读者竞争
+func (c *CoordinatorAgent) attachEvidence(sub *TaskSubmission, id string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if sub.Result == nil {
+		return
+	}
+	f := StructuredFinding{
+		Conclusion: findingConclusion(sub.Result),
+		Confidence: findingConfidence(sub.Result),
+	}
+	if sub.Result.Finding != nil {
+		f = *sub.Result.Finding
+		f.EvidenceIDs = append([]string(nil), f.EvidenceIDs...)
+	}
+	f.EvidenceIDs = append(f.EvidenceIDs, id)
+	r := *sub.Result
+	r.Finding = &f
+	sub.Result = &r
+}
+
+// failureReason 返回失败专家的具体原因
+func failureReason(sub *TaskSubmission) string {
+	if sub.Error != "" {
+		return sub.Error
+	}
+	if sub.Result != nil {
+		if sub.Result.Error != "" {
+			return sub.Result.Error
+		}
+		return sub.Result.Response
+	}
+	return "未知原因"
+}
+
+// CoverageGapNotice 渲染取证覆盖缺口说明，失败专家由程序强制披露
+func CoverageGapNotice(failed []string) string {
+	if len(failed) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("⚠️ 取证覆盖不完整：%s 未完成，以上结论缺少这些来源的证据。", strings.Join(failed, "、"))
 }
 
 // findingConclusion prefers the specialist's structured conclusion and falls
@@ -673,18 +717,29 @@ func resultConfidence(r *ExecutionResult) float64 {
 // into one conclusion. With fewer than two successful experts, no LLM, or a
 // cancelled parent context, it falls back to the deterministic concatenated
 // response and never starts a new background-only call.
-func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string) (string, bool) {
+func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string, ids map[*TaskSubmission]string) (string, bool) {
 	successful := make([]*TaskSubmission, 0, len(submissions))
+	failed := make([]*TaskSubmission, 0)
 	for _, sub := range submissions {
 		if sub.succeeded() {
 			successful = append(successful, sub)
+		} else {
+			failed = append(failed, sub)
 		}
 	}
+	fallback := strings.Join(parts, "\n\n")
 	if len(successful) < 2 || c.llmClient == nil {
-		return strings.Join(parts, "\n\n"), false
+		return fallback, false
 	}
 	if ctx != nil && ctx.Err() != nil {
-		return strings.Join(parts, "\n\n"), false
+		return fallback, false
+	}
+
+	known := make(map[string]string, len(successful))
+	for _, sub := range successful {
+		if id := ids[sub]; id != "" {
+			known[id] = sub.AgentName
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -692,31 +747,137 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 
 	messages := []llm.ClaudeMessage{{
 		Role:    "user",
-		Content: buildSynthesisPrompt(task, successful),
+		Content: buildSynthesisPrompt(task, successful, failed, ids),
 	}}
-	out, err := c.llmClient.Chat(ctx, messages)
-	if err != nil || strings.TrimSpace(out) == "" {
+	raw, err := c.llmClient.Chat(ctx, messages)
+	if err != nil || strings.TrimSpace(raw) == "" {
 		c.logger.Info("LLM synthesis unavailable, using deterministic aggregation",
 			observability.String("task_id", task.ID),
 			observability.Err(err),
 		)
-		return strings.Join(parts, "\n\n"), false
+		return fallback, false
 	}
-	return out, true
+
+	out, err := parseSynthesis(raw)
+	if err == nil {
+		err = validateSynthesis(out, known)
+	}
+	if err != nil {
+		c.logger.Info("LLM synthesis rejected by evidence gate, using deterministic aggregation",
+			observability.String("task_id", task.ID),
+			observability.Err(err),
+		)
+		return fallback, false
+	}
+	return renderSynthesis(out, isDetermined(out, known)), true
 }
 
-// buildSynthesisPrompt renders the specialists' structured findings for the
-// coordinator's final fusion pass.
-func buildSynthesisPrompt(task *Task, submissions []*TaskSubmission) string {
+// synthesisClaim 是综合输出中绑定证据的一条结论
+type synthesisClaim struct {
+	Text        string   `json:"text"`
+	EvidenceIDs []string `json:"evidence_ids"`
+}
+
+// synthesisOutput 是综合 LLM 必须返回的结构化结果
+type synthesisOutput struct {
+	Verdict   string           `json:"verdict"` // determined | undetermined
+	RootCause string           `json:"root_cause"`
+	Claims    []synthesisClaim `json:"claims"`
+}
+
+// parseSynthesis 容错解析综合输出：允许模型在 JSON 前后夹带说明文字
+func parseSynthesis(raw string) (synthesisOutput, error) {
+	start := strings.IndexByte(raw, '{')
+	end := strings.LastIndexByte(raw, '}')
+	if start < 0 || end <= start {
+		return synthesisOutput{}, fmt.Errorf("synthesis returned no JSON object")
+	}
+	var out synthesisOutput
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &out); err != nil {
+		return synthesisOutput{}, fmt.Errorf("malformed synthesis JSON: %w", err)
+	}
+	return out, nil
+}
+
+// validateSynthesis 证据门禁：每条结论必须引用本次调查真实存在的证据
+func validateSynthesis(out synthesisOutput, known map[string]string) error {
+	if len(out.Claims) == 0 {
+		return fmt.Errorf("synthesis has no claims")
+	}
+	for i, cl := range out.Claims {
+		if strings.TrimSpace(cl.Text) == "" {
+			return fmt.Errorf("claim %d has empty text", i)
+		}
+		if len(cl.EvidenceIDs) == 0 {
+			return fmt.Errorf("claim %d cites no evidence", i)
+		}
+		for _, id := range cl.EvidenceIDs {
+			if _, ok := known[id]; !ok {
+				return fmt.Errorf("claim %d cites unknown evidence %q", i, id)
+			}
+		}
+	}
+	return nil
+}
+
+// isDetermined 只有引用至少两个专家的交叉证据时才认定根因
+func isDetermined(out synthesisOutput, known map[string]string) bool {
+	if out.Verdict != "determined" || strings.TrimSpace(out.RootCause) == "" {
+		return false
+	}
+	agents := make(map[string]bool)
+	for _, cl := range out.Claims {
+		for _, id := range cl.EvidenceIDs {
+			agents[known[id]] = true
+		}
+	}
+	return len(agents) >= 2
+}
+
+// renderSynthesis 由程序渲染已通过门禁的结论，结论旁附证据引用
+func renderSynthesis(out synthesisOutput, determined bool) string {
 	var b strings.Builder
-	b.WriteString("你是运维协调者，请把多位专家的排查结论融合成一份简洁、专业的最终结论，")
-	b.WriteString("用中文输出，说明最可能的根因、支持它的证据，以及不同结论的冲突点。\n\n")
+	if determined {
+		fmt.Fprintf(&b, "根因结论：%s\n", strings.TrimSpace(out.RootCause))
+	} else {
+		b.WriteString("根因结论：未确定（专家结论缺少交叉证据，需人工复核）\n")
+	}
+	b.WriteString("\n依据：\n")
+	for _, cl := range out.Claims {
+		fmt.Fprintf(&b, "- %s（证据：%s）\n", strings.TrimSpace(cl.Text), strings.Join(cl.EvidenceIDs, ", "))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// buildSynthesisPrompt 渲染综合输入：证据 ID、置信度、时间窗与失败覆盖
+func buildSynthesisPrompt(task *Task, successful, failed []*TaskSubmission, ids map[*TaskSubmission]string) string {
+	var b strings.Builder
+	b.WriteString("你是运维协调者，请基于下列专家证据融合出最终结论。\n\n")
 	b.WriteString("原始诉求：\n")
 	b.WriteString(task.Description)
-	b.WriteString("\n\n专家结论：\n")
-	for _, sub := range submissions {
-		fmt.Fprintf(&b, "--- %s ---\n%s\n", sub.AgentName, findingConclusion(sub.Result))
+	b.WriteString("\n")
+	if svc := getString(task.Params, "service"); svc != "" {
+		fmt.Fprintf(&b, "服务：%s\n", svc)
 	}
+	if start, end := getString(task.Params, "start_time"), getString(task.Params, "end_time"); start != "" || end != "" {
+		fmt.Fprintf(&b, "时间窗：%s ~ %s\n", start, end)
+	}
+
+	b.WriteString("\n专家证据：\n")
+	for _, sub := range successful {
+		fmt.Fprintf(&b, "--- %s（证据ID: %s，置信度 %.2f）---\n%s\n",
+			sub.AgentName, ids[sub], findingConfidence(sub.Result), findingConclusion(sub.Result))
+	}
+	if len(failed) > 0 {
+		b.WriteString("\n未完成的取证（覆盖缺口，不得假设其结论）：\n")
+		for _, sub := range failed {
+			fmt.Fprintf(&b, "- %s：%s\n", sub.AgentName, failureReason(sub))
+		}
+	}
+
+	b.WriteString("\n只返回 JSON，不要其他文字：\n")
+	b.WriteString(`{"verdict":"determined|undetermined","root_cause":"一句话根因，未确定则留空","claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"]}]}`)
+	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；专家结论冲突且缺少交叉证据时 verdict 填 undetermined。\n")
 	return b.String()
 }
 
