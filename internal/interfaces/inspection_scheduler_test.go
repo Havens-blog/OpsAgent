@@ -1,0 +1,296 @@
+package interfaces
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Havens-blog/OpsAgent/internal/agent"
+)
+
+// fakeInspector 记录调用次数并返回预置结果
+type fakeInspector struct {
+	mu     sync.Mutex
+	calls  int
+	result *agent.ExecutionResult
+	err    error
+}
+
+func (f *fakeInspector) Execute(_ context.Context, _ *agent.Task) (*agent.ExecutionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return f.result, f.err
+}
+
+func (f *fakeInspector) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func everyMinutePlan(id string, tid int64) *inspectionPlan {
+	return &inspectionPlan{
+		ID:             id,
+		TenantID:       tid,
+		Cron:           "* * * * *",
+		InspectionType: "compliance",
+		Status:         planStatusActive,
+		CreatedAt:      time.Now(),
+	}
+}
+
+// TestClaimDueOncePerMinute 同一分钟只触发一次，执行中不重复触发
+func TestClaimDueOncePerMinute(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	if err := st.create(everyMinutePlan("p1", 1)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	now := time.Date(2026, 11, 6, 9, 0, 10, 0, time.UTC)
+
+	due, _ := st.claimDue(now)
+	if len(due) != 1 {
+		t.Fatalf("first claim = %d, want 1", len(due))
+	}
+	if again, _ := st.claimDue(now.Add(20 * time.Second)); len(again) != 0 {
+		t.Errorf("same minute claimed twice: %d", len(again))
+	}
+
+	// 下一分钟但上次还在执行，仍不触发
+	if busy, _ := st.claimDue(now.Add(time.Minute)); len(busy) != 0 {
+		t.Errorf("running plan claimed again: %d", len(busy))
+	}
+	_ = st.complete("p1", inspectionRun{PlanID: "p1", Status: string(agent.InspectionRunUnmet)})
+	if next, _ := st.claimDue(now.Add(time.Minute)); len(next) != 1 {
+		t.Errorf("next minute claim = %d, want 1", len(next))
+	}
+}
+
+// TestCompleteFinishesPlan 达到最大次数或满足停止条件时结束，执行失败不结束
+func TestCompleteFinishesPlan(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+
+	maxed := everyMinutePlan("max", 1)
+	maxed.MaxRuns = 2
+	stopped := everyMinutePlan("stop", 1)
+	stopped.StopCondition = "no_critical"
+	_ = st.create(maxed)
+	_ = st.create(stopped)
+
+	_ = st.complete("max", inspectionRun{Status: string(agent.InspectionRunUnmet)})
+	_ = st.complete("max", inspectionRun{Status: string(agent.InspectionRunUnmet)})
+	_ = st.complete("stop", inspectionRun{Status: string(agent.InspectionRunFailed)})
+
+	got := map[string]inspectionPlan{}
+	for _, p := range st.list(1) {
+		got[p.ID] = p
+	}
+	if got["max"].Status != planStatusFinished || got["max"].Runs != 2 {
+		t.Errorf("max plan = %+v, want finished after 2 runs", got["max"])
+	}
+	if got["stop"].Status != planStatusActive {
+		t.Errorf("failed run must not finish plan, got %+v", got["stop"])
+	}
+
+	_ = st.complete("stop", inspectionRun{Status: string(agent.InspectionRunSuccess)})
+	for _, p := range st.list(1) {
+		if p.ID == "stop" && p.Status != planStatusFinished {
+			t.Errorf("stop condition met must finish plan, got %+v", p)
+		}
+	}
+}
+
+// TestInspectionPlanStoreRestartRecovery 重启后计划保留，中断的运行补记为 interrupted
+func TestInspectionPlanStoreRestartRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "plans.json")
+	st, err := newFileBackedInspectionPlanStore(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	_ = st.create(everyMinutePlan("p1", 3))
+	if due, _ := st.claimDue(time.Now()); len(due) != 1 {
+		t.Fatalf("claim = %d, want 1", len(due))
+	}
+
+	// 模拟进程在执行中退出后重启
+	reopened, err := newFileBackedInspectionPlanStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	plans := reopened.list(3)
+	if len(plans) != 1 || !plans[0].RunningSince.IsZero() || plans[0].Status != planStatusActive {
+		t.Fatalf("plan after restart = %+v, want active and not running", plans)
+	}
+	runs, ok := reopened.runsFor(3, "p1")
+	if !ok || len(runs) != 1 || runs[0].Status != runStatusInterrupt {
+		t.Fatalf("runs after restart = %+v, want one interrupted run", runs)
+	}
+
+	// 恢复结果已落盘，再次打开不重复补记
+	third, err := newFileBackedInspectionPlanStore(path)
+	if err != nil {
+		t.Fatalf("third open: %v", err)
+	}
+	if runs, _ := third.runsFor(3, "p1"); len(runs) != 1 {
+		t.Errorf("recovery duplicated: %d runs", len(runs))
+	}
+}
+
+// TestRunsForTenantIsolation 跨租户读取运行记录按不存在处理
+func TestRunsForTenantIsolation(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	_ = st.create(everyMinutePlan("p1", 1))
+	if _, ok := st.runsFor(2, "p1"); ok {
+		t.Error("tenant 2 must not see tenant 1 plan runs")
+	}
+	if len(st.list(2)) != 0 {
+		t.Error("tenant 2 must not list tenant 1 plans")
+	}
+}
+
+// TestClassifyScheduledRun 区分执行失败与停止条件未达成
+func TestClassifyScheduledRun(t *testing.T) {
+	cases := []struct {
+		name string
+		res  *agent.ExecutionResult
+		err  error
+		want string
+	}{
+		{"exec error", nil, errors.New("boom"), "failed"},
+		{"nil result", nil, nil, "failed"},
+		{"agent failure", &agent.ExecutionResult{Success: false, Error: "源未接入"}, nil, "failed"},
+		{"unmet", &agent.ExecutionResult{Success: true, Data: map[string]interface{}{"run_status": agent.InspectionRunUnmet}}, nil, "unmet"},
+		{"success default", &agent.ExecutionResult{Success: true}, nil, "success"},
+	}
+	for _, tc := range cases {
+		if got, _ := classifyScheduledRun(tc.res, tc.err); got != tc.want {
+			t.Errorf("%s: status = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestSchedulerTickExecutesAndRecords 时钟触发执行巡检并写入运行记录
+func TestSchedulerTickExecutesAndRecords(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	plan := everyMinutePlan("p1", 1)
+	plan.MaxRuns = 1
+	_ = st.create(plan)
+	runner := &fakeInspector{result: &agent.ExecutionResult{
+		Success: true,
+		Data:    map[string]interface{}{"run_status": agent.InspectionRunUnmet},
+	}}
+	sc := &inspectionScheduler{store: st, runner: runner}
+
+	now := time.Now()
+	sc.tick(context.Background(), now)
+	sc.tick(context.Background(), now.Add(time.Minute))
+
+	if runner.callCount() != 1 {
+		t.Errorf("runner calls = %d, want 1 (finished after max_runs)", runner.callCount())
+	}
+	runs, _ := st.runsFor(1, "p1")
+	if len(runs) != 1 || runs[0].Status != "unmet" {
+		t.Errorf("runs = %+v, want one unmet run", runs)
+	}
+	if p := st.list(1)[0]; p.Status != planStatusFinished {
+		t.Errorf("plan status = %q, want finished", p.Status)
+	}
+}
+
+// TestSchedulerWithoutInspectorRecordsFailure 巡检专家不可用时记为失败而不是静默跳过
+func TestSchedulerWithoutInspectorRecordsFailure(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	_ = st.create(everyMinutePlan("p1", 1))
+	sc := &inspectionScheduler{store: st}
+
+	sc.tick(context.Background(), time.Now())
+	runs, _ := st.runsFor(1, "p1")
+	if len(runs) != 1 || runs[0].Status != "failed" || runs[0].Error == "" {
+		t.Errorf("runs = %+v, want one failed run with reason", runs)
+	}
+}
+
+// TestInspectionPlanHandlers 创建校验、列表与运行记录接口
+func TestInspectionPlanHandlers(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+
+	post := func(body map[string]interface{}) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/inspection/plans", bytes.NewReader(b))
+		w := httptest.NewRecorder()
+		server.ServeHTTP(w, req)
+		return w
+	}
+
+	bad := []map[string]interface{}{
+		{"cron": "bad", "inspection_type": "compliance"},
+		{"cron": "* * * * *", "inspection_type": "unknown"},
+		{"cron": "* * * * *", "inspection_type": "compliance", "stop_condition": "whatever"},
+		{"cron": "* * * * *", "inspection_type": "compliance", "max_runs": -1},
+	}
+	for _, body := range bad {
+		if w := post(body); w.Code != http.StatusBadRequest {
+			t.Errorf("body %v: status = %d, want 400", body, w.Code)
+		}
+	}
+
+	w := post(map[string]interface{}{"cron": "0 9 * * 1-5", "inspection_type": "compliance", "stop_condition": "score>=90", "max_runs": 5})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body %s", w.Code, w.Body.String())
+	}
+	var created struct {
+		Plan inspectionPlan `json:"plan"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || created.Plan.ID == "" {
+		t.Fatalf("decode created plan: %v (%s)", err, w.Body.String())
+	}
+
+	list := httptest.NewRecorder()
+	server.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/inspection/plans", nil))
+	var listed struct {
+		Count int `json:"count"`
+	}
+	_ = json.Unmarshal(list.Body.Bytes(), &listed)
+	if list.Code != http.StatusOK || listed.Count != 1 {
+		t.Errorf("list status=%d count=%d, want 200/1", list.Code, listed.Count)
+	}
+
+	runs := httptest.NewRecorder()
+	server.ServeHTTP(runs, httptest.NewRequest(http.MethodGet, "/api/v1/inspection/plans/"+created.Plan.ID+"/runs", nil))
+	if runs.Code != http.StatusOK {
+		t.Errorf("runs status = %d, want 200", runs.Code)
+	}
+	missing := httptest.NewRecorder()
+	server.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/v1/inspection/plans/nope/runs", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Errorf("missing plan runs status = %d, want 404", missing.Code)
+	}
+}
+
+// TestInspectionSchedulerStartStop 调度器可启动、重复启动无副作用、停止后退出
+func TestInspectionSchedulerStartStop(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+	server.startInspectionScheduler()
+	server.startInspectionScheduler()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	server.stopInspectionScheduler(ctx)
+	if ctx.Err() != nil {
+		t.Fatal("scheduler did not stop in time")
+	}
+	server.stopInspectionScheduler(context.Background())
+}
