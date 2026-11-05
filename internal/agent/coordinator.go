@@ -545,14 +545,14 @@ func (c *CoordinatorAgent) executePlan(ctx context.Context, originalTask *Task, 
 		}
 	}
 
-	return c.aggregateResults(originalTask, submissions)
+	return c.aggregateResults(ctx, originalTask, submissions)
 }
 
 // aggregateResults combines results from multiple sub-tasks. Failed sub-tasks
 // never discard the evidence other specialists already produced: successful
 // responses are kept, failures are listed, and Data["partial"] marks a mixed
 // outcome.
-func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*TaskSubmission) *ExecutionResult {
+func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *Task, submissions []*TaskSubmission) *ExecutionResult {
 	if len(submissions) == 0 {
 		return &ExecutionResult{
 			Success:  true,
@@ -585,7 +585,7 @@ func (c *CoordinatorAgent) aggregateResults(originalTask *Task, submissions []*T
 		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, reason))
 	}
 
-	response, synthesized := c.synthesize(originalTask, submissions, parts)
+	response, synthesized := c.synthesize(ctx, originalTask, submissions, parts)
 
 	result := &ExecutionResult{
 		Success:   len(failed) == 0,
@@ -659,9 +659,10 @@ func resultConfidence(r *ExecutionResult) float64 {
 }
 
 // synthesize asks the coordinator's LLM to fuse multiple specialists' findings
-// into one conclusion. With fewer than two successful experts, or when no LLM
-// is configured, it falls back to the deterministic concatenated response.
-func (c *CoordinatorAgent) synthesize(task *Task, submissions []*TaskSubmission, parts []string) (string, bool) {
+// into one conclusion. With fewer than two successful experts, no LLM, or a
+// cancelled parent context, it falls back to the deterministic concatenated
+// response and never starts a new background-only call.
+func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string) (string, bool) {
 	successful := make([]*TaskSubmission, 0, len(submissions))
 	for _, sub := range submissions {
 		if sub.succeeded() {
@@ -671,8 +672,11 @@ func (c *CoordinatorAgent) synthesize(task *Task, submissions []*TaskSubmission,
 	if len(successful) < 2 || c.llmClient == nil {
 		return strings.Join(parts, "\n\n"), false
 	}
+	if ctx != nil && ctx.Err() != nil {
+		return strings.Join(parts, "\n\n"), false
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	messages := []llm.ClaudeMessage{{
