@@ -2,7 +2,6 @@ package interfaces
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
@@ -104,8 +103,10 @@ func investigationSummary(res *agent.ExecutionResult) string {
 		return ""
 	}
 	text := strings.TrimSpace(res.Response)
-	if failed, _ := res.Data["failed_agents"].([]string); len(failed) > 0 {
-		text += fmt.Sprintf("\n\n⚠️ 取证覆盖不完整：%s 未完成，以上结论缺少这些来源的证据。", strings.Join(failed, "、"))
+	failed, _ := res.Data["failed_agents"].([]string)
+	// Coordinator 已附加缺口说明时不重复追加
+	if notice := agent.CoverageGapNotice(failed); notice != "" && !strings.Contains(text, notice) {
+		text += "\n\n" + notice
 	}
 	return strings.TrimSpace(text)
 }
