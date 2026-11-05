@@ -58,6 +58,18 @@ func (l *Loader) Load(name string) (Skill, error) {
 	return s, nil
 }
 
+// Missing returns the names in want that are absent from the loader. It is the
+// startup guard for built-in required skills.
+func (l *Loader) Missing(want []string) []string {
+	var missing []string
+	for _, name := range want {
+		if _, err := l.Load(name); err != nil {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
 // Summary renders a compact catalog suitable for the system prompt.
 func (l *Loader) Summary() string {
 	skills := l.List()
