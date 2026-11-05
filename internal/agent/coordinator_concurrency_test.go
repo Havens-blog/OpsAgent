@@ -441,3 +441,35 @@ func TestSynthesizeHonorsParentCancellation(t *testing.T) {
 		t.Errorf("text = %q, want fallback parts", text)
 	}
 }
+
+// TestGetTaskStatusReturnsSnapshot 返回快照，外部改动不污染协调器内部状态
+func TestGetTaskStatusReturnsSnapshot(t *testing.T) {
+	spec := &fakeSpecialist{name: "monitor", response: "ok"}
+	coord := newTestCoordinator(t, spec)
+	task := newDelegationTask("snap")
+
+	if _, err := coord.DelegateTask(context.Background(), "monitor", task); err != nil {
+		t.Fatalf("DelegateTask: %v", err)
+	}
+
+	first := coord.GetTaskStatus(task.ID)
+	if len(first) != 1 {
+		t.Fatalf("expected 1 submission, got %d", len(first))
+	}
+	first[0].Status = "tampered"
+	if first[0].Result != nil {
+		first[0].Result.Success = false
+		first[0].Result.Response = "tampered"
+	}
+
+	second := coord.GetTaskStatus(task.ID)
+	if second[0].Status == "tampered" {
+		t.Error("returned snapshot shared internal status")
+	}
+	if second[0].Result == nil || !second[0].Result.Success {
+		t.Errorf("internal result should stay intact, got %+v", second[0].Result)
+	}
+	if second[0].Result != nil && second[0].Result.Response == "tampered" {
+		t.Error("returned snapshot shared internal result")
+	}
+}

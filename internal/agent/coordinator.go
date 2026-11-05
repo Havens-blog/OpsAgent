@@ -726,10 +726,31 @@ func (c *CoordinatorAgent) executeTask(ctx context.Context, task *Task) *Executi
 	}
 }
 
-// GetTaskStatus returns the status of all sub-tasks for a given task.
+// GetTaskStatus returns an immutable snapshot of all sub-tasks for a task.
+// Callers read their own copies, so in-flight submission updates never overlap
+// with a read that happens after the lock is released.
 func (c *CoordinatorAgent) GetTaskStatus(taskID string) []*TaskSubmission {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.subTasks[taskID]
+	subs := c.subTasks[taskID]
+	out := make([]*TaskSubmission, 0, len(subs))
+	for _, s := range subs {
+		out = append(out, s.snapshot())
+	}
+	return out
+}
+
+// snapshot returns a defensive copy of a submission, including its Result, so
+// callers never mutate the coordinator's live state.
+func (s *TaskSubmission) snapshot() *TaskSubmission {
+	if s == nil {
+		return nil
+	}
+	cp := *s
+	if s.Result != nil {
+		r := *s.Result
+		cp.Result = &r
+	}
+	return &cp
 }
