@@ -1,13 +1,24 @@
 // Package memory stores long-term operational fault memory. Only stable,
-// service-scoped facts pass the scope gate; conversation-local or one-off facts
-// are rejected so transient context never pollutes the durable store.
+// human-confirmed, service-scoped facts pass the gate; conversation-local or
+// unconfirmed facts are rejected so transient context never pollutes the
+// durable store. Facts are tenant-scoped and can carry a service version and
+// an expiry time.
 package memory
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
+
+// DefaultMinConfidence 是写入长期记忆的最低置信度
+const DefaultMinConfidence = 0.5
 
 // FactScope describes the lifetime/authority of a fact.
 type FactScope string
@@ -26,22 +37,28 @@ const (
 	FactFragility FactKind = "fragility"
 )
 
-// Fact is a candidate durable fact about a service.
+// Fact 是一条人工确认过的长期事实
 type Fact struct {
-	Kind       FactKind
-	Scope      FactScope
-	Service    string
-	Content    string
-	Confidence float64
+	Kind        FactKind  `json:"kind"`
+	Scope       FactScope `json:"scope"`
+	Service     string    `json:"service"`
+	Content     string    `json:"content"`
+	Confidence  float64   `json:"confidence"`
+	TenantID    int64     `json:"tenant_id"`
+	Version     string    `json:"version,omitempty"`
+	ConfirmedBy string    `json:"confirmed_by"`
+	ConfirmedAt time.Time `json:"confirmed_at"`
+	// ExpiresAt 零值表示长期有效；过期后检索不再返回
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
-// key deduplicates identical facts for the same service.
+// key 按租户、版本与内容去重：不同租户或不同版本的相同结论是不同事实
 func (f Fact) key() string {
-	return string(f.Kind) + "\x00" + f.Service + "\x00" + strings.TrimSpace(f.Content)
+	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s",
+		f.TenantID, f.Kind, f.Service, f.Version, strings.TrimSpace(f.Content))
 }
 
-// scopeGate returns true only for stable, descriptive service-level facts with
-// enough confidence. Everything else stays out of long-term memory.
+// scopeGate 只有「服务级 + 内容完整 + 置信度达标 + 有人工确认者」的事实才能入库
 func scopeGate(f Fact, minConfidence float64) bool {
 	if f.Scope != ScopeService {
 		return false
@@ -52,12 +69,25 @@ func scopeGate(f Fact, minConfidence float64) bool {
 	if f.Confidence < minConfidence {
 		return false
 	}
+	if strings.TrimSpace(f.ConfirmedBy) == "" {
+		return false
+	}
 	return true
 }
 
-// Store is a thread-safe, deduplicated fault memory.
+// Query 是一次检索的过滤条件；Version 非空时精确匹配
+type Query struct {
+	TenantID int64
+	Service  string
+	Version  string
+	// Now 为零时取当前时间，用于过滤已过期事实
+	Now time.Time
+}
+
+// Store is a thread-safe, deduplicated fault memory. path 非空时变更落盘
 type Store struct {
-	mu            sync.RWMutex
+	mu            sync.Mutex
+	path          string
 	facts         map[string]Fact
 	minConfidence float64
 }
@@ -67,11 +97,82 @@ func New(minConfidence float64) *Store {
 	return &Store{facts: make(map[string]Fact), minConfidence: minConfidence}
 }
 
-// Record persists a fact if it passes the scope gate. It returns whether the
-// fact was newly stored; duplicates and rejected facts are not stored.
+// NewFileBacked loads the snapshot at path, or starts empty when it does not
+// exist. A corrupt or unreadable file returns an error.
+func NewFileBacked(minConfidence float64, path string) (*Store, error) {
+	if path == "" {
+		return nil, fmt.Errorf("fault memory path is required")
+	}
+	s := New(minConfidence)
+	s.path = path
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) load() error {
+	data, err := os.ReadFile(s.path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("read fault memory %s: %w", s.path, err)
+	}
+	var snap struct {
+		Facts map[string]Fact `json:"facts"`
+	}
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("parse fault memory %s: %w", s.path, err)
+	}
+	for k, f := range snap.Facts {
+		s.facts[k] = f
+	}
+	return nil
+}
+
+// persistLocked 写临时文件后原子替换，调用方须持有锁
+func (s *Store) persistLocked() error {
+	if s.path == "" {
+		return nil
+	}
+	dir := filepath.Dir(s.path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create fault memory dir: %w", err)
+	}
+	data, err := json.MarshalIndent(struct {
+		Facts map[string]Fact `json:"facts"`
+	}{Facts: s.facts}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode fault memory: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(s.path)+".tmp*")
+	if err != nil {
+		return fmt.Errorf("create fault memory temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write fault memory temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close fault memory temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, s.path); err != nil {
+		return fmt.Errorf("replace fault memory: %w", err)
+	}
+	return nil
+}
+
+// Record 把一条人工确认的事实写入长期记忆。ConfirmedBy 为空、非服务级、
+// 内容不完整或置信度不足都会被拒绝；重复确认按幂等处理（不重复存储）。
 func (s *Store) Record(f Fact) (bool, error) {
 	if !scopeGate(f, s.minConfidence) {
-		return false, fmt.Errorf("fact rejected by scope gate")
+		return false, errors.New("fact rejected by scope gate")
+	}
+	if f.ConfirmedAt.IsZero() {
+		f.ConfirmedAt = time.Now()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -79,25 +180,45 @@ func (s *Store) Record(f Fact) (bool, error) {
 		return false, nil
 	}
 	s.facts[f.key()] = f
-	return true, nil
+	return true, s.persistLocked()
 }
 
-// ForService returns all stored facts for one service.
-func (s *Store) ForService(service string) []Fact {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// Query 按租户/服务/版本检索未过期的事实
+func (s *Store) Query(q Query) []Fact {
+	now := q.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	out := make([]Fact, 0)
 	for _, f := range s.facts {
-		if f.Service == service {
-			out = append(out, f)
+		if f.TenantID != q.TenantID {
+			continue
 		}
+		if q.Service != "" && f.Service != q.Service {
+			continue
+		}
+		if q.Version != "" && f.Version != q.Version {
+			continue
+		}
+		if !f.ExpiresAt.IsZero() && !f.ExpiresAt.After(now) {
+			continue
+		}
+		out = append(out, f)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Service != out[j].Service {
+			return out[i].Service < out[j].Service
+		}
+		return out[i].Content < out[j].Content
+	})
 	return out
 }
 
 // Count returns the number of stored facts.
 func (s *Store) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return len(s.facts)
 }
