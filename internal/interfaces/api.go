@@ -17,6 +17,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/chat"
 	"github.com/Havens-blog/OpsAgent/internal/config"
 	"github.com/Havens-blog/OpsAgent/internal/guardrails"
+	"github.com/Havens-blog/OpsAgent/internal/memory"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
 	"github.com/Havens-blog/OpsAgent/internal/rca"
 	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
@@ -88,6 +89,9 @@ type APIServer struct {
 	// investigator 把告警调查委派给多个只读专家；nil 或专家不足两个时回退确定性引擎
 	investigator        alertInvestigator
 	investigationAgents []string
+
+	// faultMemory 长期故障记忆（仅人工确认的事实入库），按租户/服务/版本隔离检索
+	faultMemory *memory.Store
 
 	// inspectionPlans 定时巡检计划与运行记录；调度器随 Start 启动、随 Shutdown 停止
 	inspectionPlans *inspectionPlanStore
@@ -362,6 +366,22 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		inspectionPlans = ps
 	}
 
+	// 故障长期记忆：配置路径时落盘，仅存人工确认的服务级事实
+	faultMemory := memory.New(memory.DefaultMinConfidence)
+	memoryPath := strings.TrimSpace(os.Getenv("OPSAGENT_MEMORY_PATH"))
+	if memoryPath == "" {
+		logger.Warn("Fault memory persistence disabled, using in-memory store",
+			observability.String("hint", "set OPSAGENT_MEMORY_PATH to persist confirmed fault facts across restarts"),
+		)
+	} else if ms, err := memory.NewFileBacked(memory.DefaultMinConfidence, memoryPath); err != nil {
+		logger.Warn("Persistent fault memory unavailable, using in-memory fallback",
+			observability.String("path", memoryPath),
+			observability.Err(err),
+		)
+	} else {
+		faultMemory = ms
+	}
+
 	// Tenant token limit (request-entry-level coarse quota). 0 = unlimited.
 	tenantTokenLimit := int64(0)
 	if raw := strings.TrimSpace(os.Getenv("OPSAGENT_TENANT_TOKEN_LIMIT")); raw != "" {
@@ -400,6 +420,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		usage:             usage,
 		tenantTokenLimit:  tenantTokenLimit,
 		inspectionPlans:   inspectionPlans,
+		faultMemory:       faultMemory,
 	}
 
 	// Construct and register the coordinator + specialist agents (nil-safe:
@@ -485,6 +506,10 @@ func (s *APIServer) setupRoutes() {
 	s.router.HandleFunc("POST /api/v1/inspection/plans", s.protected(s.createInspectionPlanHandler))
 	s.router.HandleFunc("GET /api/v1/inspection/plans", s.protected(s.listInspectionPlansHandler))
 	s.router.HandleFunc("GET /api/v1/inspection/plans/{id}/runs", s.protected(s.listInspectionRunsHandler))
+
+	// Fault memory (human-confirmed root causes and fragility)
+	s.router.HandleFunc("POST /api/v1/memory", s.protected(s.confirmMemoryFactHandler))
+	s.router.HandleFunc("GET /api/v1/memory", s.protected(s.queryMemoryHandler))
 
 	// Change tracking (CI/CD deployments, config changes)
 	s.router.HandleFunc("/api/v1/changes", s.protected(s.changesHandler))
