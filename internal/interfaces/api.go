@@ -89,6 +89,12 @@ type APIServer struct {
 	investigator        alertInvestigator
 	investigationAgents []string
 
+	// inspectionPlans 定时巡检计划与运行记录；调度器随 Start 启动、随 Shutdown 停止
+	inspectionPlans *inspectionPlanStore
+	inspectionMu    sync.Mutex
+	inspectionStop  context.CancelFunc
+	inspectionDone  chan struct{}
+
 	// Conversation store for the chat assistant (tenant-scoped, in-memory).
 	conversationStore chat.ConversationStore
 
@@ -340,6 +346,22 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		usage = fm
 	}
 
+	// 巡检计划持久化：配置路径时落盘并恢复重启前中断的运行，否则使用内存存储
+	inspectionPlans := newMemoryInspectionPlanStore()
+	plansPath := strings.TrimSpace(os.Getenv("OPSAGENT_INSPECTION_PLANS_PATH"))
+	if plansPath == "" {
+		logger.Warn("Inspection plan persistence disabled, using in-memory store",
+			observability.String("hint", "set OPSAGENT_INSPECTION_PLANS_PATH to persist inspection plans across restarts"),
+		)
+	} else if ps, err := newFileBackedInspectionPlanStore(plansPath); err != nil {
+		logger.Warn("Persistent inspection plan store unavailable, using in-memory fallback",
+			observability.String("path", plansPath),
+			observability.Err(err),
+		)
+	} else {
+		inspectionPlans = ps
+	}
+
 	// Tenant token limit (request-entry-level coarse quota). 0 = unlimited.
 	tenantTokenLimit := int64(0)
 	if raw := strings.TrimSpace(os.Getenv("OPSAGENT_TENANT_TOKEN_LIMIT")); raw != "" {
@@ -377,6 +399,7 @@ func NewAPIServer(settings *config.Settings) (*APIServer, error) {
 		auditLog:          newRecentAuditLog(100),
 		usage:             usage,
 		tenantTokenLimit:  tenantTokenLimit,
+		inspectionPlans:   inspectionPlans,
 	}
 
 	// Construct and register the coordinator + specialist agents (nil-safe:
@@ -459,6 +482,9 @@ func (s *APIServer) setupRoutes() {
 
 	// Inspection endpoints
 	s.router.HandleFunc("/api/v1/inspection/run", s.protected(s.inspectionHandler))
+	s.router.HandleFunc("POST /api/v1/inspection/plans", s.protected(s.createInspectionPlanHandler))
+	s.router.HandleFunc("GET /api/v1/inspection/plans", s.protected(s.listInspectionPlansHandler))
+	s.router.HandleFunc("GET /api/v1/inspection/plans/{id}/runs", s.protected(s.listInspectionRunsHandler))
 
 	// Change tracking (CI/CD deployments, config changes)
 	s.router.HandleFunc("/api/v1/changes", s.protected(s.changesHandler))
@@ -509,6 +535,7 @@ func (s *APIServer) Start() error {
 	s.logger.Info("API server starting",
 		observability.String("addr", addr),
 	)
+	s.startInspectionScheduler()
 
 	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("server failed: %w", err)
@@ -519,6 +546,7 @@ func (s *APIServer) Start() error {
 
 // Shutdown gracefully shuts down the API server.
 func (s *APIServer) Shutdown(ctx context.Context) error {
+	s.stopInspectionScheduler(ctx)
 	if s.usage != nil {
 		s.usage.Flush()
 	}

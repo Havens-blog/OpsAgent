@@ -76,6 +76,28 @@ func StopConditionMet(cond string, s InspectionSummary) bool {
 	}
 }
 
+// ValidateCron 校验五段 cron 表达式，供创建巡检计划时拒绝非法表达式
+func ValidateCron(expr string) error {
+	_, err := parseCron(expr)
+	return err
+}
+
+// ValidateStopCondition 校验巡检停止条件；未知条件永远不会满足，创建计划时直接拒绝
+func ValidateStopCondition(cond string) error {
+	cond = strings.TrimSpace(cond)
+	switch {
+	case cond == "" || cond == "no_critical":
+		return nil
+	case strings.HasPrefix(cond, "score>="):
+		if _, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(cond, "score>=")), 64); err != nil {
+			return fmt.Errorf("invalid score threshold in %q", cond)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported stop condition %q", cond)
+	}
+}
+
 // cronSchedule 是五段 cron 表达式的解析结果
 type cronSchedule struct {
 	minute, hour, dom, month, dow *cronField
