@@ -32,7 +32,13 @@ func (s *APIServer) investigateIncident(ctx context.Context, incident *models.In
 
 	if rep := monitorReport(res); rep != nil {
 		out := *rep
-		out.Incident = incident
+		// 保留 monitor 引擎解析后的 incident（含域名解析出的后端服务），
+		// 不覆盖为原始 incident，否则丢失实体解析结果与映射来源。
+		if rep.Incident != nil {
+			out.Incident = rep.Incident
+		} else {
+			out.Incident = incident
+		}
 		out.Investigation = outcome
 		return &out, nil
 	}
@@ -66,6 +72,9 @@ func incidentTask(inc *models.Incident) *agent.Task {
 		},
 		"start_time": start,
 		"end_time":   end,
+		// 完整受影响服务列表：专家据此明确调查范围，避免只取第一个服务
+		// 而遗漏解析出的后端或其它服务。
+		"services": services,
 	}
 	if len(inc.AffectedServices) > 0 {
 		params["service"] = inc.AffectedServices[0]

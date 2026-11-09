@@ -122,6 +122,35 @@ func TestInvestigateIncidentUsesExpertsAndDisclosesGaps(t *testing.T) {
 	}
 }
 
+// TestInvestigateIncidentKeepsResolvedEntities 调查复用 monitor 报告时保留引擎解析出的实体
+func TestInvestigateIncidentKeepsResolvedEntities(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+	resolved := &models.Incident{
+		ID:               "inc-resolve",
+		StartTime:        time.Now().Add(-10 * time.Minute),
+		EndTime:          time.Now(),
+		Severity:         "P2",
+		AffectedServices: []string{"guess-svc", "resolved-gateway-svc"},
+		Description:      "域名 x.com 不可用",
+	}
+	monitorRep := &models.RCAReport{Confidence: 0.8, Incident: resolved}
+	fake := &fakeInvestigator{result: monitorOKLogFailed(monitorRep)}
+	server.investigator = fake
+	server.investigationAgents = []string{"monitor", "log_analyst"}
+
+	report, err := server.investigateIncident(context.Background(), testIncident("inc-resolve"))
+	if err != nil {
+		t.Fatalf("investigateIncident: %v", err)
+	}
+	if report.Incident == nil || len(report.Incident.AffectedServices) != 2 ||
+		report.Incident.AffectedServices[1] != "resolved-gateway-svc" {
+		t.Fatalf("resolved incident lost: %+v", report.Incident)
+	}
+}
+
 // TestInvestigateIncidentFallsBackWithoutMonitorReport RCA 专家无报告时回退确定性引擎，保留调查结论
 func TestInvestigateIncidentFallsBackWithoutMonitorReport(t *testing.T) {
 	server, err := NewAPIServer(testSettings())
