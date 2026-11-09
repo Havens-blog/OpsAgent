@@ -47,7 +47,10 @@ type Fact struct {
 	TenantID    int64     `json:"tenant_id"`
 	Version     string    `json:"version,omitempty"`
 	ConfirmedBy string    `json:"confirmed_by"`
-	ConfirmedAt time.Time `json:"confirmed_at"`
+	// ConfirmedByUID 是服务端认证主体的数字 ID，用于追溯真实确认者；
+	// 客户端自报的 confirmed_by 字符串不能替代它。
+	ConfirmedByUID int64     `json:"confirmed_by_uid,omitempty"`
+	ConfirmedAt    time.Time `json:"confirmed_at"`
 	// ExpiresAt 零值表示长期有效；过期后检索不再返回
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
