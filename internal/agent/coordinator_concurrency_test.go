@@ -54,17 +54,29 @@ func (e *evidenceLLM) Chat(_ context.Context, msgs []llm.ClaudeMessage) (string,
 	case "prose":
 		return "根因就是数据库", nil
 	case "fake":
-		return `{"verdict":"determined","root_cause":"x","claims":[{"text":"y","evidence_ids":["deadbeef00000000"]}]}`, nil
+		return `{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"y","evidence_ids":["deadbeef00000000"]}]}`, nil
 	case "single":
 		if len(ids) < 1 {
 			return "{}", nil
 		}
-		return fmt.Sprintf(`{"verdict":"determined","root_cause":"CPU 打满","claims":[{"text":"CPU 打满","evidence_ids":[%q]}]}`, ids[0]), nil
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"CPU 打满","evidence_ids":[%q]}]}`, ids[0]), nil
+	case "unbound":
+		// 真实证据 ID，但根因命题缺失（root_cause_claim 无效）
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":-1,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+	case "root_single":
+		// 根因 claim 只引用单一专家，另一个专家只出现在非根因 claim 上
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
 	default:
 		if len(ids) < 2 {
 			return "{}", nil
 		}
-		return fmt.Sprintf(`说明如下：{"verdict":"determined","root_cause":"慢查询导致 CPU 打满","claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+		return fmt.Sprintf(`说明如下：{"verdict":"determined","root_cause_claim":2,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]},{"text":"慢查询导致 CPU 打满","evidence_ids":[%q,%q]}]}`, ids[0], ids[1], ids[0], ids[1]), nil
 	}
 }
 

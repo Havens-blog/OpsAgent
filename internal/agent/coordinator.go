@@ -780,9 +780,9 @@ type synthesisClaim struct {
 
 // synthesisOutput 是综合 LLM 必须返回的结构化结果
 type synthesisOutput struct {
-	Verdict   string           `json:"verdict"` // determined | undetermined
-	RootCause string           `json:"root_cause"`
-	Claims    []synthesisClaim `json:"claims"`
+	Verdict        string           `json:"verdict"`          // determined | undetermined
+	RootCauseClaim int              `json:"root_cause_claim"` // 根因命题在 claims 中的索引，-1 表示未定因
+	Claims         []synthesisClaim `json:"claims"`
 }
 
 // parseSynthesis 容错解析综合输出：允许模型在 JSON 前后夹带说明文字
@@ -799,7 +799,8 @@ func parseSynthesis(raw string) (synthesisOutput, error) {
 	return out, nil
 }
 
-// validateSynthesis 证据门禁：每条结论必须引用本次调查真实存在的证据
+// validateSynthesis 证据门禁：每条结论必须引用本次调查真实存在的证据，
+// 且根因命题必须是 claims 中一条有证据支撑的结论，不能作为独立文本绕过门禁。
 func validateSynthesis(out synthesisOutput, known map[string]string) error {
 	if len(out.Claims) == 0 {
 		return fmt.Errorf("synthesis has no claims")
@@ -817,18 +818,29 @@ func validateSynthesis(out synthesisOutput, known map[string]string) error {
 			}
 		}
 	}
+	if out.Verdict == "determined" {
+		if out.RootCauseClaim < 0 || out.RootCauseClaim >= len(out.Claims) {
+			return fmt.Errorf("determined verdict requires a valid root_cause_claim")
+		}
+	}
 	return nil
 }
 
-// isDetermined 只有引用至少两个专家的交叉证据时才认定根因
+// isDetermined 根因命题必须由至少两个专家的证据交叉支持才认定根因。
+// 只统计根因 claim 自身引用的证据来源，而非所有 claim 的并集——两个专家各自
+// 出现不等于根因命题得到交叉证据。
 func isDetermined(out synthesisOutput, known map[string]string) bool {
-	if out.Verdict != "determined" || strings.TrimSpace(out.RootCause) == "" {
+	if out.Verdict != "determined" || out.RootCauseClaim < 0 || out.RootCauseClaim >= len(out.Claims) {
+		return false
+	}
+	rc := out.Claims[out.RootCauseClaim]
+	if strings.TrimSpace(rc.Text) == "" {
 		return false
 	}
 	agents := make(map[string]bool)
-	for _, cl := range out.Claims {
-		for _, id := range cl.EvidenceIDs {
-			agents[known[id]] = true
+	for _, id := range rc.EvidenceIDs {
+		if name, ok := known[id]; ok {
+			agents[name] = true
 		}
 	}
 	return len(agents) >= 2
@@ -838,7 +850,7 @@ func isDetermined(out synthesisOutput, known map[string]string) bool {
 func renderSynthesis(out synthesisOutput, determined bool) string {
 	var b strings.Builder
 	if determined {
-		fmt.Fprintf(&b, "根因结论：%s\n", strings.TrimSpace(out.RootCause))
+		fmt.Fprintf(&b, "根因结论：%s\n", strings.TrimSpace(out.Claims[out.RootCauseClaim].Text))
 	} else {
 		b.WriteString("根因结论：未确定（专家结论缺少交叉证据，需人工复核）\n")
 	}
@@ -876,8 +888,8 @@ func buildSynthesisPrompt(task *Task, successful, failed []*TaskSubmission, ids 
 	}
 
 	b.WriteString("\n只返回 JSON，不要其他文字：\n")
-	b.WriteString(`{"verdict":"determined|undetermined","root_cause":"一句话根因，未确定则留空","claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"]}]}`)
-	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；专家结论冲突且缺少交叉证据时 verdict 填 undetermined。\n")
+	b.WriteString(`{"verdict":"determined|undetermined","root_cause_claim":整数索引,"claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"]}]}`)
+	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；确定根因（determined）时必须有一条 claim 作为根因命题，且它同时引用至少两个不同专家的证据，并用 root_cause_claim 指向该 claim 的 0-based 索引；证据不足或结论冲突时 verdict 填 undetermined、root_cause_claim 填 -1。\n")
 	return b.String()
 }
 
