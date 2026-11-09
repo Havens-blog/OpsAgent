@@ -2,6 +2,7 @@ package interfaces
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -90,8 +91,13 @@ func (s *APIServer) confirmMemoryFactHandler(w http.ResponseWriter, r *http.Requ
 	}
 	stored, err := s.faultMemory.Record(fact)
 	if err != nil {
-		// 作用域门槛拒绝（非服务级、置信度不足等）按请求错误返回，不静默丢弃
-		s.writeErrorResponse(w, http.StatusBadRequest, "rejected_by_scope_gate", "Fact rejected by memory scope gate", err.Error())
+		if errors.Is(err, memory.ErrScopeGate) {
+			// 作用域门槛拒绝（非服务级、置信度不足等）按请求错误返回
+			s.writeErrorResponse(w, http.StatusBadRequest, "rejected_by_scope_gate", "Fact rejected by memory scope gate", err.Error())
+		} else {
+			// 持久化失败是系统故障，映射为 5xx 而非输入错误
+			s.writeErrorResponse(w, http.StatusInternalServerError, "persistence_failed", "Failed to persist fact", err.Error())
+		}
 		return
 	}
 	s.writeJSONResponse(w, http.StatusCreated, map[string]interface{}{

@@ -77,6 +77,9 @@ type inspectionPlanStore struct {
 	path  string
 	plans map[string]*inspectionPlan
 	runs  []inspectionRun
+	// persistFn 是可注入的持久化函数（nil 时用 persistLocked 的真实文件逻辑），
+	// 用于测试模拟落盘故障以验证内存回滚。
+	persistFn func() error
 }
 
 func newMemoryInspectionPlanStore() *inspectionPlanStore {
@@ -141,6 +144,9 @@ func (s *inspectionPlanStore) load() error {
 
 // persistLocked 写临时文件后原子替换，调用方须持有锁
 func (s *inspectionPlanStore) persistLocked() error {
+	if s.persistFn != nil {
+		return s.persistFn()
+	}
 	if s.path == "" {
 		return nil
 	}
@@ -183,7 +189,12 @@ func (s *inspectionPlanStore) create(p *inspectionPlan) error {
 	defer s.mu.Unlock()
 	cp := *p
 	s.plans[p.ID] = &cp
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		// 回滚：落盘失败不得留下幽灵计划
+		delete(s.plans, p.ID)
+		return err
+	}
+	return nil
 }
 
 // list 返回租户下的计划副本，按创建时间排序
@@ -217,12 +228,19 @@ func (s *inspectionPlanStore) runsFor(tid int64, planID string) ([]inspectionRun
 	return out, true
 }
 
-// claimDue 取出当前分钟到期且未在执行的计划，并标记执行中以防重复触发
+// claimDue 取出当前分钟到期且未在执行的计划，并标记执行中以防重复触发。
+// 落盘失败时回滚内存状态并返回错误，调用方不得执行未 durable 的计划。
 func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	minute := now.Truncate(time.Minute)
 	var due []inspectionPlan
+	type claimState struct {
+		p            *inspectionPlan
+		lastFiredAt  time.Time
+		runningSince time.Time
+	}
+	var claimed []claimState
 	for _, p := range s.plans {
 		if p.Status != planStatusActive || !p.RunningSince.IsZero() {
 			continue
@@ -233,6 +251,7 @@ func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) 
 		if !(&agent.InspectionSchedule{Cron: p.Cron}).Matches(now) {
 			continue
 		}
+		claimed = append(claimed, claimState{p: p, lastFiredAt: p.LastFiredAt, runningSince: p.RunningSince})
 		p.LastFiredAt = now
 		p.RunningSince = now
 		due = append(due, *p)
@@ -240,7 +259,15 @@ func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) 
 	if len(due) == 0 {
 		return nil, nil
 	}
-	return due, s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		// 回滚内存状态：claim 未 durable，既不能执行，也不能污染内存
+		for _, c := range claimed {
+			c.p.LastFiredAt = c.lastFiredAt
+			c.p.RunningSince = c.runningSince
+		}
+		return nil, err
+	}
+	return due, nil
 }
 
 // complete 记录一次运行结果并推进计划状态
@@ -324,11 +351,13 @@ func (sc *inspectionScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick 并行执行本分钟到期的计划并等待全部完成
+// tick 并行执行本分钟到期的计划并等待全部完成。
+// claim 落盘失败时直接返回，不执行未 durable 的计划（runner 调用次数为 0）。
 func (sc *inspectionScheduler) tick(ctx context.Context, now time.Time) {
 	due, err := sc.store.claimDue(now)
 	if err != nil {
 		sc.warn("巡检计划状态落盘失败", err)
+		return
 	}
 	var wg sync.WaitGroup
 	for _, p := range due {

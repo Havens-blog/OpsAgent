@@ -294,3 +294,47 @@ func TestInspectionSchedulerStartStop(t *testing.T) {
 	}
 	server.stopInspectionScheduler(context.Background())
 }
+
+// TestInspectionCreateRollsBackOnPersistFailure 创建落盘失败不得留下幽灵计划
+func TestInspectionCreateRollsBackOnPersistFailure(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	failErr := errors.New("disk full")
+	st.persistFn = func() error { return failErr }
+
+	if err := st.create(everyMinutePlan("p1", 1)); !errors.Is(err, failErr) {
+		t.Fatalf("create err = %v, want persist failure", err)
+	}
+	if got := st.list(1); len(got) != 0 {
+		t.Fatalf("list = %+v, want no ghost plan after failed create", got)
+	}
+
+	// 恢复后重试成功
+	st.persistFn = nil
+	if err := st.create(everyMinutePlan("p1", 1)); err != nil {
+		t.Fatalf("retry create: %v", err)
+	}
+	if got := st.list(1); len(got) != 1 {
+		t.Fatalf("list after retry = %d, want 1", len(got))
+	}
+}
+
+// TestInspectionTickSkipsOnClaimPersistFailure claim 落盘失败时不执行任何计划
+func TestInspectionTickSkipsOnClaimPersistFailure(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	_ = st.create(everyMinutePlan("p1", 1))
+	runner := &fakeInspector{result: &agent.ExecutionResult{Success: true, Response: "ok"}}
+	sc := &inspectionScheduler{store: st, runner: runner}
+
+	st.persistFn = func() error { return errors.New("disk full") }
+	now := time.Date(2026, 11, 6, 9, 0, 10, 0, time.UTC)
+	sc.tick(context.Background(), now)
+	if runner.callCount() != 0 {
+		t.Fatalf("runner calls = %d, want 0 when claim is not durable", runner.callCount())
+	}
+
+	// claim 失败不得把计划粘滞为执行中
+	got := st.list(1)
+	if len(got) != 1 || !got[0].RunningSince.IsZero() || !got[0].LastFiredAt.IsZero() {
+		t.Fatalf("plan state after failed claim = %+v, want not running and not fired", got)
+	}
+}

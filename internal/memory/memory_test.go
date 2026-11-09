@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -167,5 +168,33 @@ func TestFileBackedPersistence(t *testing.T) {
 	}
 	if stored, err := reopened.Record(f); err != nil || stored {
 		t.Errorf("duplicate across restart: stored=%v err=%v", stored, err)
+	}
+}
+
+// TestRecordRollsBackOnPersistFailure 落盘失败时回滚内存写入，不产生伪幂等
+func TestRecordRollsBackOnPersistFailure(t *testing.T) {
+	s := New(0.5)
+	failErr := errors.New("disk full")
+	s.persistFn = func() error { return failErr }
+
+	f := confirmedFact("order", "连接池耗尽", 0.8)
+	if _, err := s.Record(f); !errors.Is(err, failErr) {
+		t.Fatalf("record err = %v, want injected persist failure", err)
+	}
+	// 内存查询不得看到已拒绝数据
+	if s.Count() != 0 {
+		t.Fatalf("count = %d, want 0 (failed persist must roll back)", s.Count())
+	}
+	if got := s.Query(Query{Service: "order"}); len(got) != 0 {
+		t.Fatalf("query = %+v, want empty after rollback", got)
+	}
+
+	// 恢复存储后重试必须真实提交
+	s.persistFn = nil
+	if stored, err := s.Record(f); err != nil || !stored {
+		t.Fatalf("retry: stored=%v err=%v, want real commit", stored, err)
+	}
+	if s.Count() != 1 {
+		t.Fatalf("count after retry = %d, want 1", s.Count())
 	}
 }
