@@ -361,10 +361,7 @@ func (s *APIServer) notifyRCACompleted(report *models.RCAReport, extra string) {
 	if extra != "" {
 		text += "\n\n" + extra
 	}
-	text += "\n\n" + report.GetSummary()
-	if report.Investigation != "" {
-		text += "\n\n多专家调查：\n" + report.Investigation
-	}
+	text += "\n\n" + report.FinalSummary()
 
 	s.logger.Info("RCA completion notification",
 		observability.String("incident_id", incidentID),

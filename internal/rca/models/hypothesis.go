@@ -3,6 +3,7 @@ package models
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -73,9 +74,27 @@ type RCAReport struct {
 	// crowning the edge as the root cause.
 	EdgeFacts *EdgeFacts
 	// Investigation is the multi-expert investigation outcome (coordinator
-	// findings plus programmatically disclosed coverage gaps). Storage and
-	// notification read this same field.
-	Investigation string
+	// findings plus programmatically disclosed coverage gaps). Storage,
+	// notification, and the API read this same field; it is the single source
+	// of truth for the final verdict.
+	Investigation *InvestigationOutcome
+}
+
+// InvestigationOutcome is the structured verdict of a multi-expert
+// investigation. The monitor's deterministic scoring is demoted to an expert
+// candidate; the final credibility is decided by Verdict, never by
+// TopCandidate alone.
+type InvestigationOutcome struct {
+	// Status is the execution state: completed, partial, or failed.
+	Status string `json:"status"`
+	// Verdict is the final credibility: determined or undetermined.
+	Verdict string `json:"verdict"`
+	// RootCause is the confirmed root cause, non-empty only when determined.
+	RootCause string `json:"root_cause,omitempty"`
+	// MissingSources lists experts that failed to produce evidence.
+	MissingSources []string `json:"missing_sources,omitempty"`
+	// Summary is the full investigation text (evidence refs + coverage gaps).
+	Summary string `json:"summary"`
 }
 
 // GetSummary returns a human-readable summary of the RCA report. The headline
@@ -106,6 +125,40 @@ func (r *RCAReport) GetSummary() string {
 		r.TopCandidate.Hypothesis.Description,
 		conf*100,
 		formatEvidence(r.TopCandidate.Hypothesis.Evidence))
+}
+
+// FinalSummary returns the single source of truth for the final verdict. When a
+// multi-expert investigation exists, its Verdict decides the headline and the
+// monitor's deterministic candidate is demoted to reference material; otherwise
+// it falls back to the deterministic engine summary.
+func (r *RCAReport) FinalSummary() string {
+	if r == nil {
+		return "Unable to determine root cause"
+	}
+	if r.Investigation == nil {
+		return r.GetSummary()
+	}
+
+	inv := r.Investigation
+	switch inv.Verdict {
+	case "determined":
+		if inv.RootCause != "" {
+			return "根因（多专家确认）：" + inv.RootCause + "\n\n" + inv.Summary
+		}
+		return inv.Summary
+	default:
+		head := "根因：未确定（多专家调查未能交叉验证）"
+		if len(inv.MissingSources) > 0 {
+			head += "，缺少来源：" + strings.Join(inv.MissingSources, "、")
+		}
+		if r.TopCandidate != nil {
+			head += "\n\n专家候选（仅供参考）：" + r.TopCandidate.Hypothesis.Description
+		}
+		if inv.Summary != "" {
+			head += "\n\n" + inv.Summary
+		}
+		return head
+	}
 }
 
 func formatEvidence(evidence []string) string {

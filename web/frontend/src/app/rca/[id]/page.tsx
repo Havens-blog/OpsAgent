@@ -176,44 +176,88 @@ export default function RCADetailPage({
             <CardDescription>由 Coordinator Agent 汇总多智能体证据</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {report.top_candidate ? (
-              <>
-                <div className="rounded-md bg-accent/40 p-4">
-                  <div className="text-sm text-muted-foreground">推断根因</div>
-                  <div className="mt-1 text-base font-medium">
-                    {report.top_candidate.description}
-                  </div>
-                </div>
-                <div className="flex items-center gap-4">
-                  <div className="flex-1">
-                    <div className="mb-1 flex justify-between text-xs">
-                      <span className="text-muted-foreground">置信度</span>
-                      <span className="font-mono">
-                        {confidencePct(report.confidence)}
-                      </span>
-                    </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-muted">
-                      <div
-                        className="h-full rounded-full bg-primary"
-                        style={{ width: `${(report.confidence || 0) * 100}%` }}
-                      />
+            {(() => {
+              const inv = report.investigation
+              if (inv?.verdict === "determined") {
+                return (
+                  <div className="rounded-md bg-accent/40 p-4">
+                    <div className="text-sm text-muted-foreground">多专家确认根因</div>
+                    <div className="mt-1 text-base font-medium">
+                      {inv.root_cause || "未提供根因描述"}
                     </div>
                   </div>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {(report.affected_services || []).map((s) => (
-                    <Badge key={s} variant="outline" className="font-mono">
-                      {s}
-                    </Badge>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                {report.status === "running"
-                  ? "RCA 分析进行中，尚未生成根因结论..."
-                  : "未能生成根因结论"}
-              </p>
+                )
+              }
+              if (inv?.verdict === "undetermined") {
+                return (
+                  <>
+                    <div className="rounded-md border border-warning-border bg-warning-soft p-4">
+                      <div className="text-sm font-medium text-warning">根因未确定</div>
+                      <div className="mt-1 text-sm text-muted-foreground">
+                        多专家调查未能交叉验证根因
+                        {inv.missing_sources?.length
+                          ? `，缺少来源：${inv.missing_sources.join("、")}`
+                          : ""}
+                      </div>
+                    </div>
+                    {report.top_candidate && (
+                      <div className="rounded-md bg-accent/40 p-4">
+                        <div className="text-sm text-muted-foreground">专家候选（仅供参考）</div>
+                        <div className="mt-1 text-base font-medium">
+                          {report.top_candidate.description}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )
+              }
+              if (report.top_candidate) {
+                return (
+                  <>
+                    <div className="rounded-md bg-accent/40 p-4">
+                      <div className="text-sm text-muted-foreground">推断根因</div>
+                      <div className="mt-1 text-base font-medium">
+                        {report.top_candidate.description}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <div className="flex-1">
+                        <div className="mb-1 flex justify-between text-xs">
+                          <span className="text-muted-foreground">置信度</span>
+                          <span className="font-mono">
+                            {confidencePct(report.confidence)}
+                          </span>
+                        </div>
+                        <div className="h-2 overflow-hidden rounded-full bg-muted">
+                          <div
+                            className="h-full rounded-full bg-primary"
+                            style={{ width: `${(report.confidence || 0) * 100}%` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {(report.affected_services || []).map((s) => (
+                        <Badge key={s} variant="outline" className="font-mono">
+                          {s}
+                        </Badge>
+                      ))}
+                    </div>
+                  </>
+                )
+              }
+              return (
+                <p className="text-sm text-muted-foreground">
+                  {report.status === "running"
+                    ? "RCA 分析进行中，尚未生成根因结论..."
+                    : "未能生成根因结论"}
+                </p>
+              )
+            })()}
+            {report.investigation?.summary && (
+              <pre className="whitespace-pre-wrap text-xs leading-relaxed text-muted-foreground">
+                {report.investigation.summary}
+              </pre>
             )}
           </CardContent>
         </Card>

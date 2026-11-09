@@ -593,10 +593,16 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, failureReason(sub)))
 	}
 
-	response, synthesized := c.synthesize(ctx, originalTask, submissions, parts, ids)
+	outcome := c.synthesize(ctx, originalTask, submissions, parts, ids)
+	response := outcome.Text
 	// 失败覆盖由程序强制附加，不依赖综合文本自觉披露
 	if notice := CoverageGapNotice(failed); notice != "" {
 		response += "\n\n" + notice
+	}
+
+	verdict := "undetermined"
+	if outcome.Determined {
+		verdict = "determined"
 	}
 
 	result := &ExecutionResult{
@@ -610,7 +616,9 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 			"partial":        len(failed) > 0 && len(failed) < len(submissions),
 			"evidence_ids":   evidenceIDs,
 			"evidence_count": len(c.evidence.GetByIncident(originalTask.ID)),
-			"synthesized":    synthesized,
+			"synthesized":    outcome.Synthesized,
+			"verdict":        verdict,
+			"root_cause":     outcome.RootCause,
 		},
 	}
 	if len(failed) > 0 {
@@ -713,11 +721,19 @@ func resultConfidence(r *ExecutionResult) float64 {
 	}
 }
 
+// synthesisOutcome 是综合裁决的结构化结果，供上层作为最终结论的唯一来源。
+type synthesisOutcome struct {
+	Text        string // 渲染后的综合文本
+	Synthesized bool   // 是否成功综合（LLM 可用且通过门禁）
+	Determined  bool   // 是否确定根因
+	RootCause   string // 确定的根因，undetermined 时为空
+}
+
 // synthesize asks the coordinator's LLM to fuse multiple specialists' findings
 // into one conclusion. With fewer than two successful experts, no LLM, or a
 // cancelled parent context, it falls back to the deterministic concatenated
 // response and never starts a new background-only call.
-func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string, ids map[*TaskSubmission]string) (string, bool) {
+func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string, ids map[*TaskSubmission]string) synthesisOutcome {
 	successful := make([]*TaskSubmission, 0, len(submissions))
 	failed := make([]*TaskSubmission, 0)
 	for _, sub := range submissions {
@@ -729,10 +745,10 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 	}
 	fallback := strings.Join(parts, "\n\n")
 	if len(successful) < 2 || c.llmClient == nil {
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
 	if ctx != nil && ctx.Err() != nil {
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
 
 	known := make(map[string]string, len(successful))
@@ -755,7 +771,7 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 			observability.String("task_id", task.ID),
 			observability.Err(err),
 		)
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
 
 	out, err := parseSynthesis(raw)
@@ -767,9 +783,19 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 			observability.String("task_id", task.ID),
 			observability.Err(err),
 		)
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
-	return renderSynthesis(out, isDetermined(out, known)), true
+	determined := isDetermined(out, known)
+	rootCause := ""
+	if determined {
+		rootCause = strings.TrimSpace(out.Claims[out.RootCauseClaim].Text)
+	}
+	return synthesisOutcome{
+		Text:        renderSynthesis(out, determined),
+		Synthesized: true,
+		Determined:  determined,
+		RootCause:   rootCause,
+	}
 }
 
 // synthesisClaim 是综合输出中绑定证据的一条结论

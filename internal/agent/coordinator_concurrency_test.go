@@ -447,12 +447,12 @@ func TestSynthesizeSkipsCancelledParent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	text, synthesized := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"}, nil)
-	if synthesized {
+	outcome := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"}, nil)
+	if outcome.Synthesized {
 		t.Error("cancelled parent must not synthesize")
 	}
-	if text != "[monitor]: A\n\n[log_analyst]: B" {
-		t.Errorf("text = %q, want deterministic fallback", text)
+	if outcome.Text != "[monitor]: A\n\n[log_analyst]: B" {
+		t.Errorf("text = %q, want deterministic fallback", outcome.Text)
 	}
 	if llmClient.callCount() != 0 {
 		t.Errorf("LLM called %d times, want 0", llmClient.callCount())
@@ -467,10 +467,9 @@ func TestSynthesizeHonorsParentCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	var text string
-	var synthesized bool
+	var outcome synthesisOutcome
 	go func() {
-		text, synthesized = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"}, nil)
+		outcome = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"}, nil)
 		close(done)
 	}()
 
@@ -482,11 +481,11 @@ func TestSynthesizeHonorsParentCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("synthesize did not return after parent cancellation")
 	}
-	if synthesized {
+	if outcome.Synthesized {
 		t.Error("should fall back to deterministic on cancellation")
 	}
-	if text != "parts" {
-		t.Errorf("text = %q, want fallback parts", text)
+	if outcome.Text != "parts" {
+		t.Errorf("text = %q, want fallback parts", outcome.Text)
 	}
 }
 

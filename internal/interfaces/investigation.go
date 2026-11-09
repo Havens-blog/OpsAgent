@@ -28,12 +28,12 @@ func (s *APIServer) investigateIncident(ctx context.Context, incident *models.In
 	ictx, cancel := context.WithTimeout(ctx, investigationTimeout)
 	res := s.investigator.Investigate(ictx, incidentTask(incident), s.investigationAgents)
 	cancel()
-	summary := investigationSummary(res)
+	outcome := investigationOutcome(res)
 
 	if rep := monitorReport(res); rep != nil {
 		out := *rep
 		out.Incident = incident
-		out.Investigation = summary
+		out.Investigation = outcome
 		return &out, nil
 	}
 
@@ -42,7 +42,7 @@ func (s *APIServer) investigateIncident(ctx context.Context, incident *models.In
 	if err != nil {
 		return nil, err
 	}
-	report.Investigation = summary
+	report.Investigation = outcome
 	return report, nil
 }
 
@@ -97,7 +97,7 @@ func monitorReport(res *agent.ExecutionResult) *models.RCAReport {
 	return nil
 }
 
-// investigationSummary 渲染调查结论，失败专家由程序强制披露，不依赖综合文本
+// investigationSummary 渲染调查结论文本，失败专家由程序强制披露，不依赖综合文本
 func investigationSummary(res *agent.ExecutionResult) string {
 	if res == nil {
 		return ""
@@ -109,4 +109,30 @@ func investigationSummary(res *agent.ExecutionResult) string {
 		text += "\n\n" + notice
 	}
 	return strings.TrimSpace(text)
+}
+
+// investigationOutcome 从调查执行结果构造结构化裁决，综合 verdict 成为最终结论来源。
+func investigationOutcome(res *agent.ExecutionResult) *models.InvestigationOutcome {
+	if res == nil {
+		return nil
+	}
+	outcome := &models.InvestigationOutcome{
+		Status:  "completed",
+		Verdict: "undetermined",
+		Summary: investigationSummary(res),
+	}
+	if failed, ok := res.Data["failed_agents"].([]string); ok && len(failed) > 0 {
+		outcome.Status = "partial"
+		outcome.MissingSources = append([]string(nil), failed...)
+	}
+	if partial, ok := res.Data["partial"].(bool); ok && partial {
+		outcome.Status = "partial"
+	}
+	if v, ok := res.Data["verdict"].(string); ok && v == "determined" {
+		outcome.Verdict = "determined"
+		if rc, ok := res.Data["root_cause"].(string); ok {
+			outcome.RootCause = rc
+		}
+	}
+	return outcome
 }
