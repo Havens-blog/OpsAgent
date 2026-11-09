@@ -27,6 +27,11 @@ const (
 	inspectionRunTimeout = 5 * time.Minute
 	// inspectionTickInterval 调度检查间隔；按分钟去重，保证每分钟至多触发一次且不漏分钟
 	inspectionTickInterval = 30 * time.Second
+	// inspectionWorkerCount 巡检执行并发上限；扫描与执行分离后，慢巡检只占用
+	// 一个 worker，不再阻塞时钟扫描与其它计划。
+	inspectionWorkerCount = 4
+	// inspectionJobQueue 待执行任务队列容量。
+	inspectionJobQueue = 64
 
 	planStatusActive   = "active"
 	planStatusFinished = "finished"
@@ -270,6 +275,20 @@ func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) 
 	return due, nil
 }
 
+// unclaim 恢复被 claim 但未执行的计划，用于队列满时放弃本次触发，
+// 避免计划粘滞在执行中直到重启恢复。
+func (s *inspectionPlanStore) unclaim(planID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.plans[planID]
+	if !ok {
+		return nil
+	}
+	p.RunningSince = time.Time{}
+	p.LastFiredAt = time.Time{}
+	return s.persistLocked()
+}
+
 // complete 记录一次运行结果并推进计划状态
 func (s *inspectionPlanStore) complete(planID string, run inspectionRun) error {
 	s.mu.Lock()
@@ -297,11 +316,22 @@ func planFinished(p *inspectionPlan, status string) bool {
 	return p.StopCondition != "" && status == string(agent.InspectionRunSuccess)
 }
 
-// inspectionScheduler 按时钟驱动执行到期的巡检计划
+// inspectionScheduler 按时钟驱动执行到期的巡检计划。时钟扫描与执行池分离：
+// tick 只负责 claim 并提交任务到有界队列，worker 异步执行，慢巡检不会阻塞
+// 后续分钟的扫描。
 type inspectionScheduler struct {
 	store  *inspectionPlanStore
 	runner executableAgent
 	logger *observability.Logger
+
+	jobs chan inspectionJob
+	wg   sync.WaitGroup
+}
+
+// inspectionJob 是待执行的巡检任务
+type inspectionJob struct {
+	plan inspectionPlan
+	now  time.Time
 }
 
 // startInspectionScheduler 启动定时巡检调度器，重复调用无副作用
@@ -337,13 +367,21 @@ func (s *APIServer) stopInspectionScheduler(ctx context.Context) {
 	}
 }
 
-// run 每隔 inspectionTickInterval 检查一次到期计划，ctx 取消后退出
+// run 启动执行池，并每隔 inspectionTickInterval 扫描一次到期计划。
+// ctx 取消后先停止接收新任务，再等待 worker 收尾。
 func (sc *inspectionScheduler) run(ctx context.Context) {
+	sc.jobs = make(chan inspectionJob, inspectionJobQueue)
+	for i := 0; i < inspectionWorkerCount; i++ {
+		sc.wg.Add(1)
+		go sc.worker(ctx)
+	}
 	ticker := time.NewTicker(inspectionTickInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			close(sc.jobs)
+			sc.wg.Wait()
 			return
 		case t := <-ticker.C:
 			sc.tick(ctx, t)
@@ -351,26 +389,42 @@ func (sc *inspectionScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick 并行执行本分钟到期的计划并等待全部完成。
-// claim 落盘失败时直接返回，不执行未 durable 的计划（runner 调用次数为 0）。
+// tick 扫描本分钟到期计划并提交到执行池，不再同步等待执行完成。
+// claim 落盘失败时直接返回，不执行未 durable 的计划。
 func (sc *inspectionScheduler) tick(ctx context.Context, now time.Time) {
 	due, err := sc.store.claimDue(now)
 	if err != nil {
 		sc.warn("巡检计划状态落盘失败", err)
 		return
 	}
-	var wg sync.WaitGroup
 	for _, p := range due {
-		wg.Add(1)
-		go func(p inspectionPlan) {
-			defer wg.Done()
-			run := sc.execute(ctx, p, now)
-			if err := sc.store.complete(p.ID, run); err != nil {
-				sc.warn("巡检运行记录写入失败", err)
+		select {
+		case sc.jobs <- inspectionJob{plan: p, now: now}:
+		case <-ctx.Done():
+			return
+		default:
+			// 队列满：fire-once 策略，放弃本次触发并恢复计划状态，
+			// 让下一分钟可以重新 claim。
+			if err := sc.store.unclaim(p.ID); err != nil {
+				sc.warn("巡检计划释放失败", err)
 			}
-		}(p)
+			sc.warn("巡检执行队列已满，跳过本次触发", fmt.Errorf("queue full for %s", p.ID))
+		}
 	}
-	wg.Wait()
+}
+
+// worker 从队列取巡检执行；ctx 取消后仍在队列中的任务被丢弃。
+func (sc *inspectionScheduler) worker(ctx context.Context) {
+	defer sc.wg.Done()
+	for job := range sc.jobs {
+		if ctx.Err() != nil {
+			continue
+		}
+		run := sc.execute(ctx, job.plan, job.now)
+		if err := sc.store.complete(job.plan.ID, run); err != nil {
+			sc.warn("巡检运行记录写入失败", err)
+		}
+	}
 }
 
 func (sc *inspectionScheduler) execute(ctx context.Context, p inspectionPlan, now time.Time) inspectionRun {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,6 +35,34 @@ func (f *fakeInspector) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.calls
+}
+
+// startTestWorkers 启动执行池但不启动 ticker，返回停止函数（等待 worker 收尾）
+func startTestWorkers(sc *inspectionScheduler) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	sc.jobs = make(chan inspectionJob, inspectionJobQueue)
+	for i := 0; i < inspectionWorkerCount; i++ {
+		sc.wg.Add(1)
+		go sc.worker(ctx)
+	}
+	return func() {
+		cancel()
+		close(sc.jobs)
+		sc.wg.Wait()
+	}
+}
+
+// waitForRuns 轮询等待某计划的运行记录达到 n 条
+func waitForRuns(t *testing.T, st *inspectionPlanStore, tid int64, planID string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if runs, _ := st.runsFor(tid, planID); len(runs) >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("plan %s runs did not reach %d in time", planID, n)
 }
 
 func everyMinutePlan(id string, tid int64) *inspectionPlan {
@@ -187,11 +216,14 @@ func TestSchedulerTickExecutesAndRecords(t *testing.T) {
 		Data:    map[string]interface{}{"run_status": agent.InspectionRunUnmet},
 	}}
 	sc := &inspectionScheduler{store: st, runner: runner}
+	stop := startTestWorkers(sc)
+	defer stop()
 
 	now := time.Now()
 	sc.tick(context.Background(), now)
 	sc.tick(context.Background(), now.Add(time.Minute))
 
+	waitForRuns(t, st, 1, "p1", 1)
 	if runner.callCount() != 1 {
 		t.Errorf("runner calls = %d, want 1 (finished after max_runs)", runner.callCount())
 	}
@@ -209,8 +241,11 @@ func TestSchedulerWithoutInspectorRecordsFailure(t *testing.T) {
 	st := newMemoryInspectionPlanStore()
 	_ = st.create(everyMinutePlan("p1", 1))
 	sc := &inspectionScheduler{store: st}
+	stop := startTestWorkers(sc)
+	defer stop()
 
 	sc.tick(context.Background(), time.Now())
+	waitForRuns(t, st, 1, "p1", 1)
 	runs, _ := st.runsFor(1, "p1")
 	if len(runs) != 1 || runs[0].Status != "failed" || runs[0].Error == "" {
 		t.Errorf("runs = %+v, want one failed run with reason", runs)
@@ -337,4 +372,52 @@ func TestInspectionTickSkipsOnClaimPersistFailure(t *testing.T) {
 	if len(got) != 1 || !got[0].RunningSince.IsZero() || !got[0].LastFiredAt.IsZero() {
 		t.Fatalf("plan state after failed claim = %+v, want not running and not fired", got)
 	}
+}
+
+// perPlanInspector 按计划 ID 返回不同延迟，用于模拟慢巡检与快巡检并发
+type perPlanInspector struct {
+	mu    sync.Mutex
+	slow  time.Duration
+	fast  time.Duration
+	calls int
+}
+
+func (p *perPlanInspector) Execute(ctx context.Context, task *agent.Task) (*agent.ExecutionResult, error) {
+	d := p.fast
+	if strings.Contains(task.ID, "slow") {
+		d = p.slow
+	}
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	p.mu.Lock()
+	p.calls++
+	p.mu.Unlock()
+	return &agent.ExecutionResult{Success: true, Data: map[string]interface{}{"run_status": agent.InspectionRunSuccess}}, nil
+}
+
+// TestSchedulerSlowRunDoesNotBlockOthers 慢巡检只占用一个 worker，不阻塞其它计划的扫描与执行
+func TestSchedulerSlowRunDoesNotBlockOthers(t *testing.T) {
+	st := newMemoryInspectionPlanStore()
+	_ = st.create(everyMinutePlan("slow", 1))
+	_ = st.create(everyMinutePlan("fast", 1))
+
+	runner := &perPlanInspector{slow: time.Second, fast: 0}
+	sc := &inspectionScheduler{store: st, runner: runner}
+	stop := startTestWorkers(sc)
+	defer stop()
+
+	now := time.Now()
+	start := time.Now()
+	sc.tick(context.Background(), now)
+	// tick 应立即返回，不等待 slow 执行完（否则整个调度循环被慢巡检阻塞）
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("tick blocked for %v, want async submit", elapsed)
+	}
+
+	// fast 快速完成，slow 最终完成：证明两者并发执行，慢任务不阻塞快任务
+	waitForRuns(t, st, 1, "fast", 1)
+	waitForRuns(t, st, 1, "slow", 1)
 }
