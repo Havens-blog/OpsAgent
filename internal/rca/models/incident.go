@@ -3,6 +3,8 @@ package models
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -115,6 +117,26 @@ type MetricSeries struct {
 	Labels     map[string]string
 	Unit       string
 	DataPoints []DataPoint
+}
+
+// MetricSeriesIdentity returns a canonical identity for a metric series: its
+// name plus sorted labels. Same-name series across instances or datasources
+// stay distinct instead of overwriting each other in trend maps.
+func MetricSeriesIdentity(s MetricSeries) string {
+	var b strings.Builder
+	b.WriteString(s.Name)
+	keys := make([]string, 0, len(s.Labels))
+	for k := range s.Labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		b.WriteByte(0)
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(s.Labels[k])
+	}
+	return b.String()
 }
 
 // DataPoint represents a single metric value at a timestamp.

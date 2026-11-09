@@ -135,10 +135,15 @@ func (s *MultiDimensionalScorer) scoreTimeCorrelation(hypothesis *models.Hypothe
 
 	// Check metric trends during incident
 	if hypothesis.Metric != "" {
-		trends, ok := signals.MetricTrends[metricTrendKey(hypothesis.Service, hypothesis.Metric)]
+		trends, ok := signals.MetricTrends[models.MetricSeriesIdentity(models.MetricSeries{
+			Name:   hypothesis.Metric,
+			Labels: hypothesis.MetricLabels,
+		})]
 		if !ok {
-			// Back-compat with trends keyed by a bare metric name (tests or
-			// callers that never scoped metrics to a service).
+			// Back-compat with trends keyed by service+metric or a bare name.
+			trends, ok = signals.MetricTrends[metricTrendKey(hypothesis.Service, hypothesis.Metric)]
+		}
+		if !ok {
 			trends, ok = signals.MetricTrends[hypothesis.Metric]
 		}
 		if ok {
@@ -227,7 +232,13 @@ func (s *MultiDimensionalScorer) scoreMetricSeverity(hypothesis *models.Hypothes
 		return 0.0
 	}
 
-	trends, ok := signals.MetricTrends[metricTrendKey(hypothesis.Service, hypothesis.Metric)]
+	trends, ok := signals.MetricTrends[models.MetricSeriesIdentity(models.MetricSeries{
+		Name:   hypothesis.Metric,
+		Labels: hypothesis.MetricLabels,
+	})]
+	if !ok {
+		trends, ok = signals.MetricTrends[metricTrendKey(hypothesis.Service, hypothesis.Metric)]
+	}
 	if !ok {
 		// Back-compat with trends keyed by a bare metric name.
 		trends, ok = signals.MetricTrends[hypothesis.Metric]
