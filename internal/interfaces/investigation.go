@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/agent"
+	"github.com/Havens-blog/OpsAgent/internal/memory"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // alertInvestigator 执行调用方规划好的多专家只读取证
@@ -26,7 +28,12 @@ func (s *APIServer) investigateIncident(ctx context.Context, incident *models.In
 	}
 
 	ictx, cancel := context.WithTimeout(ctx, investigationTimeout)
-	res := s.investigator.Investigate(ictx, incidentTask(incident), s.investigationAgents)
+	task := incidentTask(incident)
+	// 召回历史先验并注入任务：作为待验证假设供规划参考，不作为本次观察证据。
+	if hist := s.historicalFacts(ctx, incident); len(hist) > 0 {
+		task.Params["historical_facts"] = hist
+	}
+	res := s.investigator.Investigate(ictx, task, s.investigationAgents)
 	cancel()
 	outcome := investigationOutcome(res)
 
@@ -50,6 +57,27 @@ func (s *APIServer) investigateIncident(ctx context.Context, incident *models.In
 	}
 	report.Investigation = outcome
 	return report, nil
+}
+
+// historicalFacts 召回当前租户 + 受影响服务的未过期 root_cause 历史先验。
+// 这些事实仅作为待验证假设注入调查规划，不作为本次观察证据。
+func (s *APIServer) historicalFacts(ctx context.Context, incident *models.Incident) []memory.Fact {
+	if s.faultMemory == nil || incident == nil {
+		return nil
+	}
+	tid := tenant.IDFrom(ctx)
+	var out []memory.Fact
+	for _, svc := range incident.AffectedServices {
+		if strings.TrimSpace(svc) == "" {
+			continue
+		}
+		for _, f := range s.faultMemory.Query(memory.Query{TenantID: tid, Service: svc}) {
+			if f.Kind == memory.FactRootCause {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // incidentTask 把事件正规化为专家可直接消费的任务参数

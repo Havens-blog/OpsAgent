@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/agent"
+	"github.com/Havens-blog/OpsAgent/internal/memory"
 	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
@@ -242,4 +243,38 @@ func TestWatchAlertWebhookRunsInvestigation(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("webhook did not store an investigation result in time")
+}
+
+// TestHistoricalFactsRecall 历史先验召回：租户隔离、服务匹配、过期过滤、仅 root_cause
+func TestHistoricalFactsRecall(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+
+	now := time.Now()
+	hit := memory.Fact{Kind: memory.FactRootCause, Scope: memory.ScopeService, Service: "order-service",
+		Content: "连接池耗尽", Confidence: 0.9, TenantID: 1, ConfirmedBy: "oncall-alice"}
+	otherTenant := memory.Fact{Kind: memory.FactRootCause, Scope: memory.ScopeService, Service: "order-service",
+		Content: "其他租户", Confidence: 0.9, TenantID: 2, ConfirmedBy: "oncall-alice"}
+	expired := memory.Fact{Kind: memory.FactRootCause, Scope: memory.ScopeService, Service: "order-service",
+		Content: "过期事实", Confidence: 0.9, TenantID: 1, ConfirmedBy: "oncall-alice",
+		ExpiresAt: now.Add(-time.Hour)}
+	fragility := memory.Fact{Kind: memory.FactFragility, Scope: memory.ScopeService, Service: "order-service",
+		Content: "限流阈值偏低", Confidence: 0.9, TenantID: 1, ConfirmedBy: "oncall-alice"}
+
+	for _, f := range []memory.Fact{hit, otherTenant, expired, fragility} {
+		if _, err := server.faultMemory.Record(f); err != nil {
+			t.Fatalf("record %+v: %v", f, err)
+		}
+	}
+
+	ctx := tenant.WithID(context.Background(), 1)
+	inc := testIncident("hist-1")
+	inc.AffectedServices = []string{"order-service"}
+
+	got := server.historicalFacts(ctx, inc)
+	if len(got) != 1 || got[0].Content != "连接池耗尽" {
+		t.Fatalf("historicalFacts = %+v, want only the matching unexpired root-cause fact", got)
+	}
 }
