@@ -25,11 +25,13 @@ type fakeInvestigator struct {
 	agents []string
 	task   *agent.Task
 	result *agent.ExecutionResult
+	ctx    context.Context
 }
 
-func (f *fakeInvestigator) Investigate(_ context.Context, task *agent.Task, agents []string) *agent.ExecutionResult {
+func (f *fakeInvestigator) Investigate(ctx context.Context, task *agent.Task, agents []string) *agent.ExecutionResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ctx = ctx
 	f.task = task
 	f.agents = append([]string(nil), agents...)
 	return f.result
@@ -276,5 +278,35 @@ func TestHistoricalFactsRecall(t *testing.T) {
 	got := server.historicalFacts(ctx, inc)
 	if len(got) != 1 || got[0].Content != "连接池耗尽" {
 		t.Fatalf("historicalFacts = %+v, want only the matching unexpired root-cause fact", got)
+	}
+}
+
+// TestInvestigateIncidentUsesBudgetedContext 专家调查继承总预算 deadline
+func TestInvestigateIncidentUsesBudgetedContext(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+	fake := &fakeInvestigator{result: monitorOKLogFailed(&models.RCAReport{Confidence: 0.8})}
+	server.investigator = fake
+	server.investigationAgents = []string{"monitor", "log_analyst"}
+
+	_, err = server.investigateIncident(context.Background(), testIncident("budget"))
+	if err != nil {
+		t.Fatalf("investigateIncident: %v", err)
+	}
+
+	fake.mu.Lock()
+	ictx := fake.ctx
+	fake.mu.Unlock()
+	if ictx == nil {
+		t.Fatal("investigator ctx not captured")
+	}
+	deadline, ok := ictx.Deadline()
+	if !ok {
+		t.Fatal("investigator ctx has no deadline: total budget not applied")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > investigationTimeout {
+		t.Errorf("deadline remaining = %v, want within total budget %v", remaining, investigationTimeout)
 	}
 }

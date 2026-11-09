@@ -21,20 +21,22 @@ const investigationTimeout = 5 * time.Minute
 
 // investigateIncident 是告警与手工 RCA 的统一调查入口：有两个以上专家时委派
 // Coordinator 并行取证，复用 monitor 的确定性报告；否则回退确定性引擎。
-// 部分失败的覆盖缺口由程序写入 Investigation，存储与通知读取同一份结果。
+// 在最外层建立总预算，专家、综合与降级都继承同一 deadline，预算耗尽后
+// 不再重启无预算的引擎采集。部分失败的覆盖缺口由程序写入 Investigation。
 func (s *APIServer) investigateIncident(ctx context.Context, incident *models.Incident) (*models.RCAReport, error) {
+	bctx, cancel := context.WithTimeout(ctx, investigationTimeout)
+	defer cancel()
+
 	if s.investigator == nil || len(s.investigationAgents) < 2 {
-		return s.rcaEngine.Analyze(ctx, incident)
+		return s.rcaEngine.Analyze(bctx, incident)
 	}
 
-	ictx, cancel := context.WithTimeout(ctx, investigationTimeout)
 	task := incidentTask(incident)
 	// 召回历史先验并注入任务：作为待验证假设供规划参考，不作为本次观察证据。
-	if hist := s.historicalFacts(ctx, incident); len(hist) > 0 {
+	if hist := s.historicalFacts(bctx, incident); len(hist) > 0 {
 		task.Params["historical_facts"] = hist
 	}
-	res := s.investigator.Investigate(ictx, task, s.investigationAgents)
-	cancel()
+	res := s.investigator.Investigate(bctx, task, s.investigationAgents)
 	outcome := investigationOutcome(res)
 
 	if rep := monitorReport(res); rep != nil {
@@ -50,8 +52,9 @@ func (s *APIServer) investigateIncident(ctx context.Context, incident *models.In
 		return &out, nil
 	}
 
-	// RCA 专家未产出报告时回退确定性引擎，但保留其他专家的调查结论
-	report, err := s.rcaEngine.Analyze(ctx, incident)
+	// RCA 专家未产出报告时回退确定性引擎，使用总预算 ctx（剩余 deadline），
+	// 不重启无预算的完整采集。
+	report, err := s.rcaEngine.Analyze(bctx, incident)
 	if err != nil {
 		return nil, err
 	}
