@@ -54,17 +54,35 @@ func (e *evidenceLLM) Chat(_ context.Context, msgs []llm.ClaudeMessage) (string,
 	case "prose":
 		return "根因就是数据库", nil
 	case "fake":
-		return `{"verdict":"determined","root_cause":"x","claims":[{"text":"y","evidence_ids":["deadbeef00000000"]}]}`, nil
+		return `{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"y","evidence_ids":["deadbeef00000000"]}]}`, nil
 	case "single":
 		if len(ids) < 1 {
 			return "{}", nil
 		}
-		return fmt.Sprintf(`{"verdict":"determined","root_cause":"CPU 打满","claims":[{"text":"CPU 打满","evidence_ids":[%q]}]}`, ids[0]), nil
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"CPU 打满","evidence_ids":[%q]}]}`, ids[0]), nil
+	case "unbound":
+		// 真实证据 ID，但根因命题缺失（root_cause_claim 无效）
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":-1,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+	case "root_single":
+		// 根因 claim 只引用单一专家，另一个专家只出现在非根因 claim 上
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+	case "conflict":
+		// 两个真实专家 ID，但根因命题标记 conflict=true
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":2,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]},{"text":"慢查询导致 CPU 打满","evidence_ids":[%q,%q],"conflict":true}]}`, ids[0], ids[1], ids[0], ids[1]), nil
 	default:
 		if len(ids) < 2 {
 			return "{}", nil
 		}
-		return fmt.Sprintf(`说明如下：{"verdict":"determined","root_cause":"慢查询导致 CPU 打满","claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+		return fmt.Sprintf(`说明如下：{"verdict":"determined","root_cause_claim":2,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]},{"text":"慢查询导致 CPU 打满","evidence_ids":[%q,%q]}]}`, ids[0], ids[1], ids[0], ids[1]), nil
 	}
 }
 
@@ -435,12 +453,12 @@ func TestSynthesizeSkipsCancelledParent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	text, synthesized := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"}, nil)
-	if synthesized {
+	outcome := coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"[monitor]: A\n\n[log_analyst]: B"}, nil)
+	if outcome.Synthesized {
 		t.Error("cancelled parent must not synthesize")
 	}
-	if text != "[monitor]: A\n\n[log_analyst]: B" {
-		t.Errorf("text = %q, want deterministic fallback", text)
+	if outcome.Text != "[monitor]: A\n\n[log_analyst]: B" {
+		t.Errorf("text = %q, want deterministic fallback", outcome.Text)
 	}
 	if llmClient.callCount() != 0 {
 		t.Errorf("LLM called %d times, want 0", llmClient.callCount())
@@ -455,10 +473,9 @@ func TestSynthesizeHonorsParentCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	var text string
-	var synthesized bool
+	var outcome synthesisOutcome
 	go func() {
-		text, synthesized = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"}, nil)
+		outcome = coord.synthesize(ctx, newDelegationTask("t"), twoOKSubs(), []string{"parts"}, nil)
 		close(done)
 	}()
 
@@ -470,11 +487,11 @@ func TestSynthesizeHonorsParentCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("synthesize did not return after parent cancellation")
 	}
-	if synthesized {
+	if outcome.Synthesized {
 		t.Error("should fall back to deterministic on cancellation")
 	}
-	if text != "parts" {
-		t.Errorf("text = %q, want fallback parts", text)
+	if outcome.Text != "parts" {
+		t.Errorf("text = %q, want fallback parts", outcome.Text)
 	}
 }
 

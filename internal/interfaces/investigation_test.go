@@ -108,11 +108,17 @@ func TestInvestigateIncidentUsesExpertsAndDisclosesGaps(t *testing.T) {
 	if report.Confidence != 0.8 || report.Incident != inc {
 		t.Errorf("expected monitor report bound to original incident, got %+v", report)
 	}
-	if !strings.Contains(report.Investigation, "连接池耗尽") {
-		t.Errorf("investigation missing expert finding: %q", report.Investigation)
+	if report.Investigation == nil {
+		t.Fatalf("expected structured investigation outcome, got nil")
 	}
-	if !strings.Contains(report.Investigation, "log_analyst 未完成") {
-		t.Errorf("investigation missing coverage gap: %q", report.Investigation)
+	if report.Investigation.Status != "partial" || len(report.Investigation.MissingSources) != 1 {
+		t.Errorf("investigation outcome = %+v, want partial with one missing source", report.Investigation)
+	}
+	if !strings.Contains(report.Investigation.Summary, "连接池耗尽") {
+		t.Errorf("investigation missing expert finding: %q", report.Investigation.Summary)
+	}
+	if !strings.Contains(report.Investigation.Summary, "log_analyst 未完成") {
+		t.Errorf("investigation missing coverage gap: %q", report.Investigation.Summary)
 	}
 }
 
@@ -133,8 +139,11 @@ func TestInvestigateIncidentFallsBackWithoutMonitorReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("investigateIncident: %v", err)
 	}
-	if !strings.Contains(report.Investigation, "monitor 未完成") {
-		t.Errorf("fallback report lost investigation gap: %q", report.Investigation)
+	if report.Investigation == nil {
+		t.Fatalf("fallback report lost investigation outcome")
+	}
+	if !strings.Contains(report.Investigation.Summary, "monitor 未完成") {
+		t.Errorf("fallback report lost investigation gap: %q", report.Investigation.Summary)
 	}
 }
 
@@ -156,8 +165,8 @@ func TestInvestigateIncidentSingleExpertUsesEngine(t *testing.T) {
 	if agents, _ := fake.planned(); agents != nil {
 		t.Errorf("investigator should not run with one expert, got %v", agents)
 	}
-	if report.Investigation != "" {
-		t.Errorf("engine path should not carry investigation, got %q", report.Investigation)
+	if report.Investigation != nil {
+		t.Errorf("engine path should not carry investigation, got %+v", report.Investigation)
 	}
 }
 
@@ -192,9 +201,9 @@ func TestWatchAlertWebhookRunsInvestigation(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), 7)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if rep, err := server.rcaStore.Get(ctx, "evt-b21"); err == nil && rep.Investigation != "" {
-			if !strings.Contains(rep.Investigation, "log_analyst 未完成") {
-				t.Fatalf("stored investigation missing gap: %q", rep.Investigation)
+		if rep, err := server.rcaStore.Get(ctx, "evt-b21"); err == nil && rep.Investigation != nil {
+			if !strings.Contains(rep.Investigation.Summary, "log_analyst 未完成") {
+				t.Fatalf("stored investigation missing gap: %q", rep.Investigation.Summary)
 			}
 			if agents, _ := fake.planned(); len(agents) != 2 {
 				t.Fatalf("planned agents = %v, want 2", agents)

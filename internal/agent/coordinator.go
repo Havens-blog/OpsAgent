@@ -593,10 +593,16 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 		parts = append(parts, fmt.Sprintf("[%s] 执行失败: %s", sub.AgentName, failureReason(sub)))
 	}
 
-	response, synthesized := c.synthesize(ctx, originalTask, submissions, parts, ids)
+	outcome := c.synthesize(ctx, originalTask, submissions, parts, ids)
+	response := outcome.Text
 	// 失败覆盖由程序强制附加，不依赖综合文本自觉披露
 	if notice := CoverageGapNotice(failed); notice != "" {
 		response += "\n\n" + notice
+	}
+
+	verdict := "undetermined"
+	if outcome.Determined {
+		verdict = "determined"
 	}
 
 	result := &ExecutionResult{
@@ -610,7 +616,9 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 			"partial":        len(failed) > 0 && len(failed) < len(submissions),
 			"evidence_ids":   evidenceIDs,
 			"evidence_count": len(c.evidence.GetByIncident(originalTask.ID)),
-			"synthesized":    synthesized,
+			"synthesized":    outcome.Synthesized,
+			"verdict":        verdict,
+			"root_cause":     outcome.RootCause,
 		},
 	}
 	if len(failed) > 0 {
@@ -713,11 +721,19 @@ func resultConfidence(r *ExecutionResult) float64 {
 	}
 }
 
+// synthesisOutcome 是综合裁决的结构化结果，供上层作为最终结论的唯一来源。
+type synthesisOutcome struct {
+	Text        string // 渲染后的综合文本
+	Synthesized bool   // 是否成功综合（LLM 可用且通过门禁）
+	Determined  bool   // 是否确定根因
+	RootCause   string // 确定的根因，undetermined 时为空
+}
+
 // synthesize asks the coordinator's LLM to fuse multiple specialists' findings
 // into one conclusion. With fewer than two successful experts, no LLM, or a
 // cancelled parent context, it falls back to the deterministic concatenated
 // response and never starts a new background-only call.
-func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string, ids map[*TaskSubmission]string) (string, bool) {
+func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissions []*TaskSubmission, parts []string, ids map[*TaskSubmission]string) synthesisOutcome {
 	successful := make([]*TaskSubmission, 0, len(submissions))
 	failed := make([]*TaskSubmission, 0)
 	for _, sub := range submissions {
@@ -729,10 +745,10 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 	}
 	fallback := strings.Join(parts, "\n\n")
 	if len(successful) < 2 || c.llmClient == nil {
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
 	if ctx != nil && ctx.Err() != nil {
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
 
 	known := make(map[string]string, len(successful))
@@ -755,7 +771,7 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 			observability.String("task_id", task.ID),
 			observability.Err(err),
 		)
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
 
 	out, err := parseSynthesis(raw)
@@ -767,22 +783,34 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 			observability.String("task_id", task.ID),
 			observability.Err(err),
 		)
-		return fallback, false
+		return synthesisOutcome{Text: fallback}
 	}
-	return renderSynthesis(out, isDetermined(out, known)), true
+	determined := isDetermined(out, known)
+	rootCause := ""
+	if determined {
+		rootCause = strings.TrimSpace(out.Claims[out.RootCauseClaim].Text)
+	}
+	return synthesisOutcome{
+		Text:        renderSynthesis(out, determined),
+		Synthesized: true,
+		Determined:  determined,
+		RootCause:   rootCause,
+	}
 }
 
 // synthesisClaim 是综合输出中绑定证据的一条结论
 type synthesisClaim struct {
 	Text        string   `json:"text"`
 	EvidenceIDs []string `json:"evidence_ids"`
+	// Conflict 标记该结论与其它专家结论冲突；冲突时不得作为确定根因。
+	Conflict bool `json:"conflict,omitempty"`
 }
 
 // synthesisOutput 是综合 LLM 必须返回的结构化结果
 type synthesisOutput struct {
-	Verdict   string           `json:"verdict"` // determined | undetermined
-	RootCause string           `json:"root_cause"`
-	Claims    []synthesisClaim `json:"claims"`
+	Verdict        string           `json:"verdict"`          // determined | undetermined
+	RootCauseClaim int              `json:"root_cause_claim"` // 根因命题在 claims 中的索引，-1 表示未定因
+	Claims         []synthesisClaim `json:"claims"`
 }
 
 // parseSynthesis 容错解析综合输出：允许模型在 JSON 前后夹带说明文字
@@ -799,7 +827,8 @@ func parseSynthesis(raw string) (synthesisOutput, error) {
 	return out, nil
 }
 
-// validateSynthesis 证据门禁：每条结论必须引用本次调查真实存在的证据
+// validateSynthesis 证据门禁：每条结论必须引用本次调查真实存在的证据，
+// 且根因命题必须是 claims 中一条有证据支撑的结论，不能作为独立文本绕过门禁。
 func validateSynthesis(out synthesisOutput, known map[string]string) error {
 	if len(out.Claims) == 0 {
 		return fmt.Errorf("synthesis has no claims")
@@ -817,20 +846,37 @@ func validateSynthesis(out synthesisOutput, known map[string]string) error {
 			}
 		}
 	}
+	if out.Verdict == "determined" {
+		if out.RootCauseClaim < 0 || out.RootCauseClaim >= len(out.Claims) {
+			return fmt.Errorf("determined verdict requires a valid root_cause_claim")
+		}
+	}
 	return nil
 }
 
-// isDetermined 只有引用至少两个专家的交叉证据时才认定根因
+// isDetermined 根因命题必须由至少两个专家的证据交叉支持才认定根因。
+// 只统计根因 claim 自身引用的证据来源，而非所有 claim 的并集——两个专家各自
+// 出现不等于根因命题得到交叉证据；根因命题若与其它结论冲突，或引用的证据
+// 全部来自同一专家，都不得确定。
 func isDetermined(out synthesisOutput, known map[string]string) bool {
-	if out.Verdict != "determined" || strings.TrimSpace(out.RootCause) == "" {
+	if out.Verdict != "determined" || out.RootCauseClaim < 0 || out.RootCauseClaim >= len(out.Claims) {
+		return false
+	}
+	rc := out.Claims[out.RootCauseClaim]
+	if strings.TrimSpace(rc.Text) == "" {
+		return false
+	}
+	// 根因命题与其它结论冲突，不得确定。
+	if rc.Conflict {
 		return false
 	}
 	agents := make(map[string]bool)
-	for _, cl := range out.Claims {
-		for _, id := range cl.EvidenceIDs {
-			agents[known[id]] = true
+	for _, id := range rc.EvidenceIDs {
+		if name, ok := known[id]; ok {
+			agents[name] = true
 		}
 	}
+	// 至少两个独立专家交叉支持（同一专家的多条证据只算一个来源）。
 	return len(agents) >= 2
 }
 
@@ -838,7 +884,7 @@ func isDetermined(out synthesisOutput, known map[string]string) bool {
 func renderSynthesis(out synthesisOutput, determined bool) string {
 	var b strings.Builder
 	if determined {
-		fmt.Fprintf(&b, "根因结论：%s\n", strings.TrimSpace(out.RootCause))
+		fmt.Fprintf(&b, "根因结论：%s\n", strings.TrimSpace(out.Claims[out.RootCauseClaim].Text))
 	} else {
 		b.WriteString("根因结论：未确定（专家结论缺少交叉证据，需人工复核）\n")
 	}
@@ -876,8 +922,8 @@ func buildSynthesisPrompt(task *Task, successful, failed []*TaskSubmission, ids 
 	}
 
 	b.WriteString("\n只返回 JSON，不要其他文字：\n")
-	b.WriteString(`{"verdict":"determined|undetermined","root_cause":"一句话根因，未确定则留空","claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"]}]}`)
-	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；专家结论冲突且缺少交叉证据时 verdict 填 undetermined。\n")
+	b.WriteString(`{"verdict":"determined|undetermined","root_cause_claim":整数索引,"claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"],"conflict":false}]}`)
+	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；确定根因（determined）时必须有一条 claim 作为根因命题，且它同时引用至少两个不同专家的证据，并用 root_cause_claim 指向该 claim 的 0-based 索引；若两个专家结论互相矛盾、或根因命题与其它结论冲突，把根因 claim 的 conflict 标为 true 且 verdict 填 undetermined；证据不足或结论冲突时 verdict 填 undetermined、root_cause_claim 填 -1。\n")
 	return b.String()
 }
 

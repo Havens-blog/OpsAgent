@@ -114,3 +114,44 @@ func TestBuildSynthesisPromptIncludesCoverage(t *testing.T) {
 		}
 	}
 }
+
+// TestSynthesisRootCauseMustBindToClaim 根因命题缺失（root_cause_claim 无效）时，
+// 即使两个专家都提供了真实证据，也不得作为确定结论呈现，应回退确定性拼接。
+func TestSynthesisRootCauseMustBindToClaim(t *testing.T) {
+	_, result := runTwoExperts(t, "unbound", false)
+	if result.Data["synthesized"] != false {
+		t.Errorf("synthesized = %v, want false for unbound root cause", result.Data["synthesized"])
+	}
+	if strings.Contains(result.Response, "根因结论：") && !strings.Contains(result.Response, "根因结论：未确定") {
+		t.Errorf("unbound root cause must not be rendered as determined: %q", result.Response)
+	}
+}
+
+// TestSynthesisRootCauseNeedsOwnCrossEvidence 根因命题只引用单一专家时，
+// 即使其他 claim 覆盖了第二个专家，也不得认定为确定根因。
+func TestSynthesisRootCauseNeedsOwnCrossEvidence(t *testing.T) {
+	_, result := runTwoExperts(t, "root_single", false)
+	if result.Data["synthesized"] != true {
+		t.Fatalf("synthesized = %v, want true (claims are valid)", result.Data["synthesized"])
+	}
+	if !strings.Contains(result.Response, "根因结论：未确定") {
+		t.Errorf("response = %q, want undetermined for single-source root cause", result.Response)
+	}
+	if strings.Contains(result.Response, "根因结论：CPU 打满") {
+		t.Errorf("single-source root cause must not be crowned: %q", result.Response)
+	}
+}
+
+// TestSynthesisConflictIsUndetermined 根因命题标记冲突时，即使引用两个专家也不得确定
+func TestSynthesisConflictIsUndetermined(t *testing.T) {
+	_, result := runTwoExperts(t, "conflict", false)
+	if result.Data["synthesized"] != true {
+		t.Fatalf("synthesized = %v, want true (claims are valid)", result.Data["synthesized"])
+	}
+	if !strings.Contains(result.Response, "根因结论：未确定") {
+		t.Errorf("response = %q, want undetermined for conflicting root cause", result.Response)
+	}
+	if strings.Contains(result.Response, "根因结论：慢查询导致 CPU 打满") {
+		t.Errorf("conflicting root cause must not be crowned: %q", result.Response)
+	}
+}

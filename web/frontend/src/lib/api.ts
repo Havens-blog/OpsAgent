@@ -473,6 +473,15 @@ export interface ScoredHypothesis extends Hypothesis {
   breakdown: ScoreBreakdown
 }
 
+/** Multi-expert investigation verdict — the single source of truth for the final conclusion. */
+export interface InvestigationOutcome {
+  status: "completed" | "partial" | "failed"
+  verdict: "determined" | "undetermined"
+  root_cause?: string
+  missing_sources?: string[]
+  summary: string
+}
+
 /** A complete RCA report — the payload of GET /api/v1/rca/:id. */
 export interface RCAReport {
   incident_id: string
@@ -489,6 +498,8 @@ export interface RCAReport {
   generated_at?: string
   /** 各数据源采集失败的告警，为空数组表示无告警。 */
   warnings?: string[]
+  /** 多专家调查裁决，存在时是最终结论的唯一来源。 */
+  investigation?: InvestigationOutcome
 }
 
 /* ---------- Chat types ---------- */
