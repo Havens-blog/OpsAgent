@@ -12,6 +12,7 @@ import (
 
 	"github.com/Havens-blog/OpsAgent/internal/config"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // cancelLLM 在 Chat 里阻塞到 ctx 取消，用于验证综合继承取消
@@ -349,7 +350,7 @@ func TestRecordEvidencePrefersStructuredFinding(t *testing.T) {
 			Finding:  &StructuredFinding{Conclusion: "订单服务 P99 飙升", Confidence: 0.8},
 		},
 	}
-	id := coord.recordEvidence(task, sub)
+	id := coord.recordEvidence(context.Background(), task, sub)
 	ev, ok := coord.evidence.Get(id)
 	if !ok {
 		t.Fatalf("evidence %q not found", id)
@@ -372,7 +373,7 @@ func TestRecordEvidenceFallsBackToResponse(t *testing.T) {
 		Status:    "completed",
 		Result:    &ExecutionResult{Success: true, Response: "完整日志分析"},
 	}
-	id := coord.recordEvidence(task, sub)
+	id := coord.recordEvidence(context.Background(), task, sub)
 	ev, ok := coord.evidence.Get(id)
 	if !ok || ev.Description != "完整日志分析" {
 		t.Fatalf("expected fallback to response, got %+v", ev)
@@ -394,8 +395,8 @@ func TestRecordEvidenceSeparatesIncidents(t *testing.T) {
 		}
 	}
 
-	idA := coord.recordEvidence(newDelegationTask("inc-A"), mk("CPU 饱和", 0.7))
-	idB := coord.recordEvidence(newDelegationTask("inc-B"), mk("连接池耗尽", 0.9))
+	idA := coord.recordEvidence(context.Background(), newDelegationTask("inc-A"), mk("CPU 饱和", 0.7))
+	idB := coord.recordEvidence(context.Background(), newDelegationTask("inc-B"), mk("连接池耗尽", 0.9))
 	if idA == idB {
 		t.Fatal("两个事件不得共享证据 ID")
 	}
@@ -409,7 +410,7 @@ func TestRecordEvidenceSeparatesIncidents(t *testing.T) {
 	}
 
 	// 相同输入幂等，复用同一证据 ID
-	if id := coord.recordEvidence(newDelegationTask("inc-A"), mk("CPU 饱和", 0.7)); id != idA {
+	if id := coord.recordEvidence(context.Background(), newDelegationTask("inc-A"), mk("CPU 饱和", 0.7)); id != idA {
 		t.Errorf("幂等写入应复用 ID，got %q want %q", id, idA)
 	}
 }
@@ -524,5 +525,83 @@ func TestGetTaskStatusReturnsSnapshot(t *testing.T) {
 	}
 	if second[0].Result != nil && second[0].Result.Response == "tampered" {
 		t.Error("returned snapshot shared internal result")
+	}
+}
+
+// TestGetTaskStatusDeepCopiesNestedResult 快照深拷贝 Data/Finding/ToolsUsed/Metadata
+func TestGetTaskStatusDeepCopiesNestedResult(t *testing.T) {
+	coord := newTestCoordinator(t)
+	task := newDelegationTask("deep")
+
+	coord.mu.Lock()
+	coord.subTasks[task.ID] = []*TaskSubmission{{
+		TaskID: "sub-deep",
+		Status: "completed",
+		Result: &ExecutionResult{
+			Success:   true,
+			Response:  "ok",
+			Data:      map[string]interface{}{"confidence": 0.9},
+			ToolsUsed: []string{"query_logs"},
+			Metadata:  map[string]interface{}{"duration": "1s"},
+			Finding:   &StructuredFinding{Conclusion: "cpu 打满", Confidence: 0.8, EvidenceIDs: []string{"ev-1"}},
+		},
+	}}
+	coord.mu.Unlock()
+
+	snap := coord.GetTaskStatus(task.ID)[0]
+	snap.Result.ToolsUsed[0] = "tampered"
+	snap.Result.Finding.Conclusion = "tampered"
+	snap.Result.Finding.EvidenceIDs[0] = "tampered"
+	snap.Result.Data["confidence"] = 0.1
+	snap.Result.Data["extra"] = "tampered"
+	snap.Result.Metadata["duration"] = "tampered"
+
+	internal := coord.GetTaskStatus(task.ID)[0]
+	if internal.Result.ToolsUsed[0] != "query_logs" {
+		t.Errorf("ToolsUsed polluted: %v", internal.Result.ToolsUsed)
+	}
+	if internal.Result.Finding.Conclusion != "cpu 打满" {
+		t.Errorf("Finding.Conclusion polluted: %q", internal.Result.Finding.Conclusion)
+	}
+	if internal.Result.Finding.EvidenceIDs[0] != "ev-1" {
+		t.Errorf("Finding.EvidenceIDs polluted: %v", internal.Result.Finding.EvidenceIDs)
+	}
+	if internal.Result.Data["confidence"] != 0.9 {
+		t.Errorf("Data polluted: %v", internal.Result.Data)
+	}
+	if _, ok := internal.Result.Data["extra"]; ok {
+		t.Errorf("Data leaked extra key: %v", internal.Result.Data)
+	}
+	if internal.Result.Metadata["duration"] != "1s" {
+		t.Errorf("Metadata polluted: %v", internal.Result.Metadata)
+	}
+}
+
+// TestRecordEvidenceIsolatesTenants 跨租户同事件 ID 证据隔离
+func TestRecordEvidenceIsolatesTenants(t *testing.T) {
+	coord := newTestCoordinator(t)
+	mk := func() *TaskSubmission {
+		return &TaskSubmission{
+			AgentName: "monitor",
+			Status:    "completed",
+			Result: &ExecutionResult{
+				Success: true,
+				Finding: &StructuredFinding{Conclusion: "连接池耗尽", Confidence: 0.9},
+			},
+		}
+	}
+
+	ctxA := tenant.WithID(context.Background(), 1)
+	ctxB := tenant.WithID(context.Background(), 2)
+
+	idA := coord.recordEvidence(ctxA, newDelegationTask("ext-42"), mk())
+	idB := coord.recordEvidence(ctxB, newDelegationTask("ext-42"), mk())
+	if idA == idB {
+		t.Fatal("跨租户同事件 ID 不得共享证据 ID")
+	}
+	evA, _ := coord.evidence.Get(idA)
+	evB, _ := coord.evidence.Get(idB)
+	if evA.TenantID != 1 || evB.TenantID != 2 {
+		t.Errorf("tenant not preserved: %+v / %+v", evA, evB)
 	}
 }
