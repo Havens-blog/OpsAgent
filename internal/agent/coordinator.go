@@ -802,6 +802,8 @@ func (c *CoordinatorAgent) synthesize(ctx context.Context, task *Task, submissio
 type synthesisClaim struct {
 	Text        string   `json:"text"`
 	EvidenceIDs []string `json:"evidence_ids"`
+	// Conflict 标记该结论与其它专家结论冲突；冲突时不得作为确定根因。
+	Conflict bool `json:"conflict,omitempty"`
 }
 
 // synthesisOutput 是综合 LLM 必须返回的结构化结果
@@ -854,7 +856,8 @@ func validateSynthesis(out synthesisOutput, known map[string]string) error {
 
 // isDetermined 根因命题必须由至少两个专家的证据交叉支持才认定根因。
 // 只统计根因 claim 自身引用的证据来源，而非所有 claim 的并集——两个专家各自
-// 出现不等于根因命题得到交叉证据。
+// 出现不等于根因命题得到交叉证据；根因命题若与其它结论冲突，或引用的证据
+// 全部来自同一专家，都不得确定。
 func isDetermined(out synthesisOutput, known map[string]string) bool {
 	if out.Verdict != "determined" || out.RootCauseClaim < 0 || out.RootCauseClaim >= len(out.Claims) {
 		return false
@@ -863,12 +866,17 @@ func isDetermined(out synthesisOutput, known map[string]string) bool {
 	if strings.TrimSpace(rc.Text) == "" {
 		return false
 	}
+	// 根因命题与其它结论冲突，不得确定。
+	if rc.Conflict {
+		return false
+	}
 	agents := make(map[string]bool)
 	for _, id := range rc.EvidenceIDs {
 		if name, ok := known[id]; ok {
 			agents[name] = true
 		}
 	}
+	// 至少两个独立专家交叉支持（同一专家的多条证据只算一个来源）。
 	return len(agents) >= 2
 }
 
@@ -914,8 +922,8 @@ func buildSynthesisPrompt(task *Task, successful, failed []*TaskSubmission, ids 
 	}
 
 	b.WriteString("\n只返回 JSON，不要其他文字：\n")
-	b.WriteString(`{"verdict":"determined|undetermined","root_cause_claim":整数索引,"claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"]}]}`)
-	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；确定根因（determined）时必须有一条 claim 作为根因命题，且它同时引用至少两个不同专家的证据，并用 root_cause_claim 指向该 claim 的 0-based 索引；证据不足或结论冲突时 verdict 填 undetermined、root_cause_claim 填 -1。\n")
+	b.WriteString(`{"verdict":"determined|undetermined","root_cause_claim":整数索引,"claims":[{"text":"结论要点","evidence_ids":["引用上面列出的证据ID"],"conflict":false}]}`)
+	b.WriteString("\n规则：每条 claim 至少引用一个上面列出的证据ID，禁止编造；确定根因（determined）时必须有一条 claim 作为根因命题，且它同时引用至少两个不同专家的证据，并用 root_cause_claim 指向该 claim 的 0-based 索引；若两个专家结论互相矛盾、或根因命题与其它结论冲突，把根因 claim 的 conflict 标为 true 且 verdict 填 undetermined；证据不足或结论冲突时 verdict 填 undetermined、root_cause_claim 填 -1。\n")
 	return b.String()
 }
 

@@ -141,3 +141,17 @@ func TestSynthesisRootCauseNeedsOwnCrossEvidence(t *testing.T) {
 		t.Errorf("single-source root cause must not be crowned: %q", result.Response)
 	}
 }
+
+// TestSynthesisConflictIsUndetermined 根因命题标记冲突时，即使引用两个专家也不得确定
+func TestSynthesisConflictIsUndetermined(t *testing.T) {
+	_, result := runTwoExperts(t, "conflict", false)
+	if result.Data["synthesized"] != true {
+		t.Fatalf("synthesized = %v, want true (claims are valid)", result.Data["synthesized"])
+	}
+	if !strings.Contains(result.Response, "根因结论：未确定") {
+		t.Errorf("response = %q, want undetermined for conflicting root cause", result.Response)
+	}
+	if strings.Contains(result.Response, "根因结论：慢查询导致 CPU 打满") {
+		t.Errorf("conflicting root cause must not be crowned: %q", result.Response)
+	}
+}

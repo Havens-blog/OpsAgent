@@ -72,6 +72,12 @@ func (e *evidenceLLM) Chat(_ context.Context, msgs []llm.ClaudeMessage) (string,
 			return "{}", nil
 		}
 		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":0,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]}]}`, ids[0], ids[1]), nil
+	case "conflict":
+		// 两个真实专家 ID，但根因命题标记 conflict=true
+		if len(ids) < 2 {
+			return "{}", nil
+		}
+		return fmt.Sprintf(`{"verdict":"determined","root_cause_claim":2,"claims":[{"text":"CPU 打满","evidence_ids":[%q]},{"text":"慢查询暴增","evidence_ids":[%q]},{"text":"慢查询导致 CPU 打满","evidence_ids":[%q,%q],"conflict":true}]}`, ids[0], ids[1], ids[0], ids[1]), nil
 	default:
 		if len(ids) < 2 {
 			return "{}", nil
