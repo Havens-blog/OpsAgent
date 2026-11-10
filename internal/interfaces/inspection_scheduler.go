@@ -27,6 +27,11 @@ const (
 	inspectionRunTimeout = 5 * time.Minute
 	// inspectionTickInterval 调度检查间隔；按分钟去重，保证每分钟至多触发一次且不漏分钟
 	inspectionTickInterval = 30 * time.Second
+	// inspectionWorkerCount 巡检执行并发上限；扫描与执行分离后，慢巡检只占用
+	// 一个 worker，不再阻塞时钟扫描与其它计划。
+	inspectionWorkerCount = 4
+	// inspectionJobQueue 待执行任务队列容量。
+	inspectionJobQueue = 64
 
 	planStatusActive   = "active"
 	planStatusFinished = "finished"
@@ -77,6 +82,9 @@ type inspectionPlanStore struct {
 	path  string
 	plans map[string]*inspectionPlan
 	runs  []inspectionRun
+	// persistFn 是可注入的持久化函数（nil 时用 persistLocked 的真实文件逻辑），
+	// 用于测试模拟落盘故障以验证内存回滚。
+	persistFn func() error
 }
 
 func newMemoryInspectionPlanStore() *inspectionPlanStore {
@@ -141,6 +149,9 @@ func (s *inspectionPlanStore) load() error {
 
 // persistLocked 写临时文件后原子替换，调用方须持有锁
 func (s *inspectionPlanStore) persistLocked() error {
+	if s.persistFn != nil {
+		return s.persistFn()
+	}
 	if s.path == "" {
 		return nil
 	}
@@ -183,7 +194,12 @@ func (s *inspectionPlanStore) create(p *inspectionPlan) error {
 	defer s.mu.Unlock()
 	cp := *p
 	s.plans[p.ID] = &cp
-	return s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		// 回滚：落盘失败不得留下幽灵计划
+		delete(s.plans, p.ID)
+		return err
+	}
+	return nil
 }
 
 // list 返回租户下的计划副本，按创建时间排序
@@ -217,12 +233,19 @@ func (s *inspectionPlanStore) runsFor(tid int64, planID string) ([]inspectionRun
 	return out, true
 }
 
-// claimDue 取出当前分钟到期且未在执行的计划，并标记执行中以防重复触发
+// claimDue 取出当前分钟到期且未在执行的计划，并标记执行中以防重复触发。
+// 落盘失败时回滚内存状态并返回错误，调用方不得执行未 durable 的计划。
 func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	minute := now.Truncate(time.Minute)
 	var due []inspectionPlan
+	type claimState struct {
+		p            *inspectionPlan
+		lastFiredAt  time.Time
+		runningSince time.Time
+	}
+	var claimed []claimState
 	for _, p := range s.plans {
 		if p.Status != planStatusActive || !p.RunningSince.IsZero() {
 			continue
@@ -233,6 +256,7 @@ func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) 
 		if !(&agent.InspectionSchedule{Cron: p.Cron}).Matches(now) {
 			continue
 		}
+		claimed = append(claimed, claimState{p: p, lastFiredAt: p.LastFiredAt, runningSince: p.RunningSince})
 		p.LastFiredAt = now
 		p.RunningSince = now
 		due = append(due, *p)
@@ -240,7 +264,29 @@ func (s *inspectionPlanStore) claimDue(now time.Time) ([]inspectionPlan, error) 
 	if len(due) == 0 {
 		return nil, nil
 	}
-	return due, s.persistLocked()
+	if err := s.persistLocked(); err != nil {
+		// 回滚内存状态：claim 未 durable，既不能执行，也不能污染内存
+		for _, c := range claimed {
+			c.p.LastFiredAt = c.lastFiredAt
+			c.p.RunningSince = c.runningSince
+		}
+		return nil, err
+	}
+	return due, nil
+}
+
+// unclaim 恢复被 claim 但未执行的计划，用于队列满时放弃本次触发，
+// 避免计划粘滞在执行中直到重启恢复。
+func (s *inspectionPlanStore) unclaim(planID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.plans[planID]
+	if !ok {
+		return nil
+	}
+	p.RunningSince = time.Time{}
+	p.LastFiredAt = time.Time{}
+	return s.persistLocked()
 }
 
 // complete 记录一次运行结果并推进计划状态
@@ -270,11 +316,22 @@ func planFinished(p *inspectionPlan, status string) bool {
 	return p.StopCondition != "" && status == string(agent.InspectionRunSuccess)
 }
 
-// inspectionScheduler 按时钟驱动执行到期的巡检计划
+// inspectionScheduler 按时钟驱动执行到期的巡检计划。时钟扫描与执行池分离：
+// tick 只负责 claim 并提交任务到有界队列，worker 异步执行，慢巡检不会阻塞
+// 后续分钟的扫描。
 type inspectionScheduler struct {
 	store  *inspectionPlanStore
 	runner executableAgent
 	logger *observability.Logger
+
+	jobs chan inspectionJob
+	wg   sync.WaitGroup
+}
+
+// inspectionJob 是待执行的巡检任务
+type inspectionJob struct {
+	plan inspectionPlan
+	now  time.Time
 }
 
 // startInspectionScheduler 启动定时巡检调度器，重复调用无副作用
@@ -310,13 +367,21 @@ func (s *APIServer) stopInspectionScheduler(ctx context.Context) {
 	}
 }
 
-// run 每隔 inspectionTickInterval 检查一次到期计划，ctx 取消后退出
+// run 启动执行池，并每隔 inspectionTickInterval 扫描一次到期计划。
+// ctx 取消后先停止接收新任务，再等待 worker 收尾。
 func (sc *inspectionScheduler) run(ctx context.Context) {
+	sc.jobs = make(chan inspectionJob, inspectionJobQueue)
+	for i := 0; i < inspectionWorkerCount; i++ {
+		sc.wg.Add(1)
+		go sc.worker(ctx)
+	}
 	ticker := time.NewTicker(inspectionTickInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			close(sc.jobs)
+			sc.wg.Wait()
 			return
 		case t := <-ticker.C:
 			sc.tick(ctx, t)
@@ -324,24 +389,42 @@ func (sc *inspectionScheduler) run(ctx context.Context) {
 	}
 }
 
-// tick 并行执行本分钟到期的计划并等待全部完成
+// tick 扫描本分钟到期计划并提交到执行池，不再同步等待执行完成。
+// claim 落盘失败时直接返回，不执行未 durable 的计划。
 func (sc *inspectionScheduler) tick(ctx context.Context, now time.Time) {
 	due, err := sc.store.claimDue(now)
 	if err != nil {
 		sc.warn("巡检计划状态落盘失败", err)
+		return
 	}
-	var wg sync.WaitGroup
 	for _, p := range due {
-		wg.Add(1)
-		go func(p inspectionPlan) {
-			defer wg.Done()
-			run := sc.execute(ctx, p, now)
-			if err := sc.store.complete(p.ID, run); err != nil {
-				sc.warn("巡检运行记录写入失败", err)
+		select {
+		case sc.jobs <- inspectionJob{plan: p, now: now}:
+		case <-ctx.Done():
+			return
+		default:
+			// 队列满：fire-once 策略，放弃本次触发并恢复计划状态，
+			// 让下一分钟可以重新 claim。
+			if err := sc.store.unclaim(p.ID); err != nil {
+				sc.warn("巡检计划释放失败", err)
 			}
-		}(p)
+			sc.warn("巡检执行队列已满，跳过本次触发", fmt.Errorf("queue full for %s", p.ID))
+		}
 	}
-	wg.Wait()
+}
+
+// worker 从队列取巡检执行；ctx 取消后仍在队列中的任务被丢弃。
+func (sc *inspectionScheduler) worker(ctx context.Context) {
+	defer sc.wg.Done()
+	for job := range sc.jobs {
+		if ctx.Err() != nil {
+			continue
+		}
+		run := sc.execute(ctx, job.plan, job.now)
+		if err := sc.store.complete(job.plan.ID, run); err != nil {
+			sc.warn("巡检运行记录写入失败", err)
+		}
+	}
 }
 
 func (sc *inspectionScheduler) execute(ctx context.Context, p inspectionPlan, now time.Time) inspectionRun {

@@ -8,10 +8,16 @@ import (
 	"testing"
 )
 
+const (
+	testMemoryTenantID int64 = 1
+	testMemoryUserID   int64 = 100
+)
+
 func postMemoryFact(t *testing.T, server *APIServer, body map[string]interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(b))
+	req = withIdentity(req, testMemoryTenantID, testMemoryUserID)
 	w := httptest.NewRecorder()
 	server.ServeHTTP(w, req)
 	return w
@@ -24,10 +30,11 @@ func TestConfirmMemoryFactHandler(t *testing.T) {
 	}
 
 	valid := map[string]interface{}{
-		"kind":         "root_cause",
-		"service":      "order-service",
-		"content":      "连接池耗尽导致 5xx 飙升",
-		"confidence":   0.8,
+		"kind":       "root_cause",
+		"service":    "order-service",
+		"content":    "连接池耗尽导致 5xx 飙升",
+		"confidence": 0.8,
+		// 客户端自报的 confirmed_by 会被忽略，确认主体来自认证上下文
 		"confirmed_by": "oncall-alice",
 	}
 	w := postMemoryFact(t, server, valid)
@@ -57,22 +64,25 @@ func TestConfirmMemoryFactHandler(t *testing.T) {
 	}
 
 	// 检索返回已确认事实，并支持版本过滤
-	get := httptest.NewRequest(http.MethodGet, "/api/v1/memory?service=order-service", nil)
+	get := withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/memory?service=order-service", nil), testMemoryTenantID, testMemoryUserID)
 	w = httptest.NewRecorder()
 	server.ServeHTTP(w, get)
 	var listed struct {
 		Count int `json:"count"`
 		Facts []struct {
-			Service     string `json:"service"`
-			Content     string `json:"content"`
-			ConfirmedBy string `json:"confirmed_by"`
+			Service        string `json:"service"`
+			Content        string `json:"content"`
+			ConfirmedBy    string `json:"confirmed_by"`
+			ConfirmedByUID int64  `json:"confirmed_by_uid"`
 		} `json:"facts"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
 		t.Fatalf("decode list: %v (%s)", err, w.Body.String())
 	}
 	if w.Code != http.StatusOK || listed.Count != 1 || len(listed.Facts) != 1 ||
-		listed.Facts[0].Content != "连接池耗尽导致 5xx 飙升" || listed.Facts[0].ConfirmedBy != "oncall-alice" {
+		listed.Facts[0].Content != "连接池耗尽导致 5xx 飙升" ||
+		listed.Facts[0].ConfirmedBy != "uid-100" ||
+		listed.Facts[0].ConfirmedByUID != 100 {
 		t.Errorf("list status=%d body=%s", w.Code, w.Body.String())
 	}
 }
@@ -84,12 +94,11 @@ func TestConfirmMemoryFactHandlerValidation(t *testing.T) {
 	}
 
 	bad := []map[string]interface{}{
-		{"kind": "unknown", "service": "s", "content": "c", "confidence": 0.8, "confirmed_by": "a"},
-		{"kind": "root_cause", "service": "", "content": "c", "confidence": 0.8, "confirmed_by": "a"},
-		{"kind": "root_cause", "service": "s", "content": "", "confidence": 0.8, "confirmed_by": "a"},
-		{"kind": "root_cause", "service": "s", "content": "c", "confidence": 0.8},
-		{"kind": "root_cause", "service": "s", "content": "c", "confidence": 1.5, "confirmed_by": "a"},
-		{"kind": "root_cause", "service": "s", "content": "c", "confidence": 0.8, "confirmed_by": "a", "expires_at": "not-a-time"},
+		{"kind": "unknown", "service": "s", "content": "c", "confidence": 0.8},
+		{"kind": "root_cause", "service": "", "content": "c", "confidence": 0.8},
+		{"kind": "root_cause", "service": "s", "content": "", "confidence": 0.8},
+		{"kind": "root_cause", "service": "s", "content": "c", "confidence": 1.5},
+		{"kind": "root_cause", "service": "s", "content": "c", "confidence": 0.8, "expires_at": "not-a-time"},
 	}
 	for i, body := range bad {
 		if w := postMemoryFact(t, server, body); w.Code != http.StatusBadRequest {
@@ -110,6 +119,39 @@ func TestConfirmMemoryFactHandlerValidation(t *testing.T) {
 	}
 }
 
+// TestConfirmMemoryFactRejectsUnauthenticated 未认证/机器主体（uid==0）不得制造人工确认记录
+func TestConfirmMemoryFactRejectsUnauthenticated(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+
+	b, _ := json.Marshal(map[string]interface{}{
+		"kind": "root_cause", "service": "order-service",
+		"content": "连接池耗尽", "confidence": 0.8,
+		"confirmed_by": "oncall-alice", // 自报也应被拒绝：没有认证主体
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/memory", bytes.NewReader(b))
+	// 不注入身份：uid==0 模拟机器凭证/未认证
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated status = %d, want 403 (body %s)", w.Code, w.Body.String())
+	}
+
+	// 未认证被拒后不得留下事实
+	get := withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/memory", nil), testMemoryTenantID, testMemoryUserID)
+	w = httptest.NewRecorder()
+	server.ServeHTTP(w, get)
+	var listed struct {
+		Count int `json:"count"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &listed)
+	if listed.Count != 0 {
+		t.Errorf("unauthenticated fact leaked into memory: count = %d", listed.Count)
+	}
+}
+
 func TestQueryMemoryVersionFilter(t *testing.T) {
 	server, err := NewAPIServer(testSettings())
 	if err != nil {
@@ -125,7 +167,7 @@ func TestQueryMemoryVersionFilter(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	server.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/memory?service=gateway&version=1.0", nil))
+	server.ServeHTTP(w, withIdentity(httptest.NewRequest(http.MethodGet, "/api/v1/memory?service=gateway&version=1.0", nil), testMemoryTenantID, testMemoryUserID))
 	var listed struct {
 		Count int `json:"count"`
 	}

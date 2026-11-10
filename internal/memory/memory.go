@@ -47,7 +47,10 @@ type Fact struct {
 	TenantID    int64     `json:"tenant_id"`
 	Version     string    `json:"version,omitempty"`
 	ConfirmedBy string    `json:"confirmed_by"`
-	ConfirmedAt time.Time `json:"confirmed_at"`
+	// ConfirmedByUID 是服务端认证主体的数字 ID，用于追溯真实确认者；
+	// 客户端自报的 confirmed_by 字符串不能替代它。
+	ConfirmedByUID int64     `json:"confirmed_by_uid,omitempty"`
+	ConfirmedAt    time.Time `json:"confirmed_at"`
 	// ExpiresAt 零值表示长期有效；过期后检索不再返回
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
@@ -57,6 +60,10 @@ func (f Fact) key() string {
 	return fmt.Sprintf("%d\x00%s\x00%s\x00%s\x00%s",
 		f.TenantID, f.Kind, f.Service, f.Version, strings.TrimSpace(f.Content))
 }
+
+// ErrScopeGate 表示事实被作用域门槛拒绝（输入问题，可映射为 4xx）。
+// 与持久化失败（系统故障，应映射为 5xx）区分，避免误导客户端。
+var ErrScopeGate = errors.New("fact rejected by scope gate")
 
 // scopeGate 只有「服务级 + 内容完整 + 置信度达标 + 有人工确认者」的事实才能入库
 func scopeGate(f Fact, minConfidence float64) bool {
@@ -90,6 +97,9 @@ type Store struct {
 	path          string
 	facts         map[string]Fact
 	minConfidence float64
+	// persistFn 是可注入的持久化函数（nil 时用 persistLocked），
+	// 用于测试模拟落盘故障以验证内存回滚。
+	persistFn func() error
 }
 
 // New creates an empty store requiring at least minConfidence to persist a fact.
@@ -167,9 +177,10 @@ func (s *Store) persistLocked() error {
 
 // Record 把一条人工确认的事实写入长期记忆。ConfirmedBy 为空、非服务级、
 // 内容不完整或置信度不足都会被拒绝；重复确认按幂等处理（不重复存储）。
+// 落盘失败时回滚内存写入，避免留下"看似已存储、重启后丢失"的伪幂等状态。
 func (s *Store) Record(f Fact) (bool, error) {
 	if !scopeGate(f, s.minConfidence) {
-		return false, errors.New("fact rejected by scope gate")
+		return false, ErrScopeGate
 	}
 	if f.ConfirmedAt.IsZero() {
 		f.ConfirmedAt = time.Now()
@@ -180,7 +191,17 @@ func (s *Store) Record(f Fact) (bool, error) {
 		return false, nil
 	}
 	s.facts[f.key()] = f
-	return true, s.persistLocked()
+	persist := s.persistLocked
+	if s.persistFn != nil {
+		persist = s.persistFn
+	}
+	if err := persist(); err != nil {
+		// 回滚内存写入：持久化失败不得让内存出现已拒绝数据，
+		// 否则下一次重复提交会被误判为幂等成功。
+		delete(s.facts, f.key())
+		return false, err
+	}
+	return true, nil
 }
 
 // Query 按租户/服务/版本检索未过期的事实
