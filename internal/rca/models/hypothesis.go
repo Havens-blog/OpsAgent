@@ -25,8 +25,9 @@ type Hypothesis struct {
 	Type        HypothesisType
 	Service     string
 	Description string
-	Metric      string // For metric anomalies
-	ChangeID    string // For change-related hypotheses
+	Metric      string            // For metric anomalies
+	MetricLabels map[string]string // For metric anomalies: full series labels (instance identity)
+	ChangeID    string            // For change-related hypotheses
 	Evidence    []string
 	Confidence  float64
 }

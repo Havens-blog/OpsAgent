@@ -637,7 +637,9 @@ func calculateMetricTrends(metrics []models.MetricSeries, windows []models.TimeW
 	result := make(map[string]map[int]models.Trend)
 	for _, metric := range metrics {
 		trends := make(map[int]models.Trend)
-		result[metricTrendKey(metric.Labels["service"], metric.Name)] = trends
+		// 用完整序列身份（name + labels）作 key：同服务同指标不同实例
+		// 不再互相覆写，高异常实例不会被稳定实例掩盖。
+		result[models.MetricSeriesIdentity(metric)] = trends
 		for i := 0; i < len(windows)-1; i++ {
 			avg1 := getAverageMetricValue(metric, windows[i])
 			avg2 := getAverageMetricValue(metric, windows[i+1])
@@ -716,14 +718,19 @@ func (e *Engine) generateHypotheses(ctx context.Context, signals *models.Signals
 		if !hasAnomalousTrend(trends, normalized, incident) {
 			continue
 		}
-		service, metricName := splitMetricTrendKey(key)
-		desc, evidence := describeMetricAnomaly(service, metricName, trends, normalized.TimeWindows, signals.Metrics)
+		series := findSeriesByIdentity(signals.Metrics, key)
+		if series == nil {
+			continue
+		}
+		service := series.Labels["service"]
+		desc, evidence := describeMetricAnomaly(series, trends, normalized.TimeWindows)
 		candidates = append(candidates, models.Hypothesis{
-			Type:        models.HypothesisTypeMetricAnomaly,
-			Service:     service,
-			Description: desc,
-			Metric:      metricName,
-			Evidence:    evidence,
+			Type:         models.HypothesisTypeMetricAnomaly,
+			Service:      service,
+			Description:  desc,
+			Metric:       series.Name,
+			MetricLabels: series.Labels,
+			Evidence:     evidence,
 		})
 	}
 
@@ -908,24 +915,11 @@ func hasAnomalousTrend(trends map[int]models.Trend, normalized *models.Normalize
 }
 
 // describeMetricAnomaly builds a diagnostic description + evidence for one
-// metric's anomalous trend: direction counts in the description, and the most
-// recent anomalous windows as evidence lines with real timestamps and average
-// values (capped at 5, chronological — the old "Window 44: trending up" was
-// opaque to on-call and shuffled between runs).
-func describeMetricAnomaly(service, metricName string, trends map[int]models.Trend, windows []models.TimeWindow, series []models.MetricSeries) (string, []string) {
-	var ms *models.MetricSeries
-	for i := range series {
-		if series[i].Name != metricName {
-			continue
-		}
-		// When the candidate is service-scoped, join on the owning service so
-		// the evidence averages come from the right series. The global fallback
-		// (empty service) keeps the original name-only join.
-		if service == "" || series[i].Labels["service"] == service {
-			ms = &series[i]
-			break
-		}
-	}
+// metric series' anomalous trend: direction counts in the description, and the
+// most recent anomalous windows as evidence lines with real timestamps and
+// average values (capped at 5, chronological).
+func describeMetricAnomaly(series *models.MetricSeries, trends map[int]models.Trend, windows []models.TimeWindow) (string, []string) {
+	metricName := series.Name
 
 	idxs := make([]int, 0, len(trends))
 	ups, downs := 0, 0
@@ -949,10 +943,6 @@ func describeMetricAnomaly(service, metricName string, trends map[int]models.Tre
 		evidence = append(evidence, fmt.Sprintf("(另有 %d 个更早的异常窗口)", len(idxs)-maxLines))
 		idxs = idxs[len(idxs)-maxLines:]
 	}
-	unit := ""
-	if ms != nil {
-		unit = ms.Unit
-	}
 	for _, i := range idxs {
 		if i < 0 || i >= len(windows) {
 			continue
@@ -963,10 +953,8 @@ func describeMetricAnomaly(service, metricName string, trends map[int]models.Tre
 			dir = "falling"
 		}
 		line := fmt.Sprintf("%s~%s %s", w.Start.Format("01-02 15:04"), w.End.Format("01-02 15:04"), dir)
-		if ms != nil {
-			if avg := getAverageMetricValue(*ms, w); avg != 0 {
-				line += fmt.Sprintf(" (avg %.2f%s)", avg, unit)
-			}
+		if avg := getAverageMetricValue(*series, w); avg != 0 {
+			line += fmt.Sprintf(" (avg %.2f%s)", avg, series.Unit)
 		}
 		evidence = append(evidence, line)
 	}
@@ -974,6 +962,16 @@ func describeMetricAnomaly(service, metricName string, trends map[int]models.Tre
 		evidence = append(evidence, desc)
 	}
 	return desc, evidence
+}
+
+// findSeriesByIdentity 通过完整序列身份反查原始序列
+func findSeriesByIdentity(series []models.MetricSeries, identity string) *models.MetricSeries {
+	for i := range series {
+		if models.MetricSeriesIdentity(series[i]) == identity {
+			return &series[i]
+		}
+	}
+	return nil
 }
 
 func isChangeRelevant(change models.Change, incident *models.Incident) bool {

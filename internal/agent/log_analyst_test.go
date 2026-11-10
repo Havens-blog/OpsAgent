@@ -205,3 +205,58 @@ func TestLogAnalystAgentExecute(t *testing.T) {
 		}
 	})
 }
+
+// TestNormalizeServiceList 服务列表提取：services 优先，回退单 service
+func TestNormalizeServiceList(t *testing.T) {
+	cases := []struct {
+		name   string
+		params map[string]interface{}
+		want   []string
+	}{
+		{"services list", map[string]interface{}{"services": []interface{}{"a", "b"}, "service": "a"}, []string{"a", "b"}},
+		{"single service fallback", map[string]interface{}{"service": "a"}, []string{"a"}},
+		{"empty services then single", map[string]interface{}{"services": []interface{}{"", " "}, "service": "a"}, []string{"a"}},
+		{"global scan", map[string]interface{}{}, []string{""}},
+	}
+	for _, tc := range cases {
+		got := normalizeServiceList(tc.params)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+// TestMergeLogResults 多服务合并：错误总数累加、模式去重、时间线合并
+func TestMergeLogResults(t *testing.T) {
+	start := time.Now().Add(-time.Hour)
+	end := time.Now()
+	slot := LogTimeSlot{StartTime: start, EndTime: end, ErrorCount: 2, LogCount: 2}
+
+	a := &LogAnalysisResult{Service: "a", StartTime: start, EndTime: end, TotalErrors: 10,
+		ErrorPatterns: []ErrorPattern{{Pattern: "p1", Count: 2}, {Pattern: "p2", Count: 1}},
+		Timeline:      []LogTimeSlot{slot}}
+	b := &LogAnalysisResult{Service: "b", StartTime: start, EndTime: end, TotalErrors: 5,
+		ErrorPatterns: []ErrorPattern{{Pattern: "p1", Count: 3}, {Pattern: "p3", Count: 1}},
+		Timeline:      []LogTimeSlot{slot}}
+
+	merged := mergeLogResults([]*LogAnalysisResult{a, b})
+	if merged.TotalErrors != 15 {
+		t.Errorf("TotalErrors = %d, want 15", merged.TotalErrors)
+	}
+	if len(merged.ErrorPatterns) != 3 {
+		t.Errorf("patterns = %d, want 3 (dedup)", len(merged.ErrorPatterns))
+	}
+	if merged.Service != "a,b" {
+		t.Errorf("Service = %q, want a,b", merged.Service)
+	}
+	if len(merged.Timeline) != 1 || merged.Timeline[0].ErrorCount != 4 {
+		t.Errorf("timeline = %+v, want merged error count 4", merged.Timeline)
+	}
+}

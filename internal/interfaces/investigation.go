@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/agent"
+	"github.com/Havens-blog/OpsAgent/internal/memory"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // alertInvestigator 执行调用方规划好的多专家只读取证
@@ -19,31 +21,66 @@ const investigationTimeout = 5 * time.Minute
 
 // investigateIncident 是告警与手工 RCA 的统一调查入口：有两个以上专家时委派
 // Coordinator 并行取证，复用 monitor 的确定性报告；否则回退确定性引擎。
-// 部分失败的覆盖缺口由程序写入 Investigation，存储与通知读取同一份结果。
+// 在最外层建立总预算，专家、综合与降级都继承同一 deadline，预算耗尽后
+// 不再重启无预算的引擎采集。部分失败的覆盖缺口由程序写入 Investigation。
 func (s *APIServer) investigateIncident(ctx context.Context, incident *models.Incident) (*models.RCAReport, error) {
+	bctx, cancel := context.WithTimeout(ctx, investigationTimeout)
+	defer cancel()
+
 	if s.investigator == nil || len(s.investigationAgents) < 2 {
-		return s.rcaEngine.Analyze(ctx, incident)
+		return s.rcaEngine.Analyze(bctx, incident)
 	}
 
-	ictx, cancel := context.WithTimeout(ctx, investigationTimeout)
-	res := s.investigator.Investigate(ictx, incidentTask(incident), s.investigationAgents)
-	cancel()
+	task := incidentTask(incident)
+	// 召回历史先验并注入任务：作为待验证假设供规划参考，不作为本次观察证据。
+	if hist := s.historicalFacts(bctx, incident); len(hist) > 0 {
+		task.Params["historical_facts"] = hist
+	}
+	res := s.investigator.Investigate(bctx, task, s.investigationAgents)
 	outcome := investigationOutcome(res)
 
 	if rep := monitorReport(res); rep != nil {
 		out := *rep
-		out.Incident = incident
+		// 保留 monitor 引擎解析后的 incident（含域名解析出的后端服务），
+		// 不覆盖为原始 incident，否则丢失实体解析结果与映射来源。
+		if rep.Incident != nil {
+			out.Incident = rep.Incident
+		} else {
+			out.Incident = incident
+		}
 		out.Investigation = outcome
 		return &out, nil
 	}
 
-	// RCA 专家未产出报告时回退确定性引擎，但保留其他专家的调查结论
-	report, err := s.rcaEngine.Analyze(ctx, incident)
+	// RCA 专家未产出报告时回退确定性引擎，使用总预算 ctx（剩余 deadline），
+	// 不重启无预算的完整采集。
+	report, err := s.rcaEngine.Analyze(bctx, incident)
 	if err != nil {
 		return nil, err
 	}
 	report.Investigation = outcome
 	return report, nil
+}
+
+// historicalFacts 召回当前租户 + 受影响服务的未过期 root_cause 历史先验。
+// 这些事实仅作为待验证假设注入调查规划，不作为本次观察证据。
+func (s *APIServer) historicalFacts(ctx context.Context, incident *models.Incident) []memory.Fact {
+	if s.faultMemory == nil || incident == nil {
+		return nil
+	}
+	tid := tenant.IDFrom(ctx)
+	var out []memory.Fact
+	for _, svc := range incident.AffectedServices {
+		if strings.TrimSpace(svc) == "" {
+			continue
+		}
+		for _, f := range s.faultMemory.Query(memory.Query{TenantID: tid, Service: svc}) {
+			if f.Kind == memory.FactRootCause {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // incidentTask 把事件正规化为专家可直接消费的任务参数
@@ -66,6 +103,9 @@ func incidentTask(inc *models.Incident) *agent.Task {
 		},
 		"start_time": start,
 		"end_time":   end,
+		// 完整受影响服务列表：专家据此明确调查范围，避免只取第一个服务
+		// 而遗漏解析出的后端或其它服务。
+		"services": services,
 	}
 	if len(inc.AffectedServices) > 0 {
 		params["service"] = inc.AffectedServices[0]

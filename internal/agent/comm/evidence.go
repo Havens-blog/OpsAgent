@@ -53,6 +53,7 @@ type SharedEvidence struct {
 
 	// Correlation
 	IncidentID   string   `json:"incident_id,omitempty"`
+	TenantID     int64    `json:"tenant_id,omitempty"` // Namespace isolation: same external incident ID in different tenants stays distinct
 	CorrelatedTo []string `json:"correlated_to,omitempty"` // Other evidence IDs
 
 	// Metadata
@@ -78,8 +79,8 @@ func (e *SharedEvidence) ComputeDedupKey() string {
 	}
 
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%s|%s|%s|%v|%s|%s|%s",
-		e.IncidentID, e.Type, e.Title, e.Service, e.Data,
+	fmt.Fprintf(h, "%s|%d|%s|%s|%s|%v|%s|%s|%s",
+		e.IncidentID, e.TenantID, e.Type, e.Title, e.Service, e.Data,
 		strings.TrimSpace(e.Description),
 		e.StartTime.Format(time.RFC3339), e.EndTime.Format(time.RFC3339))
 	e.DedupKey = hex.EncodeToString(h.Sum(nil))[:16]

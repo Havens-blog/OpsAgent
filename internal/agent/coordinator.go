@@ -13,6 +13,7 @@ import (
 	"github.com/Havens-blog/OpsAgent/internal/config"
 	"github.com/Havens-blog/OpsAgent/internal/llm"
 	"github.com/Havens-blog/OpsAgent/internal/observability"
+	"github.com/Havens-blog/OpsAgent/internal/tenant"
 )
 
 // SpecialistAgent is a sub-agent registered with the Coordinator: it executes
@@ -583,7 +584,7 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 		}
 		if sub.succeeded() {
 			parts = append(parts, fmt.Sprintf("[%s]: %s", sub.AgentName, sub.Result.Response))
-			id := c.recordEvidence(originalTask, sub)
+			id := c.recordEvidence(ctx, originalTask, sub)
 			c.attachEvidence(sub, id)
 			ids[sub] = id
 			evidenceIDs = append(evidenceIDs, id)
@@ -628,13 +629,14 @@ func (c *CoordinatorAgent) aggregateResults(ctx context.Context, originalTask *T
 }
 
 // recordEvidence persists a successful specialist conclusion as shared evidence.
-func (c *CoordinatorAgent) recordEvidence(task *Task, sub *TaskSubmission) string {
+func (c *CoordinatorAgent) recordEvidence(ctx context.Context, task *Task, sub *TaskSubmission) string {
 	e := &comm.SharedEvidence{
 		SourceAgent: sub.AgentName,
 		Type:        comm.EvidenceTypeHypothesis,
 		Title:       fmt.Sprintf("%s 结论", sub.AgentName),
 		Description: findingConclusion(sub.Result),
 		IncidentID:  task.ID,
+		TenantID:    tenant.IDFrom(ctx),
 		Confidence:  findingConfidence(sub.Result),
 	}
 	c.evidence.Add(e)
@@ -960,15 +962,44 @@ func (c *CoordinatorAgent) GetTaskStatus(taskID string) []*TaskSubmission {
 }
 
 // snapshot returns a defensive copy of a submission, including its Result, so
-// callers never mutate the coordinator's live state.
+// callers never mutate the coordinator's live state. Nested maps/slices are
+// copied so rewriting Data/Finding/ToolsUsed on the snapshot stays isolated.
 func (s *TaskSubmission) snapshot() *TaskSubmission {
 	if s == nil {
 		return nil
 	}
 	cp := *s
 	if s.Result != nil {
-		r := *s.Result
-		cp.Result = &r
+		cp.Result = cloneExecutionResult(s.Result)
+	}
+	return &cp
+}
+
+// cloneExecutionResult deep-copies the mutable fields of an ExecutionResult.
+func cloneExecutionResult(r *ExecutionResult) *ExecutionResult {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	if r.Data != nil {
+		cp.Data = make(map[string]interface{}, len(r.Data))
+		for k, v := range r.Data {
+			cp.Data[k] = v
+		}
+	}
+	if r.Metadata != nil {
+		cp.Metadata = make(map[string]interface{}, len(r.Metadata))
+		for k, v := range r.Metadata {
+			cp.Metadata[k] = v
+		}
+	}
+	if r.ToolsUsed != nil {
+		cp.ToolsUsed = append([]string(nil), r.ToolsUsed...)
+	}
+	if r.Finding != nil {
+		f := *r.Finding
+		f.EvidenceIDs = append([]string(nil), r.Finding.EvidenceIDs...)
+		cp.Finding = &f
 	}
 	return &cp
 }

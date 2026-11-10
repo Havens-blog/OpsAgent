@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Havens-blog/OpsAgent/internal/agent"
+	"github.com/Havens-blog/OpsAgent/internal/memory"
 	"github.com/Havens-blog/OpsAgent/internal/rca/engine"
 	"github.com/Havens-blog/OpsAgent/internal/rca/models"
 	"github.com/Havens-blog/OpsAgent/internal/rca/sources"
@@ -24,11 +25,13 @@ type fakeInvestigator struct {
 	agents []string
 	task   *agent.Task
 	result *agent.ExecutionResult
+	ctx    context.Context
 }
 
-func (f *fakeInvestigator) Investigate(_ context.Context, task *agent.Task, agents []string) *agent.ExecutionResult {
+func (f *fakeInvestigator) Investigate(ctx context.Context, task *agent.Task, agents []string) *agent.ExecutionResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ctx = ctx
 	f.task = task
 	f.agents = append([]string(nil), agents...)
 	return f.result
@@ -119,6 +122,35 @@ func TestInvestigateIncidentUsesExpertsAndDisclosesGaps(t *testing.T) {
 	}
 	if !strings.Contains(report.Investigation.Summary, "log_analyst 未完成") {
 		t.Errorf("investigation missing coverage gap: %q", report.Investigation.Summary)
+	}
+}
+
+// TestInvestigateIncidentKeepsResolvedEntities 调查复用 monitor 报告时保留引擎解析出的实体
+func TestInvestigateIncidentKeepsResolvedEntities(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+	resolved := &models.Incident{
+		ID:               "inc-resolve",
+		StartTime:        time.Now().Add(-10 * time.Minute),
+		EndTime:          time.Now(),
+		Severity:         "P2",
+		AffectedServices: []string{"guess-svc", "resolved-gateway-svc"},
+		Description:      "域名 x.com 不可用",
+	}
+	monitorRep := &models.RCAReport{Confidence: 0.8, Incident: resolved}
+	fake := &fakeInvestigator{result: monitorOKLogFailed(monitorRep)}
+	server.investigator = fake
+	server.investigationAgents = []string{"monitor", "log_analyst"}
+
+	report, err := server.investigateIncident(context.Background(), testIncident("inc-resolve"))
+	if err != nil {
+		t.Fatalf("investigateIncident: %v", err)
+	}
+	if report.Incident == nil || len(report.Incident.AffectedServices) != 2 ||
+		report.Incident.AffectedServices[1] != "resolved-gateway-svc" {
+		t.Fatalf("resolved incident lost: %+v", report.Incident)
 	}
 }
 
@@ -213,4 +245,68 @@ func TestWatchAlertWebhookRunsInvestigation(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("webhook did not store an investigation result in time")
+}
+
+// TestHistoricalFactsRecall 历史先验召回：租户隔离、服务匹配、过期过滤、仅 root_cause
+func TestHistoricalFactsRecall(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+
+	now := time.Now()
+	hit := memory.Fact{Kind: memory.FactRootCause, Scope: memory.ScopeService, Service: "order-service",
+		Content: "连接池耗尽", Confidence: 0.9, TenantID: 1, ConfirmedBy: "oncall-alice"}
+	otherTenant := memory.Fact{Kind: memory.FactRootCause, Scope: memory.ScopeService, Service: "order-service",
+		Content: "其他租户", Confidence: 0.9, TenantID: 2, ConfirmedBy: "oncall-alice"}
+	expired := memory.Fact{Kind: memory.FactRootCause, Scope: memory.ScopeService, Service: "order-service",
+		Content: "过期事实", Confidence: 0.9, TenantID: 1, ConfirmedBy: "oncall-alice",
+		ExpiresAt: now.Add(-time.Hour)}
+	fragility := memory.Fact{Kind: memory.FactFragility, Scope: memory.ScopeService, Service: "order-service",
+		Content: "限流阈值偏低", Confidence: 0.9, TenantID: 1, ConfirmedBy: "oncall-alice"}
+
+	for _, f := range []memory.Fact{hit, otherTenant, expired, fragility} {
+		if _, err := server.faultMemory.Record(f); err != nil {
+			t.Fatalf("record %+v: %v", f, err)
+		}
+	}
+
+	ctx := tenant.WithID(context.Background(), 1)
+	inc := testIncident("hist-1")
+	inc.AffectedServices = []string{"order-service"}
+
+	got := server.historicalFacts(ctx, inc)
+	if len(got) != 1 || got[0].Content != "连接池耗尽" {
+		t.Fatalf("historicalFacts = %+v, want only the matching unexpired root-cause fact", got)
+	}
+}
+
+// TestInvestigateIncidentUsesBudgetedContext 专家调查继承总预算 deadline
+func TestInvestigateIncidentUsesBudgetedContext(t *testing.T) {
+	server, err := NewAPIServer(testSettings())
+	if err != nil {
+		t.Fatalf("NewAPIServer: %v", err)
+	}
+	fake := &fakeInvestigator{result: monitorOKLogFailed(&models.RCAReport{Confidence: 0.8})}
+	server.investigator = fake
+	server.investigationAgents = []string{"monitor", "log_analyst"}
+
+	_, err = server.investigateIncident(context.Background(), testIncident("budget"))
+	if err != nil {
+		t.Fatalf("investigateIncident: %v", err)
+	}
+
+	fake.mu.Lock()
+	ictx := fake.ctx
+	fake.mu.Unlock()
+	if ictx == nil {
+		t.Fatal("investigator ctx not captured")
+	}
+	deadline, ok := ictx.Deadline()
+	if !ok {
+		t.Fatal("investigator ctx has no deadline: total budget not applied")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > investigationTimeout {
+		t.Errorf("deadline remaining = %v, want within total budget %v", remaining, investigationTimeout)
+	}
 }

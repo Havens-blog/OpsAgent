@@ -394,10 +394,8 @@ func (l *LogAnalystAgent) Execute(ctx context.Context, task *Task) (*ExecutionRe
 	return result, err
 }
 
-// executeLogAnalysisTask executes a log analysis task.
+// executeLogAnalysisTask executes a log analysis task over one or more services.
 func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task) (*ExecutionResult, error) {
-	// Extract parameters
-	service := getString(task.Params, "service")
 	startTimeStr := getString(task.Params, "start_time")
 	endTimeStr := getString(task.Params, "end_time")
 
@@ -427,35 +425,53 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 		end = t
 	}
 
-	// Perform analysis
-	analysis, err := l.AnalyzeLogs(ctx, service, start, end)
-	if err != nil {
+	// 多服务支持：逐个分析并合并，明确每个服务的调查范围。
+	services := normalizeServiceList(task.Params)
+	var results []*LogAnalysisResult
+	var failures []string
+	for _, svc := range services {
+		analysis, err := l.AnalyzeLogs(ctx, svc, start, end)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", svc, err))
+			continue
+		}
+		results = append(results, analysis)
+	}
+	if len(results) == 0 {
+		msg := strings.Join(failures, "; ")
+		if msg == "" {
+			msg = "no services analyzed"
+		}
 		return &ExecutionResult{
 			Success:  false,
-			Error:    errText(err),
-			Response: fmt.Sprintf("Log analysis failed: %v", err),
+			Error:    msg,
+			Response: fmt.Sprintf("Log analysis failed: %s", msg),
 		}, nil
 	}
 
-	// Format response
-	response := l.formatAnalysisResult(analysis)
-	conclusion := fmt.Sprintf("窗口内错误总数 %d", analysis.TotalErrors)
+	merged := mergeLogResults(results)
+	response := l.formatAnalysisResult(merged)
+	conclusion := fmt.Sprintf("窗口内错误总数 %d", merged.TotalErrors)
 	confidence := 0.0
-	if len(analysis.ErrorPatterns) > 0 {
-		top := analysis.ErrorPatterns[0]
+	if len(merged.ErrorPatterns) > 0 {
+		top := merged.ErrorPatterns[0]
 		conclusion = fmt.Sprintf("发现 %d 个错误模式，最突出: %s (%d 次)",
-			len(analysis.ErrorPatterns), top.Pattern, top.Count)
+			len(merged.ErrorPatterns), top.Pattern, top.Count)
 		confidence = 0.5
+	}
+	if len(failures) > 0 {
+		conclusion += "（部分服务取证失败：" + strings.Join(failures, "; ") + "）"
 	}
 
 	return &ExecutionResult{
 		Success:  true,
 		Response: response,
 		Data: map[string]interface{}{
-			"service":       analysis.Service,
-			"total_errors":  analysis.TotalErrors,
-			"pattern_count": len(analysis.ErrorPatterns),
-			"timeline":      analysis.Timeline,
+			"service":       merged.Service,
+			"services":      serviceNames(results),
+			"total_errors":  merged.TotalErrors,
+			"pattern_count": len(merged.ErrorPatterns),
+			"timeline":      merged.Timeline,
 		},
 		ToolsUsed: []string{"log_analysis"},
 		Finding: &StructuredFinding{
@@ -463,6 +479,93 @@ func (l *LogAnalystAgent) executeLogAnalysisTask(ctx context.Context, task *Task
 			Confidence: confidence,
 		},
 	}, nil
+}
+
+// normalizeServiceList 从任务参数提取服务列表：优先 services 列表，
+// 回退到单个 service；空列表返回一个空串表示全局扫描。
+func normalizeServiceList(params map[string]interface{}) []string {
+	if svcs := getStringSlice(params, "services"); len(svcs) > 0 {
+		out := make([]string, 0, len(svcs))
+		for _, s := range svcs {
+			if strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	if svc := strings.TrimSpace(getString(params, "service")); svc != "" {
+		return []string{svc}
+	}
+	return []string{""}
+}
+
+// serviceNames 提取已成功分析的服务名列表
+func serviceNames(results []*LogAnalysisResult) []string {
+	names := make([]string, 0, len(results))
+	for _, r := range results {
+		if r != nil && strings.TrimSpace(r.Service) != "" {
+			names = append(names, r.Service)
+		}
+	}
+	return names
+}
+
+// mergeLogResults 合并多个服务的分析结果为一个汇总结果
+func mergeLogResults(results []*LogAnalysisResult) *LogAnalysisResult {
+	if len(results) == 1 {
+		return results[0]
+	}
+	merged := &LogAnalysisResult{
+		Service:   strings.Join(serviceNames(results), ","),
+		StartTime: results[0].StartTime,
+		EndTime:   results[0].EndTime,
+		Sources:   []string{"sls"},
+	}
+	for _, r := range results {
+		merged.TotalErrors += r.TotalErrors
+	}
+	seen := make(map[string]bool)
+	for _, r := range results {
+		for _, p := range r.ErrorPatterns {
+			if seen[p.Pattern] {
+				continue
+			}
+			seen[p.Pattern] = true
+			merged.ErrorPatterns = append(merged.ErrorPatterns, p)
+		}
+	}
+	merged.Timeline = mergeTimelines(results)
+	return merged
+}
+
+// mergeTimelines 按时间槽合并错误数
+func mergeTimelines(results []*LogAnalysisResult) []LogTimeSlot {
+	if len(results) == 0 {
+		return nil
+	}
+	if len(results) == 1 {
+		return results[0].Timeline
+	}
+	slots := append([]LogTimeSlot(nil), results[0].Timeline...)
+	for _, r := range results[1:] {
+		for _, slot := range r.Timeline {
+			merged := false
+			for i := range slots {
+				if slots[i].StartTime.Equal(slot.StartTime) && slots[i].EndTime.Equal(slot.EndTime) {
+					slots[i].ErrorCount += slot.ErrorCount
+					slots[i].LogCount += slot.LogCount
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				slots = append(slots, slot)
+			}
+		}
+	}
+	return slots
 }
 
 // formatAnalysisResult formats the analysis result for human consumption.

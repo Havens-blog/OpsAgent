@@ -957,6 +957,65 @@ func TestCalculateMetricTrends(t *testing.T) {
 	}
 }
 
+// TestCalculateMetricTrendsKeepsInstancesDistinct 同服务同指标不同实例各自独立，顺序无关
+func TestCalculateMetricTrendsKeepsInstancesDistinct(t *testing.T) {
+	base := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	windows := testWindows(base)
+
+	mk := func(pod string, values []float64) models.MetricSeries {
+		dps := make([]models.DataPoint, 0, len(values))
+		for i, v := range values {
+			dps = append(dps, models.DataPoint{
+				Timestamp: base.Add(time.Duration(i)*time.Minute + 30*time.Second),
+				Value:     v,
+			})
+		}
+		return models.MetricSeries{
+			Name:       "cpu",
+			Labels:     map[string]string{"service": "svc", "pod": pod},
+			DataPoints: dps,
+		}
+	}
+
+	rising := mk("pod-high", []float64{10, 20, 30, 40, 50})
+	stable := mk("pod-stable", []float64{50, 51, 50, 49, 50})
+
+	first := calculateMetricTrends([]models.MetricSeries{rising, stable}, windows)
+	second := calculateMetricTrends([]models.MetricSeries{stable, rising}, windows)
+
+	if len(first) != 2 || len(second) != 2 {
+		t.Fatalf("trends keys = %d/%d, want 2/2 (instances must not overwrite)", len(first), len(second))
+	}
+
+	highID := models.MetricSeriesIdentity(rising)
+	stableID := models.MetricSeriesIdentity(stable)
+
+	if _, ok := first[highID]; !ok {
+		t.Fatalf("missing high-instance trend: %v", first)
+	}
+	if _, ok := first[stableID]; !ok {
+		t.Fatalf("missing stable-instance trend: %v", first)
+	}
+	if _, ok := second[highID]; !ok {
+		t.Fatalf("high-instance trend lost after reorder: %v", second)
+	}
+
+	hasUp := false
+	for _, tr := range first[highID] {
+		if tr == models.TrendUp {
+			hasUp = true
+		}
+	}
+	if !hasUp {
+		t.Errorf("high instance should trend up, got %v", first[highID])
+	}
+	for _, tr := range first[stableID] {
+		if tr != models.TrendStable {
+			t.Errorf("stable instance should stay stable, got %v", first[stableID])
+		}
+	}
+}
+
 func TestBuildWarningsSortedAndNormalized(t *testing.T) {
 	got := buildWarnings(map[string]string{
 		"traces":  "trace backend down",
@@ -1093,10 +1152,10 @@ func TestMetricAnomalyServiceAttributionAndScoring(t *testing.T) {
 	if len(trends) != 2 {
 		t.Fatalf("calculateMetricTrends produced %d keys, want 2 (same-name metrics must not overwrite): %v", len(trends), trends)
 	}
-	if _, ok := trends[metricTrendKey("svc-a", "cpu")]; !ok {
+	if _, ok := trends[models.MetricSeriesIdentity(models.MetricSeries{Name: "cpu", Labels: map[string]string{"service": "svc-a"}})]; !ok {
 		t.Errorf("missing trend key for svc-a/cpu: %v", trends)
 	}
-	if _, ok := trends[metricTrendKey("svc-b", "cpu")]; !ok {
+	if _, ok := trends[models.MetricSeriesIdentity(models.MetricSeries{Name: "cpu", Labels: map[string]string{"service": "svc-b"}})]; !ok {
 		t.Errorf("missing trend key for svc-b/cpu: %v", trends)
 	}
 
