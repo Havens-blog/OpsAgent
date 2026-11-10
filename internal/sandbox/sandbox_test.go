@@ -10,6 +10,31 @@ import (
 	"time"
 )
 
+// platformEcho 返回跨平台 echo 命令。Windows 下 echo 不是独立可执行文件，
+// 需经 cmd /c 调用。
+func platformEcho(args ...string) []string {
+	if runtime.GOOS == "windows" {
+		return append([]string{"cmd", "/c", "echo"}, args...)
+	}
+	return append([]string{"echo"}, args...)
+}
+
+// platformSleep 返回跨平台 sleep 命令（阻塞指定秒数）。
+func platformSleep(seconds string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell", "-NoProfile", "-Command", "Start-Sleep -Seconds " + seconds}
+	}
+	return []string{"sleep", seconds}
+}
+
+// platformShell 返回跨平台 shell 命令（执行一段脚本）。
+func platformShell(script string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmd", "/c", script}
+	}
+	return []string{"sh", "-c", script}
+}
+
 // TestSandboxConfig tests sandbox configuration.
 func TestSandboxConfig(t *testing.T) {
 	t.Run("default_config", func(t *testing.T) {
@@ -72,7 +97,7 @@ func TestExecuteCommand(t *testing.T) {
 
 	t.Run("executes_simple_command", func(t *testing.T) {
 		// Use echo command which is safe and portable
-		result, err := exec.Execute(context.Background(), []string{"echo", "hello"})
+		result, err := exec.Execute(context.Background(), platformEcho("hello"))
 
 		if err != nil {
 			t.Fatalf("Failed to execute command: %v", err)
@@ -94,7 +119,7 @@ func TestExecuteCommand(t *testing.T) {
 		exec := NewExecutor(config)
 
 		// Sleep command that will timeout
-		result, err := exec.Execute(context.Background(), []string{"sleep", "10"})
+		result, err := exec.Execute(context.Background(), platformSleep("10"))
 
 		if err == nil {
 			t.Error("Expected timeout error")
@@ -270,13 +295,13 @@ func TestResultHandling(t *testing.T) {
 	exec := NewExecutor(DefaultConfig())
 
 	t.Run("returns_output", func(t *testing.T) {
-		result, err := exec.Execute(context.Background(), []string{"echo", "-n", "test"})
+		result, err := exec.Execute(context.Background(), platformEcho("test"))
 
 		if err != nil {
 			t.Fatalf("Failed to execute: %v", err)
 		}
 
-		if result.Output != "test" {
+		if strings.TrimSpace(result.Output) != "test" {
 			t.Errorf("Expected output 'test', got '%s'", result.Output)
 		}
 	})
@@ -303,7 +328,14 @@ func TestEnvironmentVariables(t *testing.T) {
 		// Set environment variable
 		exec.SetEnv("TEST_VAR", "test_value")
 
-		result, err := exec.Execute(context.Background(), []string{"sh", "-c", "echo $TEST_VAR"})
+		var cmd []string
+		if runtime.GOOS == "windows" {
+			cmd = []string{"cmd", "/c", "echo %TEST_VAR%"}
+		} else {
+			cmd = []string{"sh", "-c", "echo $TEST_VAR"}
+		}
+
+		result, err := exec.Execute(context.Background(), cmd)
 
 		if err != nil {
 			t.Fatalf("Failed to execute: %v", err)
@@ -366,19 +398,19 @@ func TestTimeoutVariations(t *testing.T) {
 		{
 			name:           "quick_command_no_timeout",
 			timeout:        1 * time.Second,
-			cmd:            []string{"echo", "quick"},
+			cmd:            platformEcho("quick"),
 			expectedTimeout: false,
 		},
 		{
 			name:           "sleep_command_timeout",
 			timeout:        100 * time.Millisecond,
-			cmd:            []string{"sleep", "5"},
+			cmd:            platformSleep("5"),
 			expectedTimeout: true,
 		},
 		{
 			name:           "moderate_timeout",
 			timeout:        500 * time.Millisecond,
-			cmd:            []string{"sleep", "0.1"},
+			cmd:            platformSleep("0.1"),
 			expectedTimeout: false,
 		},
 	}
